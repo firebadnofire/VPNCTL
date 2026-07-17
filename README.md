@@ -1,0 +1,3 @@
+# dnswg
+
+DNS for Wireguard
