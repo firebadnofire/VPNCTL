@@ -264,6 +264,22 @@ async fn create_backup(
 }
 
 #[tauri::command]
+async fn refresh_remote_credentials(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+) -> Result<InstanceHealth, AppError> {
+    state.0.refresh_remote_credentials(instance_id).await
+}
+
+#[tauri::command]
+async fn refresh_remote_dns_store(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+) -> Result<InstanceHealth, AppError> {
+    state.0.refresh_remote_dns_store(instance_id).await
+}
+
+#[tauri::command]
 async fn list_backups(
     state: State<'_, AppState>,
     instance_id: Uuid,
@@ -372,6 +388,8 @@ pub fn run() {
             list_dns_records,
             delete_dns_record,
             create_backup,
+            refresh_remote_credentials,
+            refresh_remote_dns_store,
             list_backups,
             rollback,
             health,

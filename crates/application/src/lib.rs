@@ -764,7 +764,7 @@ fi
 
     pub async fn plan_instance(&self, instance_id: Uuid) -> Result<DeploymentPlan, AppError> {
         let state = self.desired_state(instance_id).await?;
-        let files = self.render_state_for_plan(&state).await?;
+        let files = self.render_state(&state).await?;
         let remote = self.remote_manifest(&state.instance).await?;
         vam_deployment::DefaultDeploymentPlanner
             .calculate(&state, &files, remote.as_ref())
@@ -779,7 +779,7 @@ fi
         let lock = self.instance_lock(instance_id).await;
         let _guard = lock.lock().await;
         let state = self.desired_state(instance_id).await?;
-        let files = self.render_state(&state).await?;
+        let files = self.render_state_for_plan(&state).await?;
         let remote = self.remote_manifest(&state.instance).await?;
         let plan = vam_deployment::DefaultDeploymentPlanner
             .calculate(&state, &files, remote.as_ref())
@@ -1013,6 +1013,129 @@ fi
             created_at: Utc::now(),
             deployment_id: Some(deployment.summary.id),
         })
+    }
+
+    pub async fn refresh_remote_credentials(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<InstanceHealth, AppError> {
+        let state = self.desired_state(instance_id).await?;
+        let files = self.render_state_for_plan(&state).await?;
+        let credential_files: Vec<_> = files
+            .iter()
+            .filter(|file| file.path.starts_with("vpn/"))
+            .collect();
+        if credential_files.is_empty() {
+            return Err(validation_error(
+                "There are no rendered remote credential files for this instance.",
+            ));
+        }
+        let (host, trusted, passphrase) = self.trusted_host(state.instance.host_id).await?;
+        let cancellation = CancellationToken::new();
+        self.upload_rendered_files(
+            &state.instance,
+            &host,
+            &trusted,
+            passphrase.as_ref(),
+            &credential_files,
+            &cancellation,
+        )
+        .await?;
+        let command = format!(
+            r#"set -eu
+test -d {vpn_dir}
+test -s {server_key}
+docker run --rm --entrypoint sh -v {vpn_mount} {image} -c 'set -eu; umask 077; test -s /work/server.key; awk '"'"'{{ if ($0 == "PrivateKey = __VAM_SERVER_PRIVATE_KEY__") {{ getline key < "/work/server.key"; print "PrivateKey = " key }} else print }}'"'"' /work/wg0.conf.template > /work/wg0.conf; chmod 0600 /work/server.key /work/wg0.conf'
+cd {current}
+docker compose restart gateway
+docker compose restart dns
+"#,
+            vpn_dir = shell_quote(&format!("{}/vpn", state.instance.remote_path())),
+            server_key = shell_quote(&format!("{}/vpn/server.key", state.instance.remote_path())),
+            vpn_mount = shell_quote(&format!("{}/vpn:/work", state.instance.remote_path())),
+            image = shell_quote(WIREGUARD_IMAGE),
+            current = shell_quote(&state.instance.remote_path()),
+        );
+        if let Err(mut error) = self
+            .checked_execute(
+                &host,
+                &trusted,
+                passphrase.as_ref(),
+                &command,
+                &cancellation,
+            )
+            .await
+        {
+            error.remote_state_changed = true;
+            error.scope = Some(state.instance.id.to_string());
+            error.remediation = Some(
+                "Deploy the instance if the server key is missing, then retry the credential refresh."
+                    .into(),
+            );
+            return Err(error);
+        }
+        let health = self
+            .wait_for_healthy(&state, &host, &trusted, passphrase.as_ref(), &cancellation)
+            .await?;
+        if health_is_healthy(&health) {
+            self.normalize_vpn_ownership(
+                &state,
+                &host,
+                &trusted,
+                passphrase.as_ref(),
+                &cancellation,
+            )
+            .await?;
+        }
+        Ok(health)
+    }
+
+    pub async fn refresh_remote_dns_store(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<InstanceHealth, AppError> {
+        let state = self.desired_state(instance_id).await?;
+        let files = self.render_state(&state).await?;
+        let dns_files: Vec<_> = files
+            .iter()
+            .filter(|file| file.path.starts_with("dns/"))
+            .collect();
+        if dns_files.is_empty() {
+            return Err(validation_error(
+                "There are no rendered remote DNS files for this instance.",
+            ));
+        }
+        let (host, trusted, passphrase) = self.trusted_host(state.instance.host_id).await?;
+        let cancellation = CancellationToken::new();
+        self.upload_rendered_files(
+            &state.instance,
+            &host,
+            &trusted,
+            passphrase.as_ref(),
+            &dns_files,
+            &cancellation,
+        )
+        .await?;
+        let command = format!(
+            "set -eu; cd {}; docker compose restart dns",
+            shell_quote(&state.instance.remote_path())
+        );
+        if let Err(mut error) = self
+            .checked_execute(
+                &host,
+                &trusted,
+                passphrase.as_ref(),
+                &command,
+                &cancellation,
+            )
+            .await
+        {
+            error.remote_state_changed = true;
+            error.scope = Some(state.instance.id.to_string());
+            return Err(error);
+        }
+        self.wait_for_healthy(&state, &host, &trusted, passphrase.as_ref(), &cancellation)
+            .await
     }
 
     pub async fn list_backups(&self, instance_id: Uuid) -> Result<Vec<BackupInfo>, AppError> {
@@ -1489,6 +1612,50 @@ fi
             return Err(command_error("remote_operation", &result, false));
         }
         Ok(result)
+    }
+
+    async fn upload_rendered_files(
+        &self,
+        instance: &VpnInstance,
+        host: &DockerHost,
+        trusted: &vam_storage::KnownHostKey,
+        passphrase: Option<&Zeroizing<String>>,
+        files: &[&RenderedFile],
+        cancellation: &CancellationToken,
+    ) -> Result<(), AppError> {
+        let mut prepare = format!("set -eu; test -d {}", shell_quote(&instance.remote_path()));
+        for directory in
+            rendered_directories_from_paths(files.iter().map(|file| file.path.as_str()))
+        {
+            prepare.push_str(&format!(
+                "; install -d {}",
+                shell_quote(&format!("{}/{directory}", instance.remote_path()))
+            ));
+        }
+        self.checked_execute(host, trusted, passphrase, &prepare, cancellation)
+            .await?;
+        let mut changed = false;
+        for file in files {
+            self.transport
+                .upload(UploadRequest {
+                    config: &host.ssh,
+                    trusted_key_base64: &trusted.public_key_base64,
+                    passphrase,
+                    remote_path: &format!("{}/{}", instance.remote_path(), file.path),
+                    contents: file.contents.as_bytes(),
+                    mode: file.mode,
+                    cancellation,
+                })
+                .await
+                .map_err(|error| {
+                    let mut app_error = ssh_error(error);
+                    app_error.scope = Some(instance.id.to_string());
+                    app_error.remote_state_changed = changed;
+                    app_error
+                })?;
+            changed = true;
+        }
+        Ok(())
     }
 
     async fn ensure_firewall_allows(
@@ -2332,9 +2499,13 @@ impl ApplicationService {
 }
 
 fn rendered_directories(files: &[RenderedFile]) -> Vec<String> {
+    rendered_directories_from_paths(files.iter().map(|file| file.path.as_str()))
+}
+
+fn rendered_directories_from_paths<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<String> {
     let mut directories = Vec::new();
-    for file in files {
-        let mut path = Path::new(&file.path).parent();
+    for file_path in paths {
+        let mut path = Path::new(file_path).parent();
         while let Some(directory) = path {
             let text = directory.to_string_lossy();
             if !text.is_empty() && !directories.iter().any(|item| item == text.as_ref()) {

@@ -518,14 +518,37 @@
     await refreshInstanceData();
   }
 
-  async function makeBackup() {
-    if (!selectedInstanceId) return;
+  async function makeBackup(instanceId = selectedInstanceId) {
+    if (!instanceId) return;
     const result = await task("Creating remote backup", () =>
-      call<BackupInfo>("create_backup", { instanceId: selectedInstanceId }),
+      call<BackupInfo>("create_backup", { instanceId }),
     );
     if (!result) return;
     await refreshInstanceData();
     notice = `Backup ${result.name} created.`;
+  }
+
+  async function backupInstance(instance: VpnInstance) {
+    selectedInstanceId = instance.id;
+    await makeBackup(instance.id);
+  }
+
+  async function refreshRemoteCredentials() {
+    if (!selectedInstanceId) return;
+    const result = await task("Refreshing remote credential store", () =>
+      call<InstanceHealth>("refresh_remote_credentials", { instanceId: selectedInstanceId }),
+    );
+    if (!result) return;
+    notice = `Credential store refreshed. ${healthSummary(result)}`;
+  }
+
+  async function refreshRemoteDnsStore() {
+    if (!selectedInstanceId) return;
+    const result = await task("Refreshing remote DNS store", () =>
+      call<InstanceHealth>("refresh_remote_dns_store", { instanceId: selectedInstanceId }),
+    );
+    if (!result) return;
+    notice = `DNS store refreshed. ${healthSummary(result)}`;
   }
 
   async function rollbackBackup(backup: BackupInfo) {
@@ -568,10 +591,14 @@
         {#if active === "Hosts"}<button class="primary" onclick={openHost}>Add host</button>{/if}
         {#if active === "Instances"}<button class="primary" onclick={openInstance} disabled={!hosts.length}>Create instance</button>{/if}
         {#if active === "Devices"}
+          <button class="secondary" onclick={refreshRemoteCredentials} disabled={!selectedInstanceId}>Refresh credentials</button>
           <button class="primary" onclick={openDevice} disabled={!instances.length}>Add device</button>
         {/if}
-        {#if active === "DNS"}<button class="primary" onclick={openDns} disabled={!instances.length}>Add record</button>{/if}
-        {#if active === "Backups"}<button class="primary" onclick={makeBackup} disabled={!selectedInstanceId}>Create backup</button>{/if}
+        {#if active === "DNS"}
+          <button class="secondary" onclick={refreshRemoteDnsStore} disabled={!selectedInstanceId}>Refresh DNS store</button>
+          <button class="primary" onclick={openDns} disabled={!instances.length}>Add record</button>
+        {/if}
+        {#if active === "Backups"}<button class="primary" onclick={() => makeBackup()} disabled={!selectedInstanceId}>Create backup</button>{/if}
       </div>
     </header>
 
@@ -669,6 +696,7 @@
                 <button class="secondary" onclick={() => instanceAction("stop_instance", instance)}>Stop</button>
                 <button class="secondary" onclick={() => instanceAction("health", instance)}>Health</button>
                 <button class="secondary" title="Preview deployment changes before applying them" onclick={() => reviewPlan(instance)}>Preview deploy</button>
+                <button class="secondary" title="Back up this instance, including its credential and DNS stores" onclick={() => backupInstance(instance)}>Backup</button>
                 <button class="menu danger" title="Delete" onclick={() => removeInstance(instance)}>Delete</button>
               </article>
             {/each}
