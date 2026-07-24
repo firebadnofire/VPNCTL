@@ -298,14 +298,16 @@
 
   async function applyPlan() {
     if (!plan) return;
+    const pendingPlan = plan;
+    modal = null;
+    plan = null;
     const result = await task("Applying and verifying deployment", () =>
       call<{ status: string }>("apply_instance", {
-        instanceId: plan?.instance_id,
-        expectedStateHash: plan?.desired_state_hash,
+        instanceId: pendingPlan.instance_id,
+        expectedStateHash: pendingPlan.desired_state_hash,
       }),
     );
     if (!result) return;
-    modal = null;
     notice = `Deployment ${result.status}.`;
     await refresh();
   }
