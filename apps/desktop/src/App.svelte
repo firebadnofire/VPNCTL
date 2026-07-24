@@ -33,7 +33,13 @@
 
   const sections: Section[] = ["Hosts", "Instances", "Users & Devices", "DNS", "Backups", "Logs"];
   const recordTypes: DnsRecordType[] = ["A", "AAAA", "CNAME", "TXT", "SRV"];
-  const remoteHostKeyCommand = `for key in /etc/ssh/ssh_host_*_key.pub; do test -r "$key" && ssh-keygen -l -E sha256 -f "$key"; done`;
+  function shellSingleQuote(value: string) {
+    return `'${value.replaceAll("'", "'\"'\"'")}'`;
+  }
+
+  function remoteHostKeyCommand(fingerprint: string) {
+    return `for key in /etc/ssh/ssh_host_*_key.pub; do test -r "$key" && ssh-keygen -l -E sha256 -f "$key"; done | grep -F ${shellSingleQuote(fingerprint)}`;
+  }
 
   let active: Section = "Hosts";
   let modal: Modal = null;
@@ -246,7 +252,7 @@
 
   async function removeHost(host: DockerHost) {
     const accepted = await confirm(
-      `Delete â€œ${host.display_name}â€ from local host management? Existing instances on this host must be deleted first.`,
+      `Delete "${host.display_name}" from local host management? Existing instances on this host must be deleted first.`,
       { title: "Delete Docker host", kind: "warning" },
     );
     if (!accepted) return;
@@ -328,7 +334,7 @@
 
   async function removeInstance(instance: VpnInstance) {
     const accepted = await confirm(
-      `Back up, stop, and move “${instance.display_name}” to recoverable remote trash?`,
+      `Back up, stop, and move "${instance.display_name}" to recoverable remote trash?`,
       { title: "Delete VPN instance", kind: "warning" },
     );
     if (!accepted) return;
@@ -353,7 +359,7 @@
 
   async function removeUser(user: User) {
     const accepted = await confirm(
-      `Delete user â€œ${user.display_name}â€? Devices assigned to this user will become unassigned.`,
+      `Delete user "${user.display_name}"? Devices assigned to this user will become unassigned.`,
       { title: "Delete user", kind: "warning" },
     );
     if (!accepted) return;
@@ -404,7 +410,7 @@
 
   async function replaceDeviceIdentity(device: Device) {
     const accepted = await confirm(
-      `Replace the cryptographic identity for “${device.display_name}”? Its previous configuration will stop working after deployment.`,
+      `Replace the cryptographic identity for "${device.display_name}"? Its previous configuration will stop working after deployment.`,
       { title: "Replace device identity", kind: "warning" },
     );
     if (!accepted) return;
@@ -418,7 +424,7 @@
 
   async function removeDevice(device: Device) {
     const accepted = await confirm(
-      `Remove “${device.display_name}” and its managed DNS record? Its address remains reserved by retained deployment snapshots.`,
+      `Remove "${device.display_name}" and its managed DNS record? Its address remains reserved by retained deployment snapshots.`,
       { title: "Remove device", kind: "warning" },
     );
     if (!accepted) return;
@@ -777,7 +783,7 @@
         <p class="help">Verify this SHA-256 fingerprint through a trusted channel, then enter it exactly. No authentication occurs during the probe.</p>
         <div class="command-card">
           <span>On the remote server, run:</span>
-          <pre>{remoteHostKeyCommand}</pre>
+          <pre>{remoteHostKeyCommand(probe.key.sha256_fingerprint)}</pre>
           <small>Compare the {probe.key.algorithm} line to the fingerprint above.</small>
         </div>
         <label>Fingerprint confirmation<input bind:value={fingerprintConfirmation} spellcheck="false" placeholder="SHA256:…" /></label>
