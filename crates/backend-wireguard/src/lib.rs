@@ -80,7 +80,7 @@ impl VpnBackend for WireGuardBackend {
         let subnet = state.instance.network.ipv4_subnet;
         let gateway = state.instance.network.gateway_ipv4;
         let mut output = format!(
-            "[Interface]\nPrivateKey = {SERVER_PRIVATE_KEY_SENTINEL}\nAddress = {gateway}/{}\nListenPort = 51820\nPostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -s {subnet} -o eth0 -j MASQUERADE\nPreDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -s {subnet} -o eth0 -j MASQUERADE\n",
+            "[Interface]\nPrivateKey = {SERVER_PRIVATE_KEY_SENTINEL}\nAddress = {gateway}/{}\nListenPort = 51820\nPostUp = iptables -A FORWARD -i %i -o %i -j ACCEPT; iptables -A FORWARD -i %i -j ACCEPT; iptables -A FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -A POSTROUTING -s {subnet} -o eth0 -j MASQUERADE\nPreDown = iptables -D FORWARD -i %i -o %i -j ACCEPT; iptables -D FORWARD -i %i -j ACCEPT; iptables -D FORWARD -o %i -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT; iptables -t nat -D POSTROUTING -s {subnet} -o eth0 -j MASQUERADE\n",
             subnet.prefix_len()
         );
         let mut devices: Vec<_> = state
@@ -288,6 +288,16 @@ mod tests {
         assert!(rendered.contents.contains(SERVER_PRIVATE_KEY_SENTINEL));
         assert!(rendered.contents.contains("PresharedKey = peer-psk"));
         assert!(rendered.contents.contains("AllowedIPs = 10.64.0.2/32"));
+        assert!(
+            rendered
+                .contents
+                .contains("iptables -A FORWARD -i %i -o %i -j ACCEPT")
+        );
+        assert!(
+            rendered
+                .contents
+                .contains("iptables -D FORWARD -i %i -o %i -j ACCEPT")
+        );
         assert!(!rendered.contents.contains("client-private"));
         assert!(!rendered.contents.contains('\r'));
     }
