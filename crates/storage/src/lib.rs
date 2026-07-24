@@ -297,13 +297,32 @@ impl Storage {
     }
 
     pub async fn delete_user(&self, id: Uuid) -> Result<(), StorageError> {
+        let mut devices: Vec<Device> = json_rows(
+            sqlx::query("SELECT model_json FROM devices WHERE user_id = ? AND deleted_at IS NULL")
+                .bind(id.to_string())
+                .fetch_all(&self.pool)
+                .await?,
+        )?;
+        for device in &mut devices {
+            device.user_id = None;
+        }
+
+        let mut transaction = self.pool.begin().await?;
+        for device in devices {
+            sqlx::query("UPDATE devices SET user_id=NULL, model_json=? WHERE id=?")
+                .bind(serde_json::to_string(&device)?)
+                .bind(device.id.to_string())
+                .execute(&mut *transaction)
+                .await?;
+        }
         let result = sqlx::query("DELETE FROM users WHERE id = ?")
             .bind(id.to_string())
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
         if result.rows_affected() == 0 {
             return Err(StorageError::NotFound);
         }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -1036,6 +1055,44 @@ mod tests {
                 .await,
             Err(StorageError::Database(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn delete_user_clears_device_json_ownership() {
+        let storage = Storage::in_memory().await.unwrap();
+        let host = host();
+        storage.save_host(&host).await.unwrap();
+        let instance = instance(host.id, Uuid::new_v4(), 51_820);
+        storage.save_instance(&instance).await.unwrap();
+        let user = User {
+            id: Uuid::new_v4(),
+            display_name: "operator".into(),
+            created_at: Utc::now(),
+        };
+        storage.save_user(&user).await.unwrap();
+        let device = Device {
+            id: Uuid::new_v4(),
+            instance_id: instance.id,
+            user_id: Some(user.id),
+            display_name: "peer".into(),
+            ipv4_address: "10.64.0.2".parse().unwrap(),
+            ipv6_address: None,
+            dns_name: None,
+            enabled: true,
+            backend_data: DeviceBackendData::WireGuard(WireGuardDeviceData {
+                public_key: "public".into(),
+                private_key_ref: SecretReference(Uuid::new_v4()),
+                preshared_key_ref: None,
+            }),
+            created_at: Utc::now(),
+            deleted_at: None,
+        };
+        storage.save_device(&device).await.unwrap();
+
+        storage.delete_user(user.id).await.unwrap();
+
+        let updated = storage.get_device(device.id).await.unwrap();
+        assert_eq!(updated.user_id, None);
     }
 
     #[tokio::test]

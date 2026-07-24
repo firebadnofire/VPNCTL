@@ -128,6 +128,8 @@
     instances = nextInstances;
     users = nextUsers;
     logs = nextLogs;
+    if (selectedHostId && !hosts.some((host) => host.id === selectedHostId)) selectedHostId = "";
+    if (selectedInstanceId && !instances.some((instance) => instance.id === selectedInstanceId)) selectedInstanceId = "";
     if (!selectedHostId && hosts[0]) selectedHostId = hosts[0].id;
     if (!selectedInstanceId && instances[0]) selectedInstanceId = instances[0].id;
     if (selectedInstanceId) await refreshInstanceData();
@@ -242,6 +244,25 @@
     if (result) inspection = result;
   }
 
+  async function removeHost(host: DockerHost) {
+    const accepted = await confirm(
+      `Delete â€œ${host.display_name}â€ from local host management? Existing instances on this host must be deleted first.`,
+      { title: "Delete Docker host", kind: "warning" },
+    );
+    if (!accepted) return;
+    const result = await task("Deleting host", () =>
+      call<void>("delete_host", { hostId: host.id }),
+    );
+    if (result === undefined && error) return;
+    if (selectedHostId === host.id) {
+      selectedHostId = "";
+      inspection = null;
+      probe = null;
+    }
+    await refresh();
+    notice = "Host deleted.";
+  }
+
   function openInstance() {
     instanceForm = {
       display_name: "",
@@ -328,6 +349,20 @@
     modal = null;
     userName = "";
     await refresh();
+  }
+
+  async function removeUser(user: User) {
+    const accepted = await confirm(
+      `Delete user â€œ${user.display_name}â€? Devices assigned to this user will become unassigned.`,
+      { title: "Delete user", kind: "warning" },
+    );
+    if (!accepted) return;
+    const result = await task("Deleting user", () =>
+      call<void>("delete_user", { userId: user.id }),
+    );
+    if (result === undefined && error) return;
+    await refresh();
+    notice = "User deleted.";
   }
 
   function openDevice() {
@@ -567,6 +602,7 @@
                 </button>
                 <button class="secondary" onclick={() => probeHost(host)}>Verify key</button>
                 <button class="secondary" onclick={() => inspect(host)}>Inspect</button>
+                <button class="menu danger" title="Delete" onclick={() => removeHost(host)}>Delete</button>
               </article>
             {/each}
           </div>
@@ -640,6 +676,25 @@
           </div>
         {:else}
           <div class="empty"><h3>No devices for this instance</h3><p>Private keys are generated locally and remain in the macOS Keychain.</p></div>
+        {/if}
+      </section>
+      <section class="panel compact">
+        <div class="panel-head"><h3>Users</h3><span>{users.length} configured</span></div>
+        {#if users.length}
+          <div class="rows">
+            {#each users as user}
+              <article>
+                <div class="status-icon">U</div>
+                <div class="row-main">
+                  <strong>{user.display_name}</strong>
+                  <small>{devices.filter((device) => device.user_id === user.id).length} devices assigned in selected instance</small>
+                </div>
+                <button class="menu danger" title="Delete" onclick={() => removeUser(user)}>Delete</button>
+              </article>
+            {/each}
+          </div>
+        {:else}
+          <div class="empty small-empty"><h3>No users yet</h3><p>Create users before assigning device identities.</p></div>
         {/if}
       </section>
     {:else if active === "DNS"}
