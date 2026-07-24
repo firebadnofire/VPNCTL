@@ -36,7 +36,12 @@
 
   let active: Section = "Hosts";
   let modal: Modal = null;
-  let appInfo: AppInfo = { name: "VPN Appliance Manager", version: "0.1.0", status: "starting" };
+  let appInfo: AppInfo = {
+    name: "VPN Appliance Manager",
+    version: "0.1.0",
+    status: "starting",
+    system_username: "",
+  };
   let hosts: DockerHost[] = [];
   let instances: VpnInstance[] = [];
   let users: User[] = [];
@@ -52,6 +57,7 @@
   let error: AppError | null = null;
   let inspection: HostInspection | null = null;
   let probe: HostKeyProbe | null = null;
+  let defaultSshUsername = "";
   let fingerprintConfirmation = "";
   let replaceChangedKey = false;
   let plan: DeploymentPlan | null = null;
@@ -102,6 +108,7 @@
   async function load() {
     try {
       appInfo = await call<AppInfo>("app_info");
+      defaultSshUsername = appInfo.system_username;
       await refresh();
     } catch (cause) {
       setError(cause);
@@ -171,7 +178,7 @@
       display_name: "",
       hostname: "",
       port: 22,
-      username: "",
+      username: defaultSshUsername,
       private_key_path: "",
       passphrase: "",
     };
@@ -699,7 +706,7 @@
         <form onsubmit={(event) => { event.preventDefault(); saveHost(); }}>
           <label>Display name<input bind:value={hostForm.display_name} required placeholder="Debian lab" /></label>
           <div class="form-grid"><label>Hostname or IP<input bind:value={hostForm.hostname} required placeholder="192.168.86.55" /></label><label>SSH port<input type="number" bind:value={hostForm.port} min="1" max="65535" required /></label></div>
-          <label>SSH username<input bind:value={hostForm.username} required placeholder="william" /></label>
+          <label>SSH username<input bind:value={hostForm.username} required placeholder={defaultSshUsername || "username"} /></label>
           <label>SSH private key<div class="path-input"><input bind:value={hostForm.private_key_path} required placeholder="/Users/you/.ssh/id_ed25519 or key.ppk" /><button type="button" class="secondary" onclick={chooseKey}>Choose</button></div></label>
           <label>Key passphrase <span class="optional">optional · saved to Keychain</span><input type="password" bind:value={hostForm.passphrase} autocomplete="new-password" /></label>
           <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary" disabled={Boolean(busy)}>Save host</button></div>

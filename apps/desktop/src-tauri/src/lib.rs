@@ -22,8 +22,15 @@ fn app_info() -> serde_json::Value {
     serde_json::json!({
         "name": "VPN Appliance Manager",
         "version": env!("CARGO_PKG_VERSION"),
-        "status": "ready"
+        "status": "ready",
+        "system_username": system_username()
     })
+}
+
+fn system_username() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_default()
 }
 
 #[tauri::command]

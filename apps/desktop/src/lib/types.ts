@@ -4,6 +4,7 @@ export interface AppInfo {
   name: string;
   version: string;
   status: string;
+  system_username: string;
 }
 
 export interface AppError {
