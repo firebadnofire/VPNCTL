@@ -2436,7 +2436,7 @@ fn prune_command(instance_id: Uuid, retention: usize) -> String {
 
 fn firewall_allow_command(port: u16) -> String {
     format!(
-        r#"set -eu
+        r"set -eu
 if command -v ufw >/dev/null 2>&1; then
   if sudo -n ufw status 2>/dev/null | grep -q '^Status: active'; then
     sudo -n ufw allow {port}/udp >/dev/null
@@ -2449,13 +2449,13 @@ if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>
   sudo -n firewall-cmd --permanent --add-port={port}/udp >/dev/null
   sudo -n firewall-cmd --reload >/dev/null
 fi
-"#
+"
     )
 }
 
 fn firewall_remove_command(port: u16) -> String {
     format!(
-        r#"set -eu
+        r"set -eu
 if command -v ufw >/dev/null 2>&1; then
   if sudo -n ufw status 2>/dev/null | grep -q '^Status: active'; then
     sudo -n ufw delete allow {port}/udp >/dev/null 2>&1 || true
@@ -2468,7 +2468,7 @@ if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>
   sudo -n firewall-cmd --permanent --remove-port={port}/udp >/dev/null 2>&1 || true
   sudo -n firewall-cmd --reload >/dev/null
 fi
-"#
+"
     )
 }
 
