@@ -82,7 +82,7 @@
     endpoint_host: "",
     endpoint_port: 51820,
     ipv4_subnet: "10.64.0.0/24",
-    dns_zone: "vpn.internal",
+    dns_zone: "internal",
     routing_mode: "split_tunnel",
   };
   let deviceForm = {
@@ -105,6 +105,8 @@
   $: instanceDevices = devices.filter((item) => item.instance_id === selectedInstanceId);
   $: instanceRecords = records.filter((item) => item.instance_id === selectedInstanceId);
   $: dnsFormInstance = instances.find((item) => item.id === dnsForm.instance_id);
+  $: deviceFormInstance = instances.find((item) => item.id === deviceForm.instance_id);
+  $: deviceDnsPreview = deviceDnsNamePreview(deviceForm.dns_name, deviceFormInstance?.dns.zone || "");
 
   onMount(load);
 
@@ -270,7 +272,7 @@
       endpoint_host: hosts.find((host) => host.id === selectedHostId)?.ssh.hostname || "",
       endpoint_port: 51820,
       ipv4_subnet: "10.64.0.0/24",
-      dns_zone: "vpn.internal",
+      dns_zone: "internal",
       routing_mode: "split_tunnel",
     };
     modal = "instance";
@@ -355,6 +357,15 @@
   }
 
   async function saveDevice() {
+    const dnsNameError = deviceDnsNameZoneError(deviceForm.dns_name, deviceFormInstance?.dns.zone || "");
+    if (dnsNameError) {
+      error = {
+        code: "validation",
+        message: dnsNameError,
+        remote_state_changed: false,
+      };
+      return;
+    }
     const created = await task("Generating device identity", () =>
       call<Device>("create_device", {
         input: {
@@ -471,6 +482,24 @@
     if (!owner || owner === "@" || !owner.includes(".")) return null;
     if (owner === normalizedZone || owner.endsWith(`.${normalizedZone}`)) return null;
     return `DNS owner names must be short names inside ${zone}, or fully-qualified names ending in .${zone}.`;
+  }
+
+  function deviceDnsNamePreview(name: string, zone: string) {
+    const owner = name.trim().replace(/\.$/, "").toLowerCase();
+    const normalizedZone = zone.trim().replace(/\.$/, "").toLowerCase();
+    if (!owner || !normalizedZone) return "";
+    if (owner === normalizedZone || owner.endsWith(`.${normalizedZone}`)) return owner;
+    if (owner.includes(".")) return "";
+    return `${owner}.${normalizedZone}`;
+  }
+
+  function deviceDnsNameZoneError(name: string, zone: string) {
+    if (!zone) return null;
+    const owner = name.trim().replace(/\.$/, "").toLowerCase();
+    const normalizedZone = zone.trim().replace(/\.$/, "").toLowerCase();
+    if (!owner || !owner.includes(".")) return null;
+    if (owner === normalizedZone || owner.endsWith(`.${normalizedZone}`)) return null;
+    return `Device DNS names must be short names inside ${zone}, or fully-qualified names ending in .${zone}.`;
   }
 
   async function removeDns(record: DnsRecord) {
@@ -774,7 +803,10 @@
         <form onsubmit={(event) => { event.preventDefault(); saveDevice(); }}>
           <label>Instance<select bind:value={deviceForm.instance_id} required>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
           <label>Device name<input bind:value={deviceForm.display_name} required placeholder="William’s MacBook" /></label>
-          <label>DNS name <span class="optional">optional</span><input bind:value={deviceForm.dns_name} placeholder="macbook" /></label>
+          <label>DNS name <span class="optional">optional</span><input bind:value={deviceForm.dns_name} placeholder="vm1" /></label>
+          {#if deviceFormInstance}
+            <p class="help">Enter a short name like vm1; it will be saved as {deviceDnsPreview || `vm1.${deviceFormInstance.dns.zone}`}.</p>
+          {/if}
           <label class="checkbox"><input type="checkbox" bind:checked={deviceForm.preshared_key} /> Generate a preshared key (recommended)</label>
           <label class="checkbox"><input type="checkbox" bind:checked={deviceForm.create_dns_record} /> Create a managed DNS A record</label>
           <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary">Generate identity</button></div>

@@ -28,7 +28,7 @@ pub enum DnsError {
 
 pub fn normalize_zone(zone: &str) -> Result<String, DnsError> {
     let zone = zone.trim().trim_end_matches('.').to_ascii_lowercase();
-    if zone.len() > 253 || !zone.contains('.') || !valid_name(&zone) {
+    if zone.len() > 253 || !valid_name(&zone) {
         return Err(DnsError::InvalidZone);
     }
     Ok(zone)
@@ -241,6 +241,19 @@ mod tests {
         .unwrap();
         assert!(zone.find("a 300 IN A").unwrap() < zone.find("z 300 IN TXT").unwrap());
         assert!(zone.contains(r#"\"vpn\""#));
+    }
+
+    #[test]
+    fn accepts_single_label_internal_zone() {
+        let zone = render_zone(
+            "internal",
+            "10.64.0.1".parse().unwrap(),
+            2_026_072_301,
+            &[record("vm1.internal", DnsRecordType::A, "10.64.0.2")],
+        )
+        .unwrap();
+        assert!(zone.contains("$ORIGIN internal."));
+        assert!(zone.contains("vm1 300 IN A 10.64.0.2"));
     }
 
     #[test]

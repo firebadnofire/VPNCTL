@@ -530,6 +530,13 @@ fi
             &devices,
         )
         .map_err(|error| validation_error(&error.to_string()))?;
+        let dns_name = input
+            .dns_name
+            .as_deref()
+            .map(|value| normalize_dns_owner(value, &instance.dns.zone))
+            .transpose()
+            .map_err(|error| validation_error(&error))?
+            .flatten();
         let (private, public) = WireGuardBackend::generate_device_keys();
         let private_ref = SecretReference(Uuid::new_v4());
         self.secrets
@@ -554,12 +561,7 @@ fi
             display_name: input.display_name.trim().into(),
             ipv4_address: address,
             ipv6_address: None,
-            dns_name: input
-                .dns_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_owned),
+            dns_name,
             enabled: true,
             backend_data: DeviceBackendData::WireGuard(WireGuardDeviceData {
                 public_key: public,
@@ -587,7 +589,7 @@ fi
             let name = device
                 .dns_name
                 .clone()
-                .unwrap_or_else(|| slug(&device.display_name));
+                .unwrap_or_else(|| format!("{}.{}", slug(&device.display_name), instance.dns.zone));
             let record = DnsRecord {
                 id: Uuid::new_v4(),
                 instance_id: input.instance_id,
@@ -2537,6 +2539,23 @@ fn slug(value: &str) -> String {
     value.trim_matches('-').into()
 }
 
+fn normalize_dns_owner(value: &str, zone: &str) -> Result<Option<String>, String> {
+    let owner = value.trim().trim_end_matches('.').to_ascii_lowercase();
+    if owner.is_empty() {
+        return Ok(None);
+    }
+    let zone = zone.trim().trim_end_matches('.').to_ascii_lowercase();
+    if owner == zone || owner.ends_with(&format!(".{zone}")) {
+        return Ok(Some(owner));
+    }
+    if owner.contains('.') {
+        return Err(format!(
+            "DNS names must be short names inside {zone}, or fully-qualified names ending in .{zone}."
+        ));
+    }
+    Ok(Some(format!("{owner}.{zone}")))
+}
+
 async fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), AppError> {
     #[cfg(unix)]
     {
@@ -2813,6 +2832,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(service.list_instances(None).await.unwrap(), vec![instance]);
+    }
+
+    #[tokio::test]
+    async fn device_dns_names_are_normalized_into_instance_zone() {
+        let storage = Storage::in_memory().await.unwrap();
+        let service = ApplicationService::with_transport(
+            storage,
+            Arc::new(MemorySecretStore::default()),
+            Arc::new(RusshTransport::default()),
+        );
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "192.0.2.1".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let instance = service
+            .create_instance(CreateInstanceInput {
+                host_id: host.id,
+                display_name: "private".into(),
+                endpoint_host: "vpn.example.test".into(),
+                endpoint_port: DEFAULT_PORT,
+                ipv4_subnet: DEFAULT_SUBNET.into(),
+                dns_zone: "test.internal".into(),
+                routing_mode: None,
+            })
+            .await
+            .unwrap();
+
+        let device = service
+            .create_device(CreateDeviceInput {
+                instance_id: instance.id,
+                user_id: None,
+                display_name: "vm1".into(),
+                preshared_key: true,
+                create_dns_record: true,
+                dns_name: Some("vm1".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(device.dns_name.as_deref(), Some("vm1.test.internal"));
+        let records = service.list_dns_records(instance.id).await.unwrap();
+        assert_eq!(records[0].name, "vm1.test.internal");
+        assert_eq!(records[0].value, device.ipv4_address.to_string());
+
+        let invalid = service
+            .create_device(CreateDeviceInput {
+                instance_id: instance.id,
+                user_id: None,
+                display_name: "bad".into(),
+                preshared_key: true,
+                create_dns_record: true,
+                dns_name: Some("vm1.internal".into()),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code, "validation");
+        assert!(invalid.message.contains("test.internal"));
     }
 
     #[tokio::test]

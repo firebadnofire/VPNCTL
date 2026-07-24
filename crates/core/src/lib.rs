@@ -11,7 +11,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const DEFAULT_SUBNET: &str = "10.64.0.0/24";
-pub const DEFAULT_DNS_ZONE: &str = "vpn.internal";
+pub const DEFAULT_DNS_ZONE: &str = "internal";
 pub const DEFAULT_PORT: u16 = 51_820;
 pub const DEFAULT_KEEPALIVE: u16 = 25;
 
