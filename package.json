@@ -1,0 +1,16 @@
+{
+  "name": "vpn-appliance-manager-workspace",
+  "private": true,
+  "packageManager": "pnpm@11.9.0",
+  "scripts": {
+    "dev": "pnpm --dir apps/desktop tauri dev",
+    "build": "pnpm --dir apps/desktop tauri build",
+    "build:web": "pnpm --dir apps/desktop build:web",
+    "check": "pnpm --dir apps/desktop check",
+    "test": "pnpm --dir apps/desktop test",
+    "rust:fmt": "cargo fmt --all -- --check",
+    "rust:lint": "cargo clippy --workspace --all-targets -- -D warnings",
+    "rust:test": "cargo test --workspace",
+    "verify": "pnpm rust:fmt && pnpm rust:lint && pnpm rust:test && pnpm check && pnpm test && pnpm build:web"
+  }
+}

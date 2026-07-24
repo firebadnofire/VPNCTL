@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+  "apps/cli",
+  "apps/desktop/src-tauri",
+  "crates/application",
+  "crates/backend-wireguard",
+  "crates/core",
+  "crates/deployment",
+  "crates/dns",
+  "crates/protocol",
+  "crates/secrets",
+  "crates/ssh",
+  "crates/storage",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.97"
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+base64 = "0.22.1"
+chrono = { version = "0.4.42", features = ["serde"] }
+clap = { version = "4.5.48", features = ["derive"] }
+ipnet = { version = "2.11.0", features = ["serde"] }
+keyring = { version = "4.1.5", default-features = false, features = ["v1", "apple-native-keyring-store"] }
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
+russh = "0.62.3"
+russh-sftp = "2.3.0"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros", "chrono", "uuid"] }
+tauri = { version = "=2.11.5", features = [] }
+tauri-build = "2.5.1"
+tauri-plugin-dialog = "2.4.0"
+tempfile = "3.23.0"
+thiserror = "2.0.17"
+tokio = { version = "1.47.1", features = ["full"] }
+tokio-util = "0.7.16"
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18.1", features = ["v4", "serde"] }
+wireguard-conf = { version = "1.0.1", default-features = false }
+zeroize = { version = "1.8.2", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+needless_pass_by_value = "allow"
+similar_names = "allow"
+struct_excessive_bools = "allow"
+too_many_lines = "allow"
+format_push_string = "allow"

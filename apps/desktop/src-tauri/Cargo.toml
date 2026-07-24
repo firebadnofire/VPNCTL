@@ -1,0 +1,33 @@
+[package]
+name = "vpn-appliance-manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "vpn_appliance_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "vpn-appliance-manager"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tauri.workspace = true
+tauri-plugin-dialog.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+vam-application = { path = "../../../crates/application" }
+vam-core = { path = "../../../crates/core" }
+vam-protocol = { path = "../../../crates/protocol" }
+vam-secrets = { path = "../../../crates/secrets" }
+vam-storage = { path = "../../../crates/storage" }
+
+[lints]
+workspace = true
