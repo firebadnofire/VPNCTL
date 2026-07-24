@@ -15,23 +15,21 @@
     HostInspection,
     HostKeyProbe,
     InstanceHealth,
-    User,
     VpnInstance,
   } from "./lib/types";
 
-  type Section = "Hosts" | "Instances" | "Users & Devices" | "DNS" | "Backups" | "Logs";
+  type Section = "Hosts" | "Instances" | "Devices" | "DNS" | "Backups" | "Logs";
   type Modal =
     | "host"
     | "trust"
     | "instance"
-    | "user"
     | "device"
     | "dns"
     | "plan"
     | "qr"
     | null;
 
-  const sections: Section[] = ["Hosts", "Instances", "Users & Devices", "DNS", "Backups", "Logs"];
+  const sections: Section[] = ["Hosts", "Instances", "Devices", "DNS", "Backups", "Logs"];
   const recordTypes: DnsRecordType[] = ["A", "AAAA", "CNAME", "TXT", "SRV"];
   function shellSingleQuote(value: string) {
     return `'${value.replaceAll("'", "'\"'\"'")}'`;
@@ -51,7 +49,6 @@
   };
   let hosts: DockerHost[] = [];
   let instances: VpnInstance[] = [];
-  let users: User[] = [];
   let devices: Device[] = [];
   let records: DnsRecord[] = [];
   let backups: BackupInfo[] = [];
@@ -88,10 +85,8 @@
     dns_zone: "vpn.internal",
     routing_mode: "split_tunnel",
   };
-  let userName = "";
   let deviceForm = {
     instance_id: "",
-    user_id: "",
     display_name: "",
     preshared_key: true,
     create_dns_record: true,
@@ -124,15 +119,13 @@
   }
 
   async function refresh() {
-    const [nextHosts, nextInstances, nextUsers, nextLogs] = await Promise.all([
+    const [nextHosts, nextInstances, nextLogs] = await Promise.all([
       call<DockerHost[]>("list_hosts"),
       call<VpnInstance[]>("list_instances", { hostId: null }),
-      call<User[]>("list_users"),
       call<DeploymentProgress[]>("logs", { instanceId: null }),
     ]);
     hosts = nextHosts;
     instances = nextInstances;
-    users = nextUsers;
     logs = nextLogs;
     if (selectedHostId && !hosts.some((host) => host.id === selectedHostId)) selectedHostId = "";
     if (selectedInstanceId && !instances.some((instance) => instance.id === selectedInstanceId)) selectedInstanceId = "";
@@ -347,34 +340,9 @@
     notice = "Instance moved to remote trash and soft-deleted locally.";
   }
 
-  async function saveUser() {
-    const created = await task("Creating user", () =>
-      call<User>("create_user", { displayName: userName }),
-    );
-    if (!created) return;
-    modal = null;
-    userName = "";
-    await refresh();
-  }
-
-  async function removeUser(user: User) {
-    const accepted = await confirm(
-      `Delete user "${user.display_name}"? Devices assigned to this user will become unassigned.`,
-      { title: "Delete user", kind: "warning" },
-    );
-    if (!accepted) return;
-    const result = await task("Deleting user", () =>
-      call<void>("delete_user", { userId: user.id }),
-    );
-    if (result === undefined && error) return;
-    await refresh();
-    notice = "User deleted.";
-  }
-
   function openDevice() {
     deviceForm = {
       instance_id: selectedInstanceId || instances[0]?.id || "",
-      user_id: users[0]?.id || "",
       display_name: "",
       preshared_key: true,
       create_dns_record: true,
@@ -388,7 +356,7 @@
       call<Device>("create_device", {
         input: {
           ...deviceForm,
-          user_id: deviceForm.user_id || null,
+          user_id: null,
           dns_name: deviceForm.dns_name || null,
         },
       }),
@@ -549,8 +517,7 @@
       <div class="header-actions">
         {#if active === "Hosts"}<button class="primary" onclick={openHost}>Add host</button>{/if}
         {#if active === "Instances"}<button class="primary" onclick={openInstance} disabled={!hosts.length}>Create instance</button>{/if}
-        {#if active === "Users & Devices"}
-          <button class="secondary" onclick={() => (modal = "user")}>Add user</button>
+        {#if active === "Devices"}
           <button class="primary" onclick={openDevice} disabled={!instances.length}>Add device</button>
         {/if}
         {#if active === "DNS"}<button class="primary" onclick={openDns} disabled={!instances.length}>Add record</button>{/if}
@@ -651,7 +618,7 @@
                 <button class="secondary" onclick={() => instanceAction("start_instance", instance)}>Start</button>
                 <button class="secondary" onclick={() => instanceAction("stop_instance", instance)}>Stop</button>
                 <button class="secondary" onclick={() => instanceAction("health", instance)}>Health</button>
-                <button class="secondary" onclick={() => reviewPlan(instance)}>Plan</button>
+                <button class="secondary" title="Preview deployment changes before applying them" onclick={() => reviewPlan(instance)}>Preview deploy</button>
                 <button class="menu danger" title="Delete" onclick={() => removeInstance(instance)}>Delete</button>
               </article>
             {/each}
@@ -660,18 +627,18 @@
           <div class="empty"><h3>No VPN instances</h3><p>Create a WireGuard appliance after adding and approving a Docker host.</p></div>
         {/if}
       </section>
-    {:else if active === "Users & Devices"}
+    {:else if active === "Devices"}
       <div class="toolbar">
         <label>Instance<select bind:value={selectedInstanceId} onchange={refreshInstanceData}><option value="">Select…</option>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
       </div>
       <section class="panel">
-        <div class="panel-head"><h3>Device identities</h3><span>{instanceDevices.length} for selected instance · {users.length} global users</span></div>
+        <div class="panel-head"><h3>Device identities</h3><span>{instanceDevices.length} for selected instance</span></div>
         {#if instanceDevices.length}
           <div class="rows">
             {#each instanceDevices as device}
               <article>
                 <div class:disabled={!device.enabled} class="status-icon">{device.enabled ? "●" : "○"}</div>
-                <div class="row-main"><strong>{device.display_name}</strong><small>{device.ipv4_address} · {users.find((user) => user.id === device.user_id)?.display_name || "Unassigned"}</small></div>
+                <div class="row-main"><strong>{device.display_name}</strong><small>{device.ipv4_address}</small></div>
                 <button class="secondary" onclick={() => toggleDevice(device)}>{device.enabled ? "Disable" : "Enable"}</button>
                 <button class="secondary" onclick={() => replaceDeviceIdentity(device)}>Replace key</button>
                 <button class="secondary" onclick={() => showQr(device)}>QR</button>
@@ -682,25 +649,6 @@
           </div>
         {:else}
           <div class="empty"><h3>No devices for this instance</h3><p>Private keys are generated locally and remain in the macOS Keychain.</p></div>
-        {/if}
-      </section>
-      <section class="panel compact">
-        <div class="panel-head"><h3>Users</h3><span>{users.length} configured</span></div>
-        {#if users.length}
-          <div class="rows">
-            {#each users as user}
-              <article>
-                <div class="status-icon">U</div>
-                <div class="row-main">
-                  <strong>{user.display_name}</strong>
-                  <small>{devices.filter((device) => device.user_id === user.id).length} devices assigned in selected instance</small>
-                </div>
-                <button class="menu danger" title="Delete" onclick={() => removeUser(user)}>Delete</button>
-              </article>
-            {/each}
-          </div>
-        {:else}
-          <div class="empty small-empty"><h3>No users yet</h3><p>Create users before assigning device identities.</p></div>
         {/if}
       </section>
     {:else if active === "DNS"}
@@ -800,17 +748,10 @@
           <p class="help">The gateway receives the first usable address. IPv6 is not advertised until an IPv6 tunnel address exists.</p>
           <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary">Create instance</button></div>
         </form>
-      {:else if modal === "user"}
-        <div class="modal-head"><h2>Add global user</h2><button onclick={() => (modal = null)}>×</button></div>
-        <form onsubmit={(event) => { event.preventDefault(); saveUser(); }}>
-          <label>Display name<input bind:value={userName} required /></label>
-          <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary">Add user</button></div>
-        </form>
       {:else if modal === "device"}
         <div class="modal-head"><div><p class="eyebrow">LOCAL KEY GENERATION</p><h2>Add device</h2></div><button onclick={() => (modal = null)}>×</button></div>
         <form onsubmit={(event) => { event.preventDefault(); saveDevice(); }}>
           <label>Instance<select bind:value={deviceForm.instance_id} required>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
-          <label>User<select bind:value={deviceForm.user_id}><option value="">Unassigned</option>{#each users as user}<option value={user.id}>{user.display_name}</option>{/each}</select></label>
           <label>Device name<input bind:value={deviceForm.display_name} required placeholder="William’s MacBook" /></label>
           <label>DNS name <span class="optional">optional</span><input bind:value={deviceForm.dns_name} placeholder="macbook" /></label>
           <label class="checkbox"><input type="checkbox" bind:checked={deviceForm.preshared_key} /> Generate a preshared key (recommended)</label>
@@ -827,14 +768,14 @@
           <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary">Validate and save</button></div>
         </form>
       {:else if modal === "plan" && plan}
-        <div class="modal-head"><div><p class="eyebrow">CONFIRM DEPLOYMENT</p><h2>Review structural plan</h2></div><button onclick={() => (modal = null)}>×</button></div>
-        <p class="help">The plan was calculated against the verified remote manifest. A backup and full health check bracket every mutation.</p>
+        <div class="modal-head"><div><p class="eyebrow">DEPLOYMENT PREVIEW</p><h2>Preview remote changes</h2></div><button onclick={() => (modal = null)}>×</button></div>
+        <p class="help">This preview shows what Apply will change on the verified SSH host. Nothing is changed until you apply it.</p>
         {#if plan.operations.length}
           <ol class="operations">{#each plan.operations as operation}<li><code>{JSON.stringify(operation)}</code></li>{/each}</ol>
         {:else}<div class="empty small-empty"><h3>No changes</h3><p>Remote hashes match desired state.</p></div>{/if}
         {#each plan.warnings as warning}<div class="warning">{warning}</div>{/each}
         <div class="hash">Desired state <code>{plan.desired_state_hash}</code></div>
-        <div class="modal-actions"><button class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary" onclick={applyPlan} disabled={!plan.operations.length}>Apply, verify, and rollback on failure</button></div>
+        <div class="modal-actions"><button class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary" onclick={applyPlan} disabled={!plan.operations.length}>Apply these changes</button></div>
       {:else if modal === "qr"}
         <div class="modal-head"><div><p class="eyebrow">PRIVATE CONFIGURATION</p><h2>WireGuard QR code</h2></div><button onclick={() => { modal = null; qrSvg = ""; }}>×</button></div>
         <div class="qr">{@html qrSvg}</div>
