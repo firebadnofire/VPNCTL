@@ -104,6 +104,7 @@
   $: selectedHost = hosts.find((item) => item.id === selectedHostId);
   $: instanceDevices = devices.filter((item) => item.instance_id === selectedInstanceId);
   $: instanceRecords = records.filter((item) => item.instance_id === selectedInstanceId);
+  $: dnsFormInstance = instances.find((item) => item.id === dnsForm.instance_id);
 
   onMount(load);
 
@@ -444,6 +445,15 @@
   }
 
   async function saveDns() {
+    const ownerError = dnsOwnerZoneError(dnsForm.name, dnsFormInstance?.dns.zone || "");
+    if (ownerError) {
+      error = {
+        code: "validation",
+        message: ownerError,
+        remote_state_changed: false,
+      };
+      return;
+    }
     const result = await task("Validating DNS record", () =>
       call<DnsRecord>("create_dns_record", { input: dnsForm }),
     );
@@ -452,6 +462,15 @@
     selectedInstanceId = result.instance_id;
     await refreshInstanceData();
     notice = "DNS record saved. The instance now has pending desired-state changes.";
+  }
+
+  function dnsOwnerZoneError(name: string, zone: string) {
+    if (!zone) return null;
+    const owner = name.trim().replace(/\.$/, "").toLowerCase();
+    const normalizedZone = zone.trim().replace(/\.$/, "").toLowerCase();
+    if (!owner || owner === "@" || !owner.includes(".")) return null;
+    if (owner === normalizedZone || owner.endsWith(`.${normalizedZone}`)) return null;
+    return `DNS owner names must be short names inside ${zone}, or fully-qualified names ending in .${zone}.`;
   }
 
   async function removeDns(record: DnsRecord) {
@@ -656,7 +675,7 @@
     {:else if active === "DNS"}
       <div class="toolbar">
         <label>Instance<select bind:value={selectedInstanceId} onchange={refreshInstanceData}><option value="">Select…</option>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
-        {#if selectedInstance}<span>SOA {selectedInstance.dns.soa_serial}</span>{/if}
+        {#if selectedInstance}<span>Zone {selectedInstance.dns.zone} - SOA {selectedInstance.dns.soa_serial}</span>{/if}
       </div>
       <section class="panel">
         <div class="panel-head"><h3>Private DNS records</h3><span>A · AAAA · CNAME · TXT · SRV</span></div>
@@ -764,7 +783,10 @@
         <div class="modal-head"><div><p class="eyebrow">PRIVATE ZONE</p><h2>Add DNS record</h2></div><button onclick={() => (modal = null)}>×</button></div>
         <form onsubmit={(event) => { event.preventDefault(); saveDns(); }}>
           <label>Instance<select bind:value={dnsForm.instance_id} required>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
-          <div class="form-grid"><label>Owner name<input bind:value={dnsForm.name} required placeholder="service" /></label><label>Record type<select bind:value={dnsForm.record_type}>{#each recordTypes as type}<option value={type}>{type}</option>{/each}</select></label></div>
+          <div class="form-grid"><label>Owner name<input bind:value={dnsForm.name} required placeholder="vm1" /></label><label>Record type<select bind:value={dnsForm.record_type}>{#each recordTypes as type}<option value={type}>{type}</option>{/each}</select></label></div>
+          {#if dnsFormInstance}
+            <p class="help">Use a short name like vm1, or a full name ending in .{dnsFormInstance.dns.zone}. Names outside this zone will not resolve here.</p>
+          {/if}
           <label>Value<input bind:value={dnsForm.value} required placeholder={dnsForm.record_type === "A" ? "10.64.0.10" : "Record value"} /></label>
           <label>TTL<input type="number" bind:value={dnsForm.ttl} min="30" max="86400" required /></label>
           <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary">Validate and save</button></div>

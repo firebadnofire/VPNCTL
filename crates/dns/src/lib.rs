@@ -130,6 +130,8 @@ fn canonical_owner(name: &str, zone: &str) -> Result<String, DnsError> {
         zone.to_owned()
     } else if name.ends_with(&format!(".{zone}")) || name == zone {
         name.clone()
+    } else if name.contains('.') {
+        return Err(DnsError::OutsideZone(name));
     } else {
         format!("{name}.{zone}")
     };
@@ -285,5 +287,30 @@ mod tests {
             next_soa_serial(2_026_072_399, date).unwrap_err(),
             DnsError::SerialExhausted
         );
+    }
+
+    #[test]
+    fn rejects_dotted_owners_outside_zone() {
+        assert_eq!(
+            validate_records(
+                "testsrv.internal",
+                &[record("vm1.internal", DnsRecordType::A, "10.64.0.2")]
+            )
+            .unwrap_err(),
+            DnsError::OutsideZone("vm1.internal".into())
+        );
+
+        let zone = render_zone(
+            "testsrv.internal",
+            "10.64.0.1".parse().unwrap(),
+            2_026_072_301,
+            &[record(
+                "vm1.testsrv.internal",
+                DnsRecordType::A,
+                "10.64.0.2",
+            )],
+        )
+        .unwrap();
+        assert!(zone.contains("vm1 300 IN A 10.64.0.2"));
     }
 }
