@@ -115,6 +115,9 @@ input:focus, select:focus { border-color: #2f80ed; box-shadow: 0 0 0 3px #2f80ed
 .checkbox input { width: auto; }
 .help { color: #627d98; font-size: 12px; line-height: 1.55; }
 .help.centered { text-align: center; }
+.command-card { display: grid; gap: 7px; margin: 12px 0; padding: 12px; border: 1px solid #d9e5ef; border-radius: 8px; background: #f8fafc; }
+.command-card span, .command-card small { color: #627d98; font-size: 11px; }
+.command-card pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; line-height: 1.45; color: #243b53; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 7px; }
 .fingerprint-card { background: #f1f6fb; border: 1px solid #d9e5ef; border-radius: 9px; padding: 14px; display: grid; gap: 8px; margin-bottom: 13px; }
 .fingerprint-card.critical { background: #fff4e5; border-color: #ffd8a8; }

@@ -33,6 +33,7 @@
 
   const sections: Section[] = ["Hosts", "Instances", "Users & Devices", "DNS", "Backups", "Logs"];
   const recordTypes: DnsRecordType[] = ["A", "AAAA", "CNAME", "TXT", "SRV"];
+  const remoteHostKeyCommand = `for key in /etc/ssh/ssh_host_*_key.pub; do test -r "$key" && ssh-keygen -l -E sha256 -f "$key"; done`;
 
   let active: Section = "Hosts";
   let modal: Modal = null;
@@ -719,6 +720,11 @@
           {#if probe.approved_fingerprint}<small>Previously approved: {probe.approved_fingerprint}</small>{/if}
         </div>
         <p class="help">Verify this SHA-256 fingerprint through a trusted channel, then enter it exactly. No authentication occurs during the probe.</p>
+        <div class="command-card">
+          <span>On the remote server, run:</span>
+          <pre>{remoteHostKeyCommand}</pre>
+          <small>Compare the {probe.key.algorithm} line to the fingerprint above.</small>
+        </div>
         <label>Fingerprint confirmation<input bind:value={fingerprintConfirmation} spellcheck="false" placeholder="SHA256:…" /></label>
         {#if probe.state === "changed"}<label class="checkbox critical-text"><input type="checkbox" bind:checked={replaceChangedKey} /> I separately verified and intend to replace the approved key.</label>{/if}
         <div class="modal-actions"><button class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary" onclick={approveKey} disabled={fingerprintConfirmation !== probe.key.sha256_fingerprint || (probe.state === "changed" && !replaceChangedKey)}>Approve key</button></div>
