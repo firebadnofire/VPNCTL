@@ -25,6 +25,8 @@ pub enum StorageError {
     Serialization(#[from] serde_json::Error),
     #[error("record was not found")]
     NotFound,
+    #[error("host still has active VPN instances")]
+    HostHasActiveInstances,
     #[error("the SSH host key differs from the approved key")]
     HostKeyChanged,
     #[error("stored data is invalid: {0}")]
@@ -127,13 +129,86 @@ impl Storage {
     }
 
     pub async fn delete_host(&self, id: Uuid) -> Result<(), StorageError> {
+        let active_instance = sqlx::query(
+            "SELECT id FROM vpn_instances
+             WHERE host_id = ? AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        if active_instance.is_some() {
+            return Err(StorageError::HostHasActiveInstances);
+        }
+
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM deployment_events
+             WHERE deployment_id IN (
+               SELECT d.id FROM deployments d
+               JOIN vpn_instances i ON i.id = d.instance_id
+               WHERE i.host_id = ?
+             )",
+        )
+        .bind(id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "DELETE FROM deployments
+             WHERE instance_id IN (SELECT id FROM vpn_instances WHERE host_id = ?)",
+        )
+        .bind(id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "DELETE FROM dns_records
+             WHERE instance_id IN (SELECT id FROM vpn_instances WHERE host_id = ?)",
+        )
+        .bind(id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "DELETE FROM secret_references
+             WHERE owner_id IN (
+               SELECT id FROM devices
+               WHERE instance_id IN (SELECT id FROM vpn_instances WHERE host_id = ?)
+             )",
+        )
+        .bind(id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "DELETE FROM devices
+             WHERE instance_id IN (SELECT id FROM vpn_instances WHERE host_id = ?)",
+        )
+        .bind(id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query("DELETE FROM vpn_instances WHERE host_id = ?")
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query("DELETE FROM known_host_keys WHERE host_id = ?")
+            .bind(id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        sqlx::query(
+            "DELETE FROM secret_references
+             WHERE id IN (
+               SELECT passphrase_secret_ref FROM docker_hosts
+               WHERE id = ? AND passphrase_secret_ref IS NOT NULL
+             )",
+        )
+        .bind(id.to_string())
+        .execute(&mut *transaction)
+        .await?;
         let result = sqlx::query("DELETE FROM docker_hosts WHERE id = ?")
             .bind(id.to_string())
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await?;
         if result.rows_affected() == 0 {
             return Err(StorageError::NotFound);
         }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -519,6 +594,7 @@ impl Storage {
             users,
             devices,
             dns_records,
+            dns_blocklist_domains: Vec::new(),
         })
     }
 
@@ -951,8 +1027,9 @@ mod tests {
     use chrono::Utc;
     use std::path::PathBuf;
     use vam_core::{
-        DEFAULT_KEEPALIVE, DeviceBackendData, DnsConfig, EndpointConfig, NetworkConfig,
-        RoutingMode, SecretReference, SshConnectionConfig, VpnBackendKind, WireGuardDeviceData,
+        DEFAULT_KEEPALIVE, DeviceBackendData, DnsConfig, DnsRecordType, EndpointConfig,
+        NetworkConfig, RoutingMode, SecretReference, SshConnectionConfig, VpnBackendKind,
+        WireGuardDeviceData,
     };
     use vam_protocol::DeploymentPlan;
 
@@ -1058,6 +1135,152 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_host_rejects_active_instances() {
+        let storage = Storage::in_memory().await.unwrap();
+        let host = host();
+        storage.save_host(&host).await.unwrap();
+        storage
+            .save_instance(&instance(host.id, Uuid::new_v4(), 51_820))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            storage.delete_host(host.id).await,
+            Err(StorageError::HostHasActiveInstances)
+        ));
+        assert_eq!(
+            storage.list_instances(Some(host.id)).await.unwrap().len(),
+            1
+        );
+        assert_eq!(storage.get_host(host.id).await.unwrap(), host);
+    }
+
+    #[tokio::test]
+    async fn delete_host_removes_soft_deleted_instance_rows() {
+        let storage = Storage::in_memory().await.unwrap();
+        let mut host = host();
+        let passphrase = SecretReference(Uuid::new_v4());
+        host.ssh.passphrase_ref = Some(passphrase.clone());
+        storage.save_host(&host).await.unwrap();
+        storage
+            .register_secret_reference(passphrase.0, "ssh_key_passphrase", passphrase.0)
+            .await
+            .unwrap();
+        storage
+            .approve_host_key(
+                host.id,
+                &HostKeyInfo {
+                    hostname: host.ssh.hostname.clone(),
+                    resolved_address: "203.0.113.10".into(),
+                    port: host.ssh.port,
+                    algorithm: "ssh-ed25519".into(),
+                    sha256_fingerprint: "SHA256:test".into(),
+                    public_key_base64: "public".into(),
+                },
+                false,
+            )
+            .await
+            .unwrap();
+        let instance = instance(host.id, Uuid::new_v4(), 51_820);
+        storage.save_instance(&instance).await.unwrap();
+        let device_secret = SecretReference(Uuid::new_v4());
+        let device = Device {
+            id: Uuid::new_v4(),
+            instance_id: instance.id,
+            user_id: None,
+            display_name: "peer".into(),
+            ipv4_address: "10.64.0.2".parse().unwrap(),
+            ipv6_address: None,
+            dns_name: Some("peer.vpn.internal".into()),
+            enabled: true,
+            backend_data: DeviceBackendData::WireGuard(WireGuardDeviceData {
+                public_key: "public".into(),
+                private_key_ref: device_secret.clone(),
+                preshared_key_ref: None,
+            }),
+            created_at: Utc::now(),
+            deleted_at: None,
+        };
+        storage.save_device(&device).await.unwrap();
+        storage
+            .register_secret_reference(device_secret.0, "wireguard_private_key", device.id)
+            .await
+            .unwrap();
+        storage
+            .save_dns_record(&DnsRecord {
+                id: Uuid::new_v4(),
+                instance_id: instance.id,
+                name: "peer".into(),
+                record_type: DnsRecordType::A,
+                value: device.ipv4_address.to_string(),
+                ttl: 300,
+                enabled: true,
+                managed_by_device_id: Some(device.id),
+            })
+            .await
+            .unwrap();
+        let plan = DeploymentPlan {
+            id: Uuid::new_v4(),
+            instance_id: instance.id,
+            operations: Vec::new(),
+            warnings: Vec::new(),
+            desired_state_hash: "test".into(),
+        };
+        let state = DesiredState {
+            instance: instance.clone(),
+            users: Vec::new(),
+            devices: vec![device],
+            dns_records: Vec::new(),
+            dns_blocklist_domains: Vec::new(),
+        };
+        storage
+            .record_deployment(&plan, &state, DeploymentStatus::Succeeded)
+            .await
+            .unwrap();
+        storage
+            .record_deployment_event(
+                &DeploymentProgress {
+                    deployment_id: plan.id,
+                    sequence: 1,
+                    timestamp: Utc::now(),
+                    phase: "test".into(),
+                    message: "recorded".into(),
+                    technical_detail: None,
+                },
+                "info",
+            )
+            .await
+            .unwrap();
+        storage
+            .soft_delete_instance(instance.id, Utc::now())
+            .await
+            .unwrap();
+
+        storage.delete_host(host.id).await.unwrap();
+
+        assert!(matches!(
+            storage.get_host(host.id).await,
+            Err(StorageError::NotFound)
+        ));
+        assert_eq!(row_count(&storage, "docker_hosts").await, 0);
+        assert_eq!(row_count(&storage, "known_host_keys").await, 0);
+        assert_eq!(row_count(&storage, "vpn_instances").await, 0);
+        assert_eq!(row_count(&storage, "devices").await, 0);
+        assert_eq!(row_count(&storage, "dns_records").await, 0);
+        assert_eq!(row_count(&storage, "deployments").await, 0);
+        assert_eq!(row_count(&storage, "deployment_events").await, 0);
+        assert_eq!(row_count(&storage, "secret_references").await, 0);
+    }
+
+    async fn row_count(storage: &Storage, table: &str) -> i64 {
+        let query = format!("SELECT COUNT(*) FROM {table}");
+        sqlx::query_scalar(&query)
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
     async fn delete_user_clears_device_json_ownership() {
         let storage = Storage::in_memory().await.unwrap();
         let host = host();
@@ -1134,6 +1357,7 @@ mod tests {
             users: Vec::new(),
             devices: vec![device],
             dns_records: Vec::new(),
+            dns_blocklist_domains: Vec::new(),
         };
         let first_plan = DeploymentPlan {
             id: Uuid::new_v4(),
@@ -1158,6 +1382,7 @@ mod tests {
             users: Vec::new(),
             devices: Vec::new(),
             dns_records: Vec::new(),
+            dns_blocklist_domains: Vec::new(),
         };
         for index in 0..10 {
             let plan = DeploymentPlan {

@@ -10,6 +10,7 @@
     DeploymentProgress,
     DeploymentResult,
     Device,
+    DnsHostlist,
     DnsRecord,
     DnsRecordType,
     DockerHost,
@@ -20,17 +21,20 @@
   } from "./lib/types";
 
   type Section = "Hosts" | "Instances" | "Devices" | "DNS" | "Backups" | "Logs";
+  type DnsPanel = "Records" | "Hostlists";
   type Modal =
     | "host"
     | "trust"
     | "instance"
     | "device"
     | "dns"
+    | "hostlist"
     | "plan"
     | "qr"
     | null;
 
   const sections: Section[] = ["Hosts", "Instances", "Devices", "DNS", "Backups", "Logs"];
+  const dnsPanels: DnsPanel[] = ["Records", "Hostlists"];
   const recordTypes: DnsRecordType[] = ["A", "AAAA", "CNAME", "TXT", "SRV"];
   const healthCheckLabels: Record<keyof Omit<InstanceHealth, "details">, string> = {
     compose_project_exists: "Compose project exists",
@@ -41,7 +45,7 @@
     public_dns_resolves: "Public DNS resolves",
     wireguard_interface_exists: "WireGuard interface exists",
     listen_port_matches: "WireGuard UDP port published",
-    expected_peers_present: "Expected peers present",
+    expected_peers_present: "Peer set matches desired state",
   };
   function shellSingleQuote(value: string) {
     return `'${value.replaceAll("'", "'\"'\"'")}'`;
@@ -52,6 +56,7 @@
   }
 
   let active: Section = "Hosts";
+  let activeDnsPanel: DnsPanel = "Records";
   let modal: Modal = null;
   let appInfo: AppInfo = {
     name: "VPN Appliance Manager",
@@ -63,6 +68,7 @@
   let instances: VpnInstance[] = [];
   let devices: Device[] = [];
   let records: DnsRecord[] = [];
+  let hostlists: DnsHostlist[] = [];
   let backups: BackupInfo[] = [];
   let logs: DeploymentProgress[] = [];
   let selectedHostId = "";
@@ -112,6 +118,12 @@
     value: string;
     ttl: number;
   } = { instance_id: "", name: "", record_type: "A", value: "", ttl: 300 };
+  let hostlistForm = {
+    id: "",
+    name: "",
+    url: "",
+    coverage: "",
+  };
 
   $: selectedInstance = instances.find((item) => item.id === selectedInstanceId);
   $: selectedHost = hosts.find((item) => item.id === selectedHostId);
@@ -135,13 +147,15 @@
   }
 
   async function refresh() {
-    const [nextHosts, nextInstances, nextLogs] = await Promise.all([
+    const [nextHosts, nextInstances, nextHostlists, nextLogs] = await Promise.all([
       call<DockerHost[]>("list_hosts"),
       call<VpnInstance[]>("list_instances", { hostId: null }),
+      call<DnsHostlist[]>("list_dns_hostlists"),
       call<DeploymentProgress[]>("logs", { instanceId: null }),
     ]);
     hosts = nextHosts;
     instances = nextInstances;
+    hostlists = nextHostlists;
     logs = nextLogs;
     if (selectedHostId && !hosts.some((host) => host.id === selectedHostId)) selectedHostId = "";
     if (selectedInstanceId && !instances.some((instance) => instance.id === selectedInstanceId)) selectedInstanceId = "";
@@ -549,6 +563,62 @@
     await refreshInstanceData();
   }
 
+  function openHostlist(hostlist: DnsHostlist | null = null) {
+    hostlistForm = hostlist
+      ? {
+          id: hostlist.id,
+          name: hostlist.name,
+          url: hostlist.url,
+          coverage: hostlist.coverage,
+        }
+      : {
+          id: "",
+          name: "",
+          url: "",
+          coverage: "",
+        };
+    modal = "hostlist";
+  }
+
+  async function refreshHostlists() {
+    hostlists = await call<DnsHostlist[]>("list_dns_hostlists");
+  }
+
+  async function saveHostlist() {
+    const payload = {
+      name: hostlistForm.name,
+      url: hostlistForm.url,
+      coverage: hostlistForm.coverage,
+    };
+    const result = hostlistForm.id
+      ? await task("Saving hostlist", () =>
+          call<DnsHostlist>("update_dns_hostlist", {
+            hostlist: { id: hostlistForm.id, ...payload },
+          }),
+        )
+      : await task("Adding hostlist", () =>
+          call<DnsHostlist>("create_dns_hostlist", { input: payload }),
+        );
+    if (!result) return;
+    modal = null;
+    await refreshHostlists();
+    notice = "Hostlist saved. Deploy or refresh DNS to apply the updated blocklist.";
+  }
+
+  async function removeHostlist(hostlist: DnsHostlist) {
+    const accepted = await confirm(`Delete ${hostlist.name}?`, {
+      title: "Delete hostlist",
+      kind: "warning",
+    });
+    if (!accepted) return;
+    const result = await task("Deleting hostlist", () =>
+      call<void>("delete_dns_hostlist", { hostlistId: hostlist.id }),
+    );
+    if (result === undefined && error) return;
+    await refreshHostlists();
+    notice = "Hostlist deleted. Deploy or refresh DNS to apply the updated blocklist.";
+  }
+
   async function makeBackup(instanceId = selectedInstanceId) {
     if (!instanceId) return;
     const result = await task("Creating remote backup", () =>
@@ -626,8 +696,10 @@
           <button class="primary" onclick={openDevice} disabled={!instances.length}>Add device</button>
         {/if}
         {#if active === "DNS"}
-          <button class="secondary" onclick={refreshRemoteDnsStore} disabled={!selectedInstanceId}>Refresh DNS store</button>
-          <button class="primary" onclick={openDns} disabled={!instances.length}>Add record</button>
+          {#if activeDnsPanel === "Records"}
+            <button class="secondary" onclick={refreshRemoteDnsStore} disabled={!selectedInstanceId}>Refresh DNS store</button>
+            <button class="primary" onclick={openDns} disabled={!instances.length}>Add record</button>
+          {/if}
         {/if}
         {#if active === "Backups"}<button class="primary" onclick={() => makeBackup()} disabled={!selectedInstanceId}>Create backup</button>{/if}
       </div>
@@ -789,6 +861,12 @@
         <label>Instance<select bind:value={selectedInstanceId} onchange={refreshInstanceData}><option value="">Select…</option>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
         {#if selectedInstance}<span>Zone {selectedInstance.dns.zone} - SOA {selectedInstance.dns.soa_serial}</span>{/if}
       </div>
+      <div class="tabs" role="tablist" aria-label="DNS panels">
+        {#each dnsPanels as panel}
+          <button type="button" role="tab" aria-selected={activeDnsPanel === panel} class:active={activeDnsPanel === panel} onclick={() => (activeDnsPanel = panel)}>{panel}</button>
+        {/each}
+      </div>
+      {#if activeDnsPanel === "Records"}
       <section class="panel">
         <div class="panel-head"><h3>Private DNS records</h3><span>A · AAAA · CNAME · TXT · SRV</span></div>
         {#if instanceRecords.length}
@@ -802,6 +880,32 @@
           <div class="empty"><h3>No custom records</h3><p>The gateway record is generated automatically. Other queries use DNS-over-TLS.</p></div>
         {/if}
       </section>
+      {:else}
+        <section class="panel">
+          <div class="panel-head">
+            <h3>Hostlists</h3>
+            <div class="panel-head-actions">
+              <span>{hostlists.length} HTTPS sources</span>
+              <button class="primary small" onclick={() => openHostlist()}>Add</button>
+            </div>
+          </div>
+          {#if hostlists.length}
+            <div class="hostlist-table">
+              <div class="hostlist-head"><span>Name</span><span>URL</span><span>Coverage</span><span></span></div>
+              {#each hostlists as hostlist}
+                <div>
+                  <strong>{hostlist.name}</strong>
+                  <a href={hostlist.url} target="_blank" rel="noreferrer" aria-label={`Open ${hostlist.name}`}>{hostlist.url}</a>
+                  <span>{hostlist.coverage || "Custom hosts source"}</span>
+                  <span class="row-actions"><button class="secondary" onclick={() => openHostlist(hostlist)}>Edit</button><button class="menu danger" onclick={() => removeHostlist(hostlist)}>Delete</button></span>
+                </div>
+              {/each}
+            </div>
+          {:else}
+            <div class="empty"><h3>No hostlists</h3><p>Add HTTPS hosts files to build the DNS blocklist used by future deployments.</p></div>
+          {/if}
+        </section>
+      {/if}
     {:else if active === "Backups"}
       <div class="toolbar">
         <label>Instance<select bind:value={selectedInstanceId} onchange={refreshInstanceData}><option value="">Select…</option>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
@@ -905,6 +1009,15 @@
           <label>Value<input bind:value={dnsForm.value} required placeholder={dnsForm.record_type === "A" ? "10.64.0.10" : "Record value"} /></label>
           <label>TTL<input type="number" bind:value={dnsForm.ttl} min="30" max="86400" required /></label>
           <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary">Validate and save</button></div>
+        </form>
+      {:else if modal === "hostlist"}
+        <div class="modal-head"><div><p class="eyebrow">DNS BLOCKLIST</p><h2>{hostlistForm.id ? "Edit hostlist" : "Add hostlist"}</h2></div><button onclick={() => (modal = null)}>Ã—</button></div>
+        <form onsubmit={(event) => { event.preventDefault(); saveHostlist(); }}>
+          <label>Name<input bind:value={hostlistForm.name} required placeholder="Malware hosts" /></label>
+          <label>HTTPS URL<input type="url" bind:value={hostlistForm.url} required placeholder="https://example.com/hosts" /></label>
+          <label>Coverage <span class="optional">optional</span><input bind:value={hostlistForm.coverage} placeholder="Adware, malware, telemetry" /></label>
+          <p class="help">Saved hostlists are fetched over HTTPS while rendering deployments. The app starts with no built-in hostlists.</p>
+          <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary">{hostlistForm.id ? "Save changes" : "Add hostlist"}</button></div>
         </form>
       {:else if modal === "plan" && plan}
         <div class="modal-head"><div><p class="eyebrow">DEPLOYMENT PREVIEW</p><h2>Preview remote changes</h2></div><button onclick={() => (modal = null)}>×</button></div>

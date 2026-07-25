@@ -160,6 +160,8 @@ pub struct DesiredState {
     pub users: Vec<User>,
     pub devices: Vec<Device>,
     pub dns_records: Vec<DnsRecord>,
+    #[serde(default)]
+    pub dns_blocklist_domains: Vec<String>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

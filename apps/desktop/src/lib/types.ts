@@ -89,6 +89,13 @@ export interface DnsRecord {
   managed_by_device_id?: UUID;
 }
 
+export interface DnsHostlist {
+  id: UUID;
+  name: string;
+  url: string;
+  coverage: string;
+}
+
 export interface HostKeyInfo {
   hostname: string;
   resolved_address: string;

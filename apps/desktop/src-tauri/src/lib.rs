@@ -3,8 +3,8 @@ use std::{path::PathBuf, sync::Arc};
 use tauri::{Manager, State};
 use uuid::Uuid;
 use vam_application::{
-    ApplicationService, CreateDeviceInput, CreateDnsRecordInput, CreateHostInput,
-    CreateInstanceInput,
+    ApplicationService, CreateDeviceInput, CreateDnsHostlistInput, CreateDnsRecordInput,
+    CreateHostInput, CreateInstanceInput, DnsHostlist,
 };
 use vam_core::{Device, DnsRecord, DockerHost, User, VpnInstance};
 use vam_protocol::{
@@ -256,6 +256,35 @@ async fn delete_dns_record(
 }
 
 #[tauri::command]
+async fn list_dns_hostlists(state: State<'_, AppState>) -> Result<Vec<DnsHostlist>, AppError> {
+    state.0.list_dns_hostlists().await
+}
+
+#[tauri::command]
+async fn create_dns_hostlist(
+    state: State<'_, AppState>,
+    input: CreateDnsHostlistInput,
+) -> Result<DnsHostlist, AppError> {
+    state.0.create_dns_hostlist(input).await
+}
+
+#[tauri::command]
+async fn update_dns_hostlist(
+    state: State<'_, AppState>,
+    hostlist: DnsHostlist,
+) -> Result<DnsHostlist, AppError> {
+    state.0.update_dns_hostlist(hostlist).await
+}
+
+#[tauri::command]
+async fn delete_dns_hostlist(
+    state: State<'_, AppState>,
+    hostlist_id: Uuid,
+) -> Result<(), AppError> {
+    state.0.delete_dns_hostlist(hostlist_id).await
+}
+
+#[tauri::command]
 async fn create_backup(
     state: State<'_, AppState>,
     instance_id: Uuid,
@@ -387,6 +416,10 @@ pub fn run() {
             update_dns_record,
             list_dns_records,
             delete_dns_record,
+            list_dns_hostlists,
+            create_dns_hostlist,
+            update_dns_hostlist,
+            delete_dns_hostlist,
             create_backup,
             refresh_remote_credentials,
             refresh_remote_dns_store,

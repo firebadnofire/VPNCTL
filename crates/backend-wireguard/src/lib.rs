@@ -260,6 +260,7 @@ mod tests {
             users: Vec::new(),
             devices: vec![device.clone()],
             dns_records: Vec::new(),
+            dns_blocklist_domains: Vec::new(),
         };
         let secrets = HashMap::from([
             (private_ref, Zeroizing::new("client-private".into())),

@@ -8,7 +8,7 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vam_core::DesiredState;
-use vam_dns::{DnsError, render_corefile, render_zone};
+use vam_dns::{DnsError, render_blocklist_hosts, render_corefile, render_zone};
 use vam_protocol::{AppError, DeploymentOperation, DeploymentPlan, DeploymentResult, RenderedFile};
 
 pub const WIREGUARD_IMAGE: &str = "ghcr.io/linuxserver/wireguard:latest";
@@ -96,6 +96,12 @@ pub fn render_shared_files(state: &DesiredState) -> Result<Vec<RenderedFile>, De
         file("instance.json", format!("{instance_json}\n"), 0o600, false)?,
         file("dns/Corefile", corefile, 0o644, false)?,
         file(
+            "dns/hosts/blocklist.hosts",
+            render_blocklist_hosts(&state.dns_blocklist_domains),
+            0o644,
+            false,
+        )?,
+        file(
             &format!("dns/zones/db.{}", instance.dns.zone),
             zone,
             0o644,
@@ -108,7 +114,61 @@ pub fn render_shared_files(state: &DesiredState) -> Result<Vec<RenderedFile>, De
 pub fn render_compose(state: &DesiredState) -> String {
     let scope = state.instance.id;
     format!(
-        "name: {}\nservices:\n  gateway:\n    image: {}\n    restart: unless-stopped\n    labels:\n      com.centurylinklabs.watchtower.enable: \"true\"\n      com.centurylinklabs.watchtower.scope: \"{scope}\"\n    cap_add:\n      - NET_ADMIN\n    environment:\n      PUID: \"0\"\n      PGID: \"0\"\n      TZ: UTC\n      LOG_CONFS: \"false\"\n    sysctls:\n      net.ipv4.ip_forward: \"1\"\n      net.ipv4.conf.all.src_valid_mark: \"1\"\n    ports:\n      - \"${{WIREGUARD_PORT}}:51820/udp\"\n    volumes:\n      - ./vpn:/config/wg_confs\n      - ./state:/var/lib/vpn-appliance-manager\n  dns:\n    image: {}\n    restart: unless-stopped\n    labels:\n      com.centurylinklabs.watchtower.enable: \"true\"\n      com.centurylinklabs.watchtower.scope: \"{scope}\"\n    network_mode: service:gateway\n    depends_on:\n      - gateway\n    volumes:\n      - ./dns/Corefile:/etc/coredns/Corefile:ro\n      - ./dns/zones:/etc/coredns/zones:ro\n    command:\n      - -conf\n      - /etc/coredns/Corefile\n  watchtower:\n    image: {}\n    restart: unless-stopped\n    labels:\n      com.centurylinklabs.watchtower.enable: \"true\"\n      com.centurylinklabs.watchtower.scope: \"{scope}\"\n    environment:\n      WATCHTOWER_LABEL_ENABLE: \"true\"\n      WATCHTOWER_SCOPE: \"{scope}\"\n      WATCHTOWER_CLEANUP: \"true\"\n      WATCHTOWER_SCHEDULE: \"0 0 4 * * *\"\n      WATCHTOWER_NO_STARTUP_MESSAGE: \"true\"\n      WATCHTOWER_ROLLING_RESTART: \"true\"\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n",
+        r#"name: {}
+services:
+  gateway:
+    image: {}
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: "{scope}"
+    cap_add:
+      - NET_ADMIN
+    environment:
+      PUID: "0"
+      PGID: "0"
+      TZ: UTC
+      LOG_CONFS: "false"
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.src_valid_mark: "1"
+    ports:
+      - "${{WIREGUARD_PORT}}:51820/udp"
+    volumes:
+      - ./vpn:/config/wg_confs
+      - ./state:/var/lib/vpn-appliance-manager
+  dns:
+    image: {}
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: "{scope}"
+    network_mode: service:gateway
+    depends_on:
+      - gateway
+    volumes:
+      - ./dns/Corefile:/etc/coredns/Corefile:ro
+      - ./dns/zones:/etc/coredns/zones:ro
+      - ./dns/hosts:/etc/coredns/hosts:ro
+    command:
+      - -conf
+      - /etc/coredns/Corefile
+  watchtower:
+    image: {}
+    restart: unless-stopped
+    labels:
+      com.centurylinklabs.watchtower.enable: "true"
+      com.centurylinklabs.watchtower.scope: "{scope}"
+    environment:
+      DOCKER_API_VERSION: "1.40"
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_SCOPE: "{scope}"
+      WATCHTOWER_CLEANUP: "true"
+      WATCHTOWER_SCHEDULE: "0 0 4 * * *"
+      WATCHTOWER_NO_STARTUP_MESSAGE: "true"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+"#,
         state.instance.compose_project(),
         WIREGUARD_IMAGE,
         COREDNS_IMAGE,
@@ -333,6 +393,7 @@ mod tests {
             users: Vec::new(),
             devices: Vec::<Device>::new(),
             dns_records: Vec::new(),
+            dns_blocklist_domains: vec!["ads.google.com".into()],
         }
     }
 
@@ -362,15 +423,39 @@ mod tests {
         assert!(first.contains(COREDNS_IMAGE));
         assert!(first.contains(WATCHTOWER_IMAGE));
         assert!(first.contains("network_mode: service:gateway"));
+        assert!(first.contains("./dns/hosts:/etc/coredns/hosts:ro"));
         assert!(first.contains("LOG_CONFS: \"false\""));
         assert!(first.contains("WATCHTOWER_LABEL_ENABLE: \"true\""));
+        assert!(first.contains("DOCKER_API_VERSION: \"1.40\""));
         assert!(first.contains("WATCHTOWER_CLEANUP: \"true\""));
         assert!(first.contains("WATCHTOWER_SCHEDULE: \"0 0 4 * * *\""));
+        assert!(!first.contains("WATCHTOWER_ROLLING_RESTART"));
         assert!(first.contains(
             "com.centurylinklabs.watchtower.scope: \"00000000-0000-0000-0000-000000000000\""
         ));
         assert!(!first.contains("PEERS:"));
         assert!(!first.contains("SERVERURL:"));
+    }
+
+    #[test]
+    fn shared_files_include_coredns_hosts_blocklist() {
+        let files = render_shared_files(&state()).unwrap();
+        let hosts = files
+            .iter()
+            .find(|file| file.path == "dns/hosts/blocklist.hosts")
+            .expect("blocklist hosts file");
+        assert!(hosts.contents.contains("0.0.0.0 ads.google.com\n"));
+        assert!(hosts.contents.contains(":: ads.google.com\n"));
+
+        let corefile = files
+            .iter()
+            .find(|file| file.path == "dns/Corefile")
+            .expect("Corefile");
+        assert!(
+            corefile
+                .contents
+                .contains("hosts /etc/coredns/hosts/blocklist.hosts")
+        );
     }
 
     #[test]

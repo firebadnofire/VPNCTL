@@ -1,3 +1,5 @@
+#[cfg(not(test))]
+use std::collections::BTreeSet;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -9,6 +11,8 @@ use chrono::Utc;
 use ipnet::Ipv4Net;
 use qrcode::{QrCode, render::svg};
 use serde::{Deserialize, Serialize};
+#[cfg(not(test))]
+use tokio::time::timeout;
 use tokio::{sync::Mutex, time::sleep};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -24,6 +28,8 @@ use vam_deployment::{
     COREDNS_IMAGE, DeploymentExecutor, DeploymentPlanner, RemoteManifest, WATCHTOWER_IMAGE,
     WIREGUARD_IMAGE, build_manifest, shell_quote,
 };
+#[cfg(not(test))]
+use vam_dns::parse_hostslist_domains;
 use vam_dns::{next_soa_serial, validate_records};
 use vam_protocol::{
     AppError, BackupInfo, ClientArtifact, DeploymentOperation, DeploymentPlan, DeploymentProgress,
@@ -37,6 +43,35 @@ use zeroize::Zeroizing;
 
 const APP_ROOT: &str = "/opt/vpn-appliance-manager";
 const BACKUP_RETENTION: usize = 10;
+const DNS_HOSTLISTS_SETTING: &str = "dns_hostlists";
+#[cfg(not(test))]
+const HOSTLIST_CACHE_MAX_AGE: Duration = Duration::from_hours(24);
+#[cfg(not(test))]
+const HOSTLIST_FETCH_TIMEOUT: Duration = Duration::from_secs(8);
+
+#[cfg(not(test))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CachedHostlist {
+    url: String,
+    fetched_at: chrono::DateTime<Utc>,
+    domains: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsHostlist {
+    pub id: Uuid,
+    pub name: String,
+    pub url: String,
+    pub coverage: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateDnsHostlistInput {
+    pub name: String,
+    pub url: String,
+    #[serde(default)]
+    pub coverage: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateHostInput {
@@ -757,6 +792,70 @@ fi
         self.bump_soa(instance_id).await
     }
 
+    pub async fn list_dns_hostlists(&self) -> Result<Vec<DnsHostlist>, AppError> {
+        self.storage
+            .get_setting::<Vec<DnsHostlist>>(DNS_HOSTLISTS_SETTING)
+            .await
+            .map_err(storage_error)
+            .map(Option::unwrap_or_default)
+    }
+
+    pub async fn create_dns_hostlist(
+        &self,
+        input: CreateDnsHostlistInput,
+    ) -> Result<DnsHostlist, AppError> {
+        let hostlist =
+            validate_dns_hostlist(Uuid::new_v4(), &input.name, &input.url, &input.coverage)
+                .map_err(|message| validation_error(&message))?;
+        let mut hostlists = self.list_dns_hostlists().await?;
+        if hostlists.iter().any(|item| item.url == hostlist.url) {
+            return Err(validation_error("A hostlist with this URL already exists."));
+        }
+        hostlists.push(hostlist.clone());
+        self.save_dns_hostlists(&hostlists).await?;
+        Ok(hostlist)
+    }
+
+    pub async fn update_dns_hostlist(
+        &self,
+        hostlist: DnsHostlist,
+    ) -> Result<DnsHostlist, AppError> {
+        let hostlist = validate_dns_hostlist(
+            hostlist.id,
+            &hostlist.name,
+            &hostlist.url,
+            &hostlist.coverage,
+        )
+        .map_err(|message| validation_error(&message))?;
+        let mut hostlists = self.list_dns_hostlists().await?;
+        let position = hostlists
+            .iter()
+            .position(|item| item.id == hostlist.id)
+            .ok_or_else(|| storage_error(StorageError::NotFound))?;
+        if hostlists
+            .iter()
+            .any(|item| item.id != hostlist.id && item.url == hostlist.url)
+        {
+            return Err(validation_error("A hostlist with this URL already exists."));
+        }
+        hostlists[position] = hostlist.clone();
+        self.save_dns_hostlists(&hostlists).await?;
+        Ok(hostlist)
+    }
+
+    pub async fn delete_dns_hostlist(&self, id: Uuid) -> Result<(), AppError> {
+        let mut hostlists = self.list_dns_hostlists().await?;
+        hostlists.retain(|item| item.id != id);
+        self.save_dns_hostlists(&hostlists).await
+    }
+
+    async fn save_dns_hostlists(&self, hostlists: &[DnsHostlist]) -> Result<(), AppError> {
+        self.storage
+            .set_setting(DNS_HOSTLISTS_SETTING, &hostlists)
+            .await
+            .map_err(storage_error)
+    }
+
     pub async fn render_instance(&self, instance_id: Uuid) -> Result<Vec<RenderedFile>, AppError> {
         let state = self.desired_state(instance_id).await?;
         self.render_state(&state).await
@@ -1023,11 +1122,11 @@ fi
         let files = self.render_state(&state).await?;
         let device_store_files: Vec<_> = files
             .iter()
-            .filter(|file| file.path.starts_with("vpn/") || file.path.starts_with("dns/"))
+            .filter(|file| file.path.starts_with("vpn/"))
             .collect();
         if device_store_files.is_empty() {
             return Err(validation_error(
-                "There are no rendered remote device or DNS files for this instance.",
+                "There are no rendered remote credential files for this instance.",
             ));
         }
         let (host, trusted, passphrase) = self.trusted_host(state.instance.host_id).await?;
@@ -1048,7 +1147,6 @@ test -s {server_key}
 docker run --rm --entrypoint sh -v {vpn_mount} {image} -c 'set -eu; umask 077; test -s /work/server.key; awk '"'"'{{ if ($0 == "PrivateKey = __VAM_SERVER_PRIVATE_KEY__") {{ getline key < "/work/server.key"; print "PrivateKey = " key }} else print }}'"'"' /work/wg0.conf.template > /work/wg0.conf; chmod 0600 /work/server.key /work/wg0.conf'
 cd {current}
 docker compose restart gateway
-docker compose restart dns
 "#,
             vpn_dir = shell_quote(&format!("{}/vpn", state.instance.remote_path())),
             server_key = shell_quote(&format!("{}/vpn/server.key", state.instance.remote_path())),
@@ -1340,6 +1438,116 @@ docker compose restart dns
             .map_err(storage_error)
     }
 
+    async fn selected_dns_blocklist_domains(
+        &self,
+        _instance_id: Uuid,
+    ) -> Result<Vec<String>, AppError> {
+        let hostlists = self.list_dns_hostlists().await?;
+
+        #[cfg(test)]
+        {
+            let _ = hostlists;
+            tokio::task::yield_now().await;
+            Ok(Vec::new())
+        }
+
+        #[cfg(not(test))]
+        {
+            let mut tasks = Vec::new();
+            for source in hostlists {
+                let service = self.clone();
+                tasks.push(tokio::spawn(async move {
+                    service.cached_hostlist_domains(source).await
+                }));
+            }
+
+            let mut domains = BTreeSet::new();
+            for task in tasks {
+                let source_domains = task.await.map_err(|error| AppError {
+                    code: "hostlist_task".into(),
+                    message: "A DNS hostlist refresh task failed.".into(),
+                    scope: None,
+                    remote_state_changed: false,
+                    rollback_succeeded: None,
+                    remediation: Some("Retry DNS refresh.".into()),
+                    technical_detail: Some(error.to_string()),
+                })??;
+                domains.extend(source_domains);
+            }
+            Ok(domains.into_iter().collect())
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn cached_hostlist_domains(&self, source: DnsHostlist) -> Result<Vec<String>, AppError> {
+        let setting = hostlist_cache_setting(source.id);
+        let cached = self
+            .storage
+            .get_setting::<CachedHostlist>(&setting)
+            .await
+            .map_err(storage_error)?;
+        if let Some(cache) = cached.as_ref() {
+            let age = Utc::now()
+                .signed_duration_since(cache.fetched_at)
+                .to_std()
+                .unwrap_or(Duration::MAX);
+            if cache.url == source.url && age <= HOSTLIST_CACHE_MAX_AGE {
+                return Ok(cache.domains.clone());
+            }
+        }
+
+        match self.fetch_hostlist_domains(source.clone()).await {
+            Ok(domains) => {
+                let cache = CachedHostlist {
+                    url: source.url,
+                    fetched_at: Utc::now(),
+                    domains: domains.clone(),
+                };
+                self.storage
+                    .set_setting(&setting, &cache)
+                    .await
+                    .map_err(storage_error)?;
+                Ok(domains)
+            }
+            Err(_error) if cached.is_some() => Ok(cached.expect("checked is_some").domains),
+            Err(error) => Err(error),
+        }
+    }
+
+    #[cfg(not(test))]
+    async fn fetch_hostlist_domains(&self, source: DnsHostlist) -> Result<Vec<String>, AppError> {
+        let client = reqwest::Client::builder()
+            .https_only(true)
+            .timeout(HOSTLIST_FETCH_TIMEOUT)
+            .user_agent("vpn-appliance-manager/0.1 hostlist-refresh")
+            .build()
+            .map_err(hostlist_error)?;
+        let response = timeout(HOSTLIST_FETCH_TIMEOUT, client.get(&source.url).send())
+            .await
+            .map_err(|_| hostlist_timeout_error(&source))?
+            .map_err(hostlist_error)?
+            .error_for_status()
+            .map_err(hostlist_error)?;
+        let contents = timeout(HOSTLIST_FETCH_TIMEOUT, response.text())
+            .await
+            .map_err(|_| hostlist_timeout_error(&source))?
+            .map_err(hostlist_error)?;
+        let mut domains = parse_hostslist_domains(&contents);
+        if domains.is_empty() {
+            return Err(AppError {
+                code: "hostlist_empty".into(),
+                message: format!("{} did not contain any usable DNS hosts.", source.name),
+                scope: None,
+                remote_state_changed: false,
+                rollback_succeeded: None,
+                remediation: Some("Disable the source or retry after checking its URL.".into()),
+                technical_detail: Some(source.url),
+            });
+        }
+        domains.sort();
+        Ok(domains)
+    }
+
     async fn render_state(&self, state: &DesiredState) -> Result<Vec<RenderedFile>, AppError> {
         let mut secrets = HashMap::new();
         for device in &state.devices {
@@ -1375,19 +1583,25 @@ docker compose restart dns
         state: &DesiredState,
         secrets: &HashMap<SecretReference, Zeroizing<String>>,
     ) -> Result<Vec<RenderedFile>, AppError> {
-        WireGuardBackend.validate(state).map_err(backend_error)?;
+        let mut render_state = state.clone();
+        render_state.dns_blocklist_domains = self
+            .selected_dns_blocklist_domains(render_state.instance.id)
+            .await?;
+        WireGuardBackend
+            .validate(&render_state)
+            .map_err(backend_error)?;
         let mut files = vam_deployment::DefaultDeploymentPlanner
-            .render(state)
+            .render(&render_state)
             .map_err(deployment_error)?;
         files.push(
             WireGuardBackend
-                .render_server(state, secrets)
+                .render_server(&render_state, secrets)
                 .map_err(backend_error)?,
         );
         let mut manifest = build_manifest(&files);
         if let Some(public) = self
             .storage
-            .get_setting::<String>(&server_public_key_setting(state.instance.id))
+            .get_setting::<String>(&server_public_key_setting(render_state.instance.id))
             .await
             .map_err(storage_error)?
         {
@@ -1764,10 +1978,17 @@ docker compose restart dns
             r#"set +e
 cd {path} || exit 0
 services="$(docker compose ps --status running --services 2>/dev/null)"
+statuses="$(docker compose ps --all --format '{{{{.Service}}}}|{{{{.State}}}}|{{{{.Health}}}}|{{{{.Status}}}}' 2>/dev/null)"
+status_for() {{
+  printf '%s\n' "$statuses" | awk -F'|' -v service="$1" '$1 == service {{ health = ($3 == "" ? "none" : $3); print $2 "/" health " " $4; exit }}'
+}}
 printf 'project=1\n'
 printf 'gateway=%s\n' "$(printf '%s\n' "$services" | grep -qx gateway; echo $?)"
 printf 'dns=%s\n' "$(printf '%s\n' "$services" | grep -qx dns; echo $?)"
 printf 'watchtower=%s\n' "$(printf '%s\n' "$services" | grep -qx watchtower; echo $?)"
+printf 'gateway_status=%s\n' "$(status_for gateway)"
+printf 'dns_status=%s\n' "$(status_for dns)"
+printf 'watchtower_status=%s\n' "$(status_for watchtower)"
 docker compose exec -T gateway wg show wg0 >/dev/null 2>&1
 printf 'wireguard=%s\n' "$?"
 peer_count="$(docker compose exec -T gateway wg show wg0 peers 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')"
@@ -1801,6 +2022,16 @@ printf 'public_dns=%s\n' "$?"
             .get("peer_count")
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or_default();
+        let mut details = Vec::new();
+        for (label, key) in [
+            ("Gateway status", "gateway_status"),
+            ("DNS status", "dns_status"),
+            ("Watchtower status", "watchtower_status"),
+        ] {
+            if let Some(status) = values.get(key).filter(|value| !value.is_empty()) {
+                details.push(format!("{label}: {status}"));
+            }
+        }
         Ok(InstanceHealth {
             compose_project_exists: values.get("project").is_some_and(|value| value == "1"),
             gateway_running: zero("gateway"),
@@ -1811,10 +2042,7 @@ printf 'public_dns=%s\n' "$?"
             wireguard_interface_exists: zero("wireguard"),
             listen_port_matches: zero("port"),
             expected_peers_present: peer_count == expected_peers,
-            details: vec![
-                format!("Expected peers: {expected_peers}"),
-                format!("Observed peers: {peer_count}"),
-            ],
+            details,
         })
     }
 
@@ -2656,6 +2884,11 @@ fn server_public_key_setting(instance_id: Uuid) -> String {
     format!("wireguard_server_public_key:{instance_id}")
 }
 
+#[cfg(not(test))]
+fn hostlist_cache_setting(source_id: Uuid) -> String {
+    format!("dns_hostlist_cache:{source_id}")
+}
+
 fn parse_find_timestamp(value: &str) -> Option<chrono::DateTime<Utc>> {
     let (seconds, fractional) = value.split_once('.')?;
     let seconds = seconds.parse().ok()?;
@@ -2731,6 +2964,32 @@ fn normalize_dns_owner(value: &str, zone: &str) -> Result<Option<String>, String
     Ok(Some(format!("{owner}.{zone}")))
 }
 
+fn validate_dns_hostlist(
+    id: Uuid,
+    name: &str,
+    url: &str,
+    coverage: &str,
+) -> Result<DnsHostlist, String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("Hostlist name is required.".into());
+    }
+    let parsed = reqwest::Url::parse(url.trim())
+        .map_err(|_| "Hostlist URL must be a valid HTTPS URL.".to_owned())?;
+    if parsed.scheme() != "https" || parsed.host_str().is_none() {
+        return Err("Hostlist URL must use HTTPS.".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("Hostlist URLs must not include credentials.".into());
+    }
+    Ok(DnsHostlist {
+        id,
+        name: name.into(),
+        url: parsed.to_string(),
+        coverage: coverage.trim().into(),
+    })
+}
+
 async fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), AppError> {
     #[cfg(unix)]
     {
@@ -2765,18 +3024,58 @@ fn validation_error(message: &str) -> AppError {
     }
 }
 
-fn storage_error(error: StorageError) -> AppError {
+#[cfg(not(test))]
+fn hostlist_error(error: reqwest::Error) -> AppError {
     AppError {
-        code: "storage".into(),
-        message: match error {
-            StorageError::NotFound => "The requested record was not found.".into(),
-            StorageError::HostKeyChanged => "The SSH host key changed.".into(),
-            _ => "Local persistence failed.".into(),
-        },
+        code: "hostlist_fetch".into(),
+        message: "A selected DNS hostlist could not be refreshed.".into(),
         scope: None,
         remote_state_changed: false,
         rollback_succeeded: None,
-        remediation: Some("Check the local database and retry.".into()),
+        remediation: Some("Retry DNS refresh or use the cached hostlist if one exists.".into()),
+        technical_detail: Some(error.to_string()),
+    }
+}
+
+#[cfg(not(test))]
+fn hostlist_timeout_error(source: &DnsHostlist) -> AppError {
+    AppError {
+        code: "hostlist_timeout".into(),
+        message: format!("{} took too long to refresh.", source.name),
+        scope: None,
+        remote_state_changed: false,
+        rollback_succeeded: None,
+        remediation: Some("Retry DNS refresh; cached domains are used when available.".into()),
+        technical_detail: Some(source.url.clone()),
+    }
+}
+
+fn storage_error(error: StorageError) -> AppError {
+    let (message, remediation) = match &error {
+        StorageError::NotFound => (
+            "The requested record was not found.",
+            "Refresh the view and try again.",
+        ),
+        StorageError::HostHasActiveInstances => (
+            "Delete this host's VPN instances before removing the Docker host.",
+            "Open Instances, delete every instance on this host, then retry host deletion.",
+        ),
+        StorageError::HostKeyChanged => (
+            "The SSH host key changed.",
+            "Verify the host identity before approving the new key.",
+        ),
+        _ => (
+            "Local persistence failed.",
+            "Check the local database and retry.",
+        ),
+    };
+    AppError {
+        code: "storage".into(),
+        message: message.into(),
+        scope: None,
+        remote_state_changed: false,
+        rollback_succeeded: None,
+        remediation: Some(remediation.into()),
         technical_detail: Some(error.to_string()),
     }
 }
@@ -2929,9 +3228,9 @@ mod tests {
             commands.push(command.to_owned());
             if command.contains("services=\"$(docker compose ps --status running --services") {
                 let stdout = if after_stop {
-                    b"project=1\ngateway=1\ndns=1\nwatchtower=1\nwireguard=1\npeer_count=0\nport=1\nprivate_dns=1\npublic_dns=1\n".to_vec()
+                    b"project=1\ngateway=1\ndns=1\nwatchtower=1\ngateway_status=running/none Up 1 second\ndns_status=running/none Up 1 second\nwatchtower_status=running/healthy Up 1 second (healthy)\nwireguard=1\npeer_count=0\nport=1\nprivate_dns=1\npublic_dns=1\n".to_vec()
                 } else {
-                    b"project=1\ngateway=0\ndns=0\nwatchtower=0\nwireguard=0\npeer_count=1\nport=0\nprivate_dns=0\npublic_dns=0\n".to_vec()
+                    b"project=1\ngateway=0\ndns=0\nwatchtower=0\ngateway_status=exited/none Exited (0)\ndns_status=exited/none Exited (0)\nwatchtower_status=restarting/unhealthy Restarting (1)\nwireguard=0\npeer_count=1\nport=0\nprivate_dns=0\npublic_dns=0\n".to_vec()
                 };
                 return Ok(CommandResult {
                     stdout,
@@ -3040,6 +3339,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(service.list_instances(None).await.unwrap(), vec![instance]);
+    }
+
+    #[tokio::test]
+    async fn dns_hostlists_start_empty_and_are_user_managed() {
+        let storage = Storage::in_memory().await.unwrap();
+        let service = ApplicationService::with_transport(
+            storage,
+            Arc::new(MemorySecretStore::default()),
+            Arc::new(RusshTransport::default()),
+        );
+        assert!(service.list_dns_hostlists().await.unwrap().is_empty());
+
+        let invalid = service
+            .create_dns_hostlist(CreateDnsHostlistInput {
+                name: "Plain HTTP".into(),
+                url: "http://example.test/hosts".into(),
+                coverage: String::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(invalid.code, "validation");
+
+        let hostlist = service
+            .create_dns_hostlist(CreateDnsHostlistInput {
+                name: " Malware hosts ".into(),
+                url: "https://example.test/hosts".into(),
+                coverage: " malware ".into(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(hostlist.name, "Malware hosts");
+        assert_eq!(hostlist.coverage, "malware");
+        assert_eq!(
+            service.list_dns_hostlists().await.unwrap(),
+            vec![hostlist.clone()]
+        );
+
+        let duplicate = service
+            .create_dns_hostlist(CreateDnsHostlistInput {
+                name: "Duplicate".into(),
+                url: hostlist.url.clone(),
+                coverage: String::new(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(duplicate.code, "validation");
+
+        let updated = service
+            .update_dns_hostlist(DnsHostlist {
+                name: "Threat feeds".into(),
+                coverage: "threat domains".into(),
+                ..hostlist.clone()
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated.name, "Threat feeds");
+
+        service.delete_dns_hostlist(updated.id).await.unwrap();
+        assert!(service.list_dns_hostlists().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rendered_blocklist_is_empty_until_hostlists_are_added() {
+        let storage = Storage::in_memory().await.unwrap();
+        let service = ApplicationService::with_transport(
+            storage,
+            Arc::new(MemorySecretStore::default()),
+            Arc::new(RusshTransport::default()),
+        );
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "192.0.2.1".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let instance = service
+            .create_instance(CreateInstanceInput {
+                host_id: host.id,
+                display_name: "private".into(),
+                endpoint_host: "vpn.example.test".into(),
+                endpoint_port: DEFAULT_PORT,
+                ipv4_subnet: DEFAULT_SUBNET.into(),
+                dns_zone: DEFAULT_DNS_ZONE.into(),
+                routing_mode: None,
+            })
+            .await
+            .unwrap();
+        let state = service.desired_state(instance.id).await.unwrap();
+        let files = service.render_state_for_plan(&state).await.unwrap();
+        let hosts = files
+            .iter()
+            .find(|file| file.path == "dns/hosts/blocklist.hosts")
+            .expect("blocklist hosts file");
+        assert!(!hosts.contents.contains("ads.google.com"));
     }
 
     #[tokio::test]
@@ -3274,7 +3672,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn refresh_remote_credentials_uploads_real_device_keys_and_dns() {
+    async fn refresh_remote_credentials_uploads_real_device_keys_without_dns_restart() {
         let storage = Storage::in_memory().await.unwrap();
         let secrets = Arc::new(MemorySecretStore::default());
         let fake = fake_transport();
@@ -3339,11 +3737,20 @@ mod tests {
         assert!(template.contains(&data.public_key));
         assert!(template.contains(&psk));
         assert!(!template.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
-        let zone = uploads
-            .iter()
-            .find(|(path, _)| path.ends_with("/dns/zones/db.internal"))
-            .map(|(_, contents)| contents)
-            .expect("uploaded DNS zone");
-        assert!(zone.contains("vm1 300 IN A 10.64.0.2"));
+        assert!(!uploads.iter().any(|(path, _)| path.contains("/dns/")));
+        drop(uploads);
+
+        let commands = fake.commands.lock().expect("test command lock");
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("docker compose restart gateway"))
+        );
+        assert!(
+            !commands
+                .iter()
+                .any(|command| command.contains("docker compose restart dns"))
+        );
+        assert!(commands.iter().any(|command| command.contains("chown -R")));
     }
 }
