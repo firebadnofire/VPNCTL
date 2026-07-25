@@ -591,7 +591,7 @@
         {#if active === "Hosts"}<button class="primary" onclick={openHost}>Add host</button>{/if}
         {#if active === "Instances"}<button class="primary" onclick={openInstance} disabled={!hosts.length}>Create instance</button>{/if}
         {#if active === "Devices"}
-          <button class="secondary" onclick={refreshRemoteCredentials} disabled={!selectedInstanceId}>Refresh credentials</button>
+          <button class="secondary" onclick={refreshRemoteCredentials} disabled={!selectedInstanceId}>Refresh devices</button>
           <button class="primary" onclick={openDevice} disabled={!instances.length}>Add device</button>
         {/if}
         {#if active === "DNS"}

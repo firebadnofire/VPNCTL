@@ -779,7 +779,7 @@ fi
         let lock = self.instance_lock(instance_id).await;
         let _guard = lock.lock().await;
         let state = self.desired_state(instance_id).await?;
-        let files = self.render_state_for_plan(&state).await?;
+        let files = self.render_state(&state).await?;
         let remote = self.remote_manifest(&state.instance).await?;
         let plan = vam_deployment::DefaultDeploymentPlanner
             .calculate(&state, &files, remote.as_ref())
@@ -1020,14 +1020,14 @@ fi
         instance_id: Uuid,
     ) -> Result<InstanceHealth, AppError> {
         let state = self.desired_state(instance_id).await?;
-        let files = self.render_state_for_plan(&state).await?;
-        let credential_files: Vec<_> = files
+        let files = self.render_state(&state).await?;
+        let device_store_files: Vec<_> = files
             .iter()
-            .filter(|file| file.path.starts_with("vpn/"))
+            .filter(|file| file.path.starts_with("vpn/") || file.path.starts_with("dns/"))
             .collect();
-        if credential_files.is_empty() {
+        if device_store_files.is_empty() {
             return Err(validation_error(
-                "There are no rendered remote credential files for this instance.",
+                "There are no rendered remote device or DNS files for this instance.",
             ));
         }
         let (host, trusted, passphrase) = self.trusted_host(state.instance.host_id).await?;
@@ -1037,7 +1037,7 @@ fi
             &host,
             &trusted,
             passphrase.as_ref(),
-            &credential_files,
+            &device_store_files,
             &cancellation,
         )
         .await?;
@@ -1095,7 +1095,7 @@ docker compose restart dns
         instance_id: Uuid,
     ) -> Result<InstanceHealth, AppError> {
         let state = self.desired_state(instance_id).await?;
-        let files = self.render_state(&state).await?;
+        let files = self.render_state_for_plan(&state).await?;
         let dns_files: Vec<_> = files
             .iter()
             .filter(|file| file.path.starts_with("dns/"))
@@ -2894,6 +2894,7 @@ mod tests {
     struct FakeTransport {
         key: RwLock<HostKeyInfo>,
         commands: std::sync::Mutex<Vec<String>>,
+        uploads: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     #[async_trait::async_trait]
@@ -2928,9 +2929,28 @@ mod tests {
             })
         }
 
-        async fn upload(&self, _request: UploadRequest<'_>) -> Result<(), SshError> {
+        async fn upload(&self, request: UploadRequest<'_>) -> Result<(), SshError> {
+            self.uploads.lock().expect("test upload lock").push((
+                request.remote_path.to_owned(),
+                String::from_utf8_lossy(request.contents).into_owned(),
+            ));
             Ok(())
         }
+    }
+
+    fn fake_transport() -> Arc<FakeTransport> {
+        Arc::new(FakeTransport {
+            key: RwLock::new(HostKeyInfo {
+                hostname: "lab".into(),
+                resolved_address: "192.0.2.1".into(),
+                port: 22,
+                algorithm: "ssh-ed25519".into(),
+                sha256_fingerprint: "SHA256:first".into(),
+                public_key_base64: "first-key".into(),
+            }),
+            commands: std::sync::Mutex::new(Vec::new()),
+            uploads: std::sync::Mutex::new(Vec::new()),
+        })
     }
 
     #[test]
@@ -3134,17 +3154,7 @@ mod tests {
     #[tokio::test]
     async fn host_key_requires_approval_and_changed_key_is_distinct() {
         let storage = Storage::in_memory().await.unwrap();
-        let fake = Arc::new(FakeTransport {
-            key: RwLock::new(HostKeyInfo {
-                hostname: "lab".into(),
-                resolved_address: "192.0.2.1".into(),
-                port: 22,
-                algorithm: "ssh-ed25519".into(),
-                sha256_fingerprint: "SHA256:first".into(),
-                public_key_base64: "first-key".into(),
-            }),
-            commands: std::sync::Mutex::new(Vec::new()),
-        });
+        let fake = fake_transport();
         let service = ApplicationService::with_transport(
             storage,
             Arc::new(MemorySecretStore::default()),
@@ -3203,17 +3213,7 @@ mod tests {
     #[tokio::test]
     async fn stop_reports_stopped_state_without_waiting_for_running_health() {
         let storage = Storage::in_memory().await.unwrap();
-        let fake = Arc::new(FakeTransport {
-            key: RwLock::new(HostKeyInfo {
-                hostname: "lab".into(),
-                resolved_address: "192.0.2.1".into(),
-                port: 22,
-                algorithm: "ssh-ed25519".into(),
-                sha256_fingerprint: "SHA256:first".into(),
-                public_key_base64: "first-key".into(),
-            }),
-            commands: std::sync::Mutex::new(Vec::new()),
-        });
+        let fake = fake_transport();
         let service = ApplicationService::with_transport(
             storage,
             Arc::new(MemorySecretStore::default()),
@@ -3254,5 +3254,79 @@ mod tests {
         assert_eq!(commands.len(), 2);
         assert!(commands[0].contains("docker compose stop"));
         assert!(commands[1].contains("docker compose ps --status running"));
+    }
+
+    #[tokio::test]
+    async fn refresh_remote_credentials_uploads_real_device_keys_and_dns() {
+        let storage = Storage::in_memory().await.unwrap();
+        let secrets = Arc::new(MemorySecretStore::default());
+        let fake = fake_transport();
+        let service = ApplicationService::with_transport(storage, secrets.clone(), fake.clone());
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "lab".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let probe = service.probe_host_key(host.id).await.unwrap();
+        service
+            .approve_host_key(host.id, probe.key, "SHA256:first", false)
+            .await
+            .unwrap();
+        let instance = service
+            .create_instance(CreateInstanceInput {
+                host_id: host.id,
+                display_name: "private".into(),
+                endpoint_host: "vpn.example.test".into(),
+                endpoint_port: DEFAULT_PORT,
+                ipv4_subnet: DEFAULT_SUBNET.into(),
+                dns_zone: DEFAULT_DNS_ZONE.into(),
+                routing_mode: None,
+            })
+            .await
+            .unwrap();
+        let device = service
+            .create_device(CreateDeviceInput {
+                instance_id: instance.id,
+                user_id: None,
+                display_name: "vm1".into(),
+                preshared_key: true,
+                create_dns_record: true,
+                dns_name: Some("vm1".into()),
+            })
+            .await
+            .unwrap();
+        let DeviceBackendData::WireGuard(data) = &device.backend_data;
+        let psk = secrets
+            .get(data.preshared_key_ref.as_ref().unwrap())
+            .await
+            .unwrap();
+        let psk = String::from_utf8(psk.to_vec()).unwrap();
+
+        service
+            .refresh_remote_credentials(instance.id)
+            .await
+            .unwrap();
+
+        let uploads = fake.uploads.lock().expect("test upload lock");
+        let template = uploads
+            .iter()
+            .find(|(path, _)| path.ends_with("/vpn/wg0.conf.template"))
+            .map(|(_, contents)| contents)
+            .expect("uploaded wireguard template");
+        assert!(template.contains(&data.public_key));
+        assert!(template.contains(&psk));
+        assert!(!template.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
+        let zone = uploads
+            .iter()
+            .find(|(path, _)| path.ends_with("/dns/zones/db.internal"))
+            .map(|(_, contents)| contents)
+            .expect("uploaded DNS zone");
+        assert!(zone.contains("vm1 300 IN A 10.64.0.2"));
     }
 }
