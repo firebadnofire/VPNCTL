@@ -3,7 +3,7 @@
 <h1 align="center">VPN Appliance Manager</h1>
 
 <p align="center">
-  <img src="https://pubcode.archuser.org/firebadnofire/dnswg/src/branch/main/assets/app-icon.svg" alt="VPN Appliance Manager app icon" width="112">
+  <img src="https://pubcode.archuser.org/firebadnofire/dnswg/raw/branch/main/assets/app-icon.svg" alt="VPN Appliance Manager app icon" width="112">
   <br>
   <strong>Local-first management for self-hosted WireGuard appliances with private DNS.</strong>
 </p>
@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <img src="https://pubcode.archuser.org/firebadnofire/dnswg/src/branch/main/assets/instances-screen.png" alt="VPN Appliance Manager instances screen" width="920">
+  <img src="https://pubcode.archuser.org/firebadnofire/dnswg/raw/branch/main/assets/instances-screen.png" alt="VPN Appliance Manager instances screen" width="920">
 </p>
 
 VPN Appliance Manager is a Tauri 2 desktop application and developer CLI for managing VPN appliances on your own Linux Docker hosts over verified SSH. The current backend is WireGuard. The app keeps desired state locally in SQLite, renders deterministic Docker Compose/CoreDNS/WireGuard configuration, previews remote changes before applying them, creates backups, verifies health, and supports rollback when a deployment mutates remote state.
@@ -49,21 +49,21 @@ This repository still uses the historical `dnswg` repo name. The product identit
 <table>
   <tr>
     <td width="50%">
-      <img src="https://pubcode.archuser.org/firebadnofire/dnswg/src/branch/main/assets/hosts-screen.png" alt="Hosts view showing SSH host inspection" width="100%">
+      <img src="https://pubcode.archuser.org/firebadnofire/dnswg/raw/branch/main/assets/hosts-screen.png" alt="Hosts view showing SSH host inspection" width="100%">
       <br><strong>Verified SSH hosts</strong>
     </td>
     <td width="50%">
-      <img src="https://pubcode.archuser.org/firebadnofire/dnswg/src/branch/main/assets/device-screen.png" alt="Devices view showing WireGuard device identities" width="100%">
+      <img src="https://pubcode.archuser.org/firebadnofire/dnswg/raw/branch/main/assets/device-screen.png" alt="Devices view showing WireGuard device identities" width="100%">
       <br><strong>Device identities and exports</strong>
     </td>
   </tr>
   <tr>
     <td width="50%">
-      <img src="https://pubcode.archuser.org/firebadnofire/dnswg/src/branch/main/assets/dns-records-screen.png" alt="DNS records view" width="100%">
+      <img src="https://pubcode.archuser.org/firebadnofire/dnswg/raw/branch/main/assets/dns-records-screen.png" alt="DNS records view" width="100%">
       <br><strong>Private DNS records</strong>
     </td>
     <td width="50%">
-      <img src="https://pubcode.archuser.org/firebadnofire/dnswg/src/branch/main/assets/dns-hostlists-screen.png" alt="DNS hostlists view" width="100%">
+      <img src="https://pubcode.archuser.org/firebadnofire/dnswg/raw/branch/main/assets/dns-hostlists-screen.png" alt="DNS hostlists view" width="100%">
       <br><strong>HTTPS DNS hostlists</strong>
     </td>
   </tr>
