@@ -117,7 +117,7 @@ jobs:
             build_command: |
               set -euo pipefail
 
-              ./build-helpers/mac/build.sh
+              bash ./build-helpers/mac/build.sh
 
               app_bundle="target/release/bundle/macos/VPN Appliance Manager.app"
               if [ ! -d "$app_bundle" ]; then
@@ -191,6 +191,7 @@ jobs:
               export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
               export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
               export PATH="${CARGO_HOME}/bin:${HOME}/.local/bin:${PATH}"
+              mkdir -p "${HOME}/.local/bin"
               echo "${CARGO_HOME}/bin" >> "${GITHUB_PATH:-/tmp/github_path}"
               echo "${HOME}/.local/bin" >> "${GITHUB_PATH:-/tmp/github_path}"
 

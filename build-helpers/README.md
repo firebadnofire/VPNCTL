@@ -10,8 +10,10 @@ Each platform has a build and clean entrypoint:
 
 Build helpers install JavaScript dependencies from `pnpm-lock.yaml`, use the
 Rust version in `rust-toolchain.toml`, run the verification suite, and package
-the Tauri application. The Windows helper also bootstraps missing native build
-tools with `winget`: Visual Studio 2022 C++ Build Tools, Node.js 24.18.0,
+the Tauri application. The macOS helper uses `nvm` to install and select
+Node.js 24.18.0 when the active `node` is missing or at a different version,
+then activates pnpm 11.9.0 through Corepack. The Windows helper also bootstraps
+missing native build tools with `winget`: Visual Studio 2022 C++ Build Tools, Node.js 24.18.0,
 Rustup/Rust 1.97.1 with `clippy` and `rustfmt`, Microsoft Edge WebView2
 Runtime, NASM, NSIS, and pnpm 11.9.0 through Corepack. When a tool is missing,
 the Windows helper lists the exact install action it will run and asks before
