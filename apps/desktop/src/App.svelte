@@ -830,10 +830,10 @@
         <div class="modal-head"><div><p class="eyebrow">LOCAL KEY GENERATION</p><h2>Add device</h2></div><button onclick={() => (modal = null)}>×</button></div>
         <form onsubmit={(event) => { event.preventDefault(); saveDevice(); }}>
           <label>Instance<select bind:value={deviceForm.instance_id} required>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
-          <label>Device name<input bind:value={deviceForm.display_name} required placeholder="William’s MacBook" /></label>
-          <label>DNS name <span class="optional">optional</span><input bind:value={deviceForm.dns_name} placeholder="vm1" /></label>
+          <label>Device name<input bind:value={deviceForm.display_name} required placeholder="Main PC" /></label>
+          <label>DNS name <span class="optional">optional</span><input bind:value={deviceForm.dns_name} placeholder="mainpc" /></label>
           {#if deviceFormInstance}
-            <p class="help">Enter a short name like vm1; it will be saved as {deviceDnsPreview || `vm1.${deviceFormInstance.dns.zone}`}.</p>
+            <p class="help">Enter a short name like mainpc; it will be saved as {deviceDnsPreview || `mainpc.${deviceFormInstance.dns.zone}`}.</p>
           {/if}
           <label class="checkbox"><input type="checkbox" bind:checked={deviceForm.preshared_key} /> Generate a preshared key (recommended)</label>
           <label class="checkbox"><input type="checkbox" bind:checked={deviceForm.create_dns_record} /> Create a managed DNS A record</label>
@@ -843,9 +843,9 @@
         <div class="modal-head"><div><p class="eyebrow">PRIVATE ZONE</p><h2>Add DNS record</h2></div><button onclick={() => (modal = null)}>×</button></div>
         <form onsubmit={(event) => { event.preventDefault(); saveDns(); }}>
           <label>Instance<select bind:value={dnsForm.instance_id} required>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
-          <div class="form-grid"><label>Owner name<input bind:value={dnsForm.name} required placeholder="vm1" /></label><label>Record type<select bind:value={dnsForm.record_type}>{#each recordTypes as type}<option value={type}>{type}</option>{/each}</select></label></div>
+          <div class="form-grid"><label>Owner name<input bind:value={dnsForm.name} required placeholder="mainpc" /></label><label>Record type<select bind:value={dnsForm.record_type}>{#each recordTypes as type}<option value={type}>{type}</option>{/each}</select></label></div>
           {#if dnsFormInstance}
-            <p class="help">Use a short name like vm1, or a full name ending in .{dnsFormInstance.dns.zone}. Names outside this zone will not resolve here.</p>
+            <p class="help">Use a short name like mainpc, or a full name ending in .{dnsFormInstance.dns.zone}. Names outside this zone will not resolve here.</p>
           {/if}
           <label>Value<input bind:value={dnsForm.value} required placeholder={dnsForm.record_type === "A" ? "10.64.0.10" : "Record value"} /></label>
           <label>TTL<input type="number" bind:value={dnsForm.ttl} min="30" max="86400" required /></label>
