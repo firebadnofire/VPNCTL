@@ -5,14 +5,20 @@ Each platform has a build and clean entrypoint:
 | Platform | Build | Clean |
 | --- | --- | --- |
 | macOS | `build-helpers/mac/build.sh` | `build-helpers/mac/clean.sh` |
+| macOS universal DMG | `build-helpers/mac/build-universal.sh` | `build-helpers/mac/clean.sh` |
 | Windows | `build-helpers/windows/build.ps1` | `build-helpers/windows/clean.ps1` |
 | Linux | `build-helpers/linux/build.sh` | `build-helpers/linux/clean.sh` |
 
 Build helpers install JavaScript dependencies from `pnpm-lock.yaml`, use the
 Rust version in `rust-toolchain.toml`, run the verification suite, and package
-the Tauri application. The macOS helper uses `nvm` to install and select
+the Tauri application. The macOS helpers use `nvm` to install and select
 Node.js 24.18.0 when the active `node` is missing or at a different version,
-then activates pnpm 11.9.0 through Corepack. The Windows helper also bootstraps
+then activate pnpm 11.9.0 through Corepack. `build-helpers/mac/build.sh`
+packages the current architecture as a `.app`; `build-helpers/mac/build-universal.sh`
+adds the `x86_64-apple-darwin` and `aarch64-apple-darwin` Rust targets through
+`rustup`, requires Apple's `lipo` and `hdiutil` tools, and builds a universal
+`.app` plus `.dmg` under `target/universal-apple-darwin/release/bundle`.
+The Windows helper also bootstraps
 missing native build tools with `winget`: Visual Studio 2022 C++ Build Tools, Node.js 24.18.0,
 Rustup/Rust 1.97.1 with `clippy` and `rustfmt`, Microsoft Edge WebView2
 Runtime, NASM, NSIS, and pnpm 11.9.0 through Corepack. When a tool is missing,
