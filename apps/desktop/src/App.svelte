@@ -8,6 +8,7 @@
     BackupInfo,
     DeploymentPlan,
     DeploymentProgress,
+    DeploymentResult,
     Device,
     DnsRecord,
     DnsRecordType,
@@ -31,6 +32,17 @@
 
   const sections: Section[] = ["Hosts", "Instances", "Devices", "DNS", "Backups", "Logs"];
   const recordTypes: DnsRecordType[] = ["A", "AAAA", "CNAME", "TXT", "SRV"];
+  const healthCheckLabels: Record<keyof Omit<InstanceHealth, "details">, string> = {
+    compose_project_exists: "Compose project exists",
+    gateway_running: "Gateway container running",
+    dns_running: "DNS container running",
+    watchtower_running: "Watchtower container running",
+    private_dns_resolves: "Private DNS resolves",
+    public_dns_resolves: "Public DNS resolves",
+    wireguard_interface_exists: "WireGuard interface exists",
+    listen_port_matches: "WireGuard UDP port published",
+    expected_peers_present: "Expected peers present",
+  };
   function shellSingleQuote(value: string) {
     return `'${value.replaceAll("'", "'\"'\"'")}'`;
   }
@@ -58,6 +70,7 @@
   let selectedDeviceId = "";
   let busy = "";
   let notice = "";
+  let noticeHealth: InstanceHealth | null = null;
   let error: AppError | null = null;
   let inspection: HostInspection | null = null;
   let probe: HostKeyProbe | null = null;
@@ -154,6 +167,7 @@
   async function task<T>(label: string, operation: () => Promise<T>): Promise<T | undefined> {
     busy = label;
     notice = "";
+    noticeHealth = null;
     error = null;
     technicalOpen = false;
     try {
@@ -176,6 +190,16 @@
         remote_state_changed: false,
       };
     }
+  }
+
+  function setNotice(message: string, health: InstanceHealth | null = null) {
+    notice = message;
+    noticeHealth = health;
+  }
+
+  function clearNotice() {
+    notice = "";
+    noticeHealth = null;
   }
 
   function openHost() {
@@ -305,13 +329,13 @@
     modal = null;
     plan = null;
     const result = await task("Applying and verifying deployment", () =>
-      call<{ status: string }>("apply_instance", {
+      call<DeploymentResult>("apply_instance", {
         instanceId: pendingPlan.instance_id,
         expectedStateHash: pendingPlan.desired_state_hash,
       }),
     );
     if (!result) return;
-    notice = `Deployment ${result.status}.`;
+    setNotice(`Deployment ${result.status}. ${healthSummary(result.health)}`, result.health);
     await refresh();
   }
 
@@ -320,7 +344,7 @@
       call<InstanceHealth>(command, { instanceId: instance.id }),
     );
     if (result) {
-      notice = healthSummary(result);
+      setNotice(healthSummary(result), result);
     }
   }
 
@@ -328,6 +352,13 @@
     const values = Object.entries(health).filter(([key]) => key !== "details");
     const healthy = values.filter(([, value]) => value === true).length;
     return `${healthy}/${values.length} health checks passing.`;
+  }
+
+  function healthChecks(health: InstanceHealth) {
+    return Object.entries(healthCheckLabels).map(([key, label]) => ({
+      label,
+      passing: health[key as keyof Omit<InstanceHealth, "details">],
+    }));
   }
 
   async function removeInstance(instance: VpnInstance) {
@@ -539,7 +570,7 @@
       call<InstanceHealth>("refresh_remote_credentials", { instanceId: selectedInstanceId }),
     );
     if (!result) return;
-    notice = `Credential store refreshed. ${healthSummary(result)}`;
+    setNotice(`Credential store refreshed. ${healthSummary(result)}`, result);
   }
 
   async function refreshRemoteDnsStore() {
@@ -548,7 +579,7 @@
       call<InstanceHealth>("refresh_remote_dns_store", { instanceId: selectedInstanceId }),
     );
     if (!result) return;
-    notice = `DNS store refreshed. ${healthSummary(result)}`;
+    setNotice(`DNS store refreshed. ${healthSummary(result)}`, result);
   }
 
   async function rollbackBackup(backup: BackupInfo) {
@@ -603,7 +634,31 @@
     </header>
 
     {#if busy}<div class="progress"><span></span>{busy}…</div>{/if}
-    {#if notice}<div class="notice" role="status">{notice}<button aria-label="Dismiss" onclick={() => (notice = "")}>×</button></div>{/if}
+    {#if notice}
+      <div class="notice" role="status">
+        <div class="notice-body">
+          <span>{notice}</span>
+          {#if noticeHealth}
+            <details class="check-log">
+              <summary>Checks</summary>
+              <div class="check-log-list">
+                {#each healthChecks(noticeHealth) as check}
+                  <div class:pass={check.passing} class:fail={!check.passing}>
+                    <b>{check.passing ? "Pass" : "Fail"}</b><span>{check.label}</span>
+                  </div>
+                {/each}
+                {#if noticeHealth.details.length}
+                  <div class="check-details">
+                    {#each noticeHealth.details as detail}<span>{detail}</span>{/each}
+                  </div>
+                {/if}
+              </div>
+            </details>
+          {/if}
+        </div>
+        <button aria-label="Dismiss" onclick={clearNotice}>×</button>
+      </div>
+    {/if}
     {#if error}
       <div class="alert" role="alert">
         <div>

@@ -146,6 +146,15 @@ export interface DeploymentSummary {
   finished_at?: string;
 }
 
+export interface DeploymentResult {
+  deployment_id: UUID;
+  status: string;
+  remote_state_changed: boolean;
+  rollback_succeeded?: boolean;
+  backup_name?: string;
+  health: InstanceHealth;
+}
+
 export interface BackupInfo {
   name: string;
   created_at: string;

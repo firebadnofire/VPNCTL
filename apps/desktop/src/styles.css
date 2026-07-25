@@ -37,7 +37,15 @@ h1 { font-size: 30px; margin: 2px 0 0; letter-spacing: -0.7px; }
 .alert p { margin: 5px 0; line-height: 1.4; }
 .alert > button, .notice > button { border: 0; background: transparent; color: inherit; font-size: 20px; cursor: pointer; }
 .alert pre { max-width: 900px; white-space: pre-wrap; background: #5d320914; padding: 10px; border-radius: 5px; font-size: 11px; }
-.notice { background: #e8f8f2; border: 1px solid #a7e6ce; color: #116b52; align-items: center; }
+.notice { background: #e8f8f2; border: 1px solid #a7e6ce; color: #116b52; align-items: flex-start; }
+.notice-body { display: grid; gap: 8px; min-width: 0; flex: 1; }
+.check-log summary { cursor: pointer; font-weight: 700; width: max-content; }
+.check-log-list { margin-top: 8px; display: grid; gap: 5px; max-width: 560px; }
+.check-log-list div { display: flex; gap: 8px; align-items: center; }
+.check-log-list b { min-width: 34px; font-size: 10px; text-transform: uppercase; }
+.check-log-list .pass b { color: #0f7b5f; }
+.check-log-list .fail b { color: #ba2525; }
+.check-details { margin-top: 4px; padding-top: 7px; border-top: 1px solid #a7e6ce; display: grid !important; gap: 3px !important; color: #486581; }
 .progress { background: #eaf3ff; border: 1px solid #c8ddf8; color: #245b92; align-items: center; justify-content: flex-start; }
 .progress span { width: 9px; height: 9px; border: 2px solid #2f80ed; border-right-color: transparent; border-radius: 50%; animation: spin .75s linear infinite; }
 .text-button { border: 0; background: transparent; color: currentColor; padding: 2px 0; text-decoration: underline; cursor: pointer; }
