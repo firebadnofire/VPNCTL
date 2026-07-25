@@ -21,8 +21,8 @@ use vam_core::{
     validate_instance,
 };
 use vam_deployment::{
-    COREDNS_IMAGE, DeploymentExecutor, DeploymentPlanner, RemoteManifest, WIREGUARD_IMAGE,
-    build_manifest, shell_quote,
+    COREDNS_IMAGE, DeploymentExecutor, DeploymentPlanner, RemoteManifest, WATCHTOWER_IMAGE,
+    WIREGUARD_IMAGE, build_manifest, shell_quote,
 };
 use vam_dns::{next_soa_serial, validate_records};
 use vam_protocol::{
@@ -1767,6 +1767,7 @@ services="$(docker compose ps --status running --services 2>/dev/null)"
 printf 'project=1\n'
 printf 'gateway=%s\n' "$(printf '%s\n' "$services" | grep -qx gateway; echo $?)"
 printf 'dns=%s\n' "$(printf '%s\n' "$services" | grep -qx dns; echo $?)"
+printf 'watchtower=%s\n' "$(printf '%s\n' "$services" | grep -qx watchtower; echo $?)"
 docker compose exec -T gateway wg show wg0 >/dev/null 2>&1
 printf 'wireguard=%s\n' "$?"
 peer_count="$(docker compose exec -T gateway wg show wg0 peers 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')"
@@ -1804,6 +1805,7 @@ printf 'public_dns=%s\n' "$?"
             compose_project_exists: values.get("project").is_some_and(|value| value == "1"),
             gateway_running: zero("gateway"),
             dns_running: zero("dns"),
+            watchtower_running: zero("watchtower"),
             private_dns_resolves: zero("private_dns"),
             public_dns_resolves: zero("public_dns"),
             wireguard_interface_exists: zero("wireguard"),
@@ -2037,15 +2039,16 @@ fi
             plan.id,
             &mut sequence,
             "images",
-            "Pulling the pinned WireGuard and CoreDNS images.",
+            "Pulling the WireGuard, CoreDNS, and Watchtower update-channel images.",
             None,
             "info",
         )
         .await?;
         let pull = format!(
-            "set -eu; docker pull {}; docker pull {}",
+            "set -eu; docker pull {}; docker pull {}; docker pull {}",
             shell_quote(WIREGUARD_IMAGE),
-            shell_quote(COREDNS_IMAGE)
+            shell_quote(COREDNS_IMAGE),
+            shell_quote(WATCHTOWER_IMAGE),
         );
         self.checked_execute(&host, &trusted, passphrase.as_ref(), &pull, cancellation)
             .await?;
@@ -2667,6 +2670,7 @@ fn health_is_healthy(health: &InstanceHealth) -> bool {
     health.compose_project_exists
         && health.gateway_running
         && health.dns_running
+        && health.watchtower_running
         && health.private_dns_resolves
         && health.public_dns_resolves
         && health.wireguard_interface_exists
@@ -2918,10 +2922,23 @@ mod tests {
             if trusted_key_base64 != self.key.read().expect("test lock").public_key_base64 {
                 return Err(SshError::HostKeyChanged);
             }
-            self.commands
-                .lock()
-                .expect("test command lock")
-                .push(command.to_owned());
+            let mut commands = self.commands.lock().expect("test command lock");
+            let after_stop = commands
+                .last()
+                .is_some_and(|previous| previous.contains("docker compose stop"));
+            commands.push(command.to_owned());
+            if command.contains("services=\"$(docker compose ps --status running --services") {
+                let stdout = if after_stop {
+                    b"project=1\ngateway=1\ndns=1\nwatchtower=1\nwireguard=1\npeer_count=0\nport=1\nprivate_dns=1\npublic_dns=1\n".to_vec()
+                } else {
+                    b"project=1\ngateway=0\ndns=0\nwatchtower=0\nwireguard=0\npeer_count=1\nport=0\nprivate_dns=0\npublic_dns=0\n".to_vec()
+                };
+                return Ok(CommandResult {
+                    stdout,
+                    stderr: Vec::new(),
+                    exit_status: 0,
+                });
+            }
             Ok(CommandResult {
                 stdout: b"operating_system=Linux\narchitecture=x86_64\ndocker_version=29.0.0\ndocker_accessible=0\ncompose_version=5.3.1\nwireguard=0\nroot_writable=0\nsudo_bootstrap=1\n".to_vec(),
                 stderr: Vec::new(),

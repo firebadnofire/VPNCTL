@@ -109,6 +109,7 @@ pub struct InstanceHealth {
     pub compose_project_exists: bool,
     pub gateway_running: bool,
     pub dns_running: bool,
+    pub watchtower_running: bool,
     pub private_dns_resolves: bool,
     pub public_dns_resolves: bool,
     pub wireguard_interface_exists: bool,

@@ -128,6 +128,7 @@ export interface InstanceHealth {
   compose_project_exists: boolean;
   gateway_running: boolean;
   dns_running: boolean;
+  watchtower_running: boolean;
   private_dns_resolves: boolean;
   public_dns_resolves: boolean;
   wireguard_interface_exists: boolean;

@@ -11,8 +11,9 @@ use vam_core::DesiredState;
 use vam_dns::{DnsError, render_corefile, render_zone};
 use vam_protocol::{AppError, DeploymentOperation, DeploymentPlan, DeploymentResult, RenderedFile};
 
-pub const WIREGUARD_IMAGE: &str = "ghcr.io/linuxserver/wireguard:1.0.20260223-r0-ls118@sha256:2868ae5e3dd9065ea3b1e44b4214b33b02b7ce5ebcb9e4f33e1132b75007f39c";
-pub const COREDNS_IMAGE: &str = "docker.io/coredns/coredns:1.14.6@sha256:900f9c109f7a33545d3c811516e8376df9019147b750f5ce3e254468769176ea";
+pub const WIREGUARD_IMAGE: &str = "ghcr.io/linuxserver/wireguard:latest";
+pub const COREDNS_IMAGE: &str = "docker.io/coredns/coredns:latest";
+pub const WATCHTOWER_IMAGE: &str = "docker.io/containrrr/watchtower:latest";
 
 #[derive(Debug, Error)]
 pub enum DeploymentError {
@@ -105,11 +106,13 @@ pub fn render_shared_files(state: &DesiredState) -> Result<Vec<RenderedFile>, De
 
 #[must_use]
 pub fn render_compose(state: &DesiredState) -> String {
+    let scope = state.instance.id;
     format!(
-        "name: {}\nservices:\n  gateway:\n    image: {}\n    restart: unless-stopped\n    cap_add:\n      - NET_ADMIN\n    environment:\n      PUID: \"0\"\n      PGID: \"0\"\n      TZ: UTC\n      LOG_CONFS: \"false\"\n    sysctls:\n      net.ipv4.ip_forward: \"1\"\n      net.ipv4.conf.all.src_valid_mark: \"1\"\n    ports:\n      - \"${{WIREGUARD_PORT}}:51820/udp\"\n    volumes:\n      - ./vpn:/config/wg_confs\n      - ./state:/var/lib/vpn-appliance-manager\n  dns:\n    image: {}\n    restart: unless-stopped\n    network_mode: service:gateway\n    depends_on:\n      - gateway\n    volumes:\n      - ./dns/Corefile:/etc/coredns/Corefile:ro\n      - ./dns/zones:/etc/coredns/zones:ro\n    command:\n      - -conf\n      - /etc/coredns/Corefile\n",
+        "name: {}\nservices:\n  gateway:\n    image: {}\n    restart: unless-stopped\n    labels:\n      com.centurylinklabs.watchtower.enable: \"true\"\n      com.centurylinklabs.watchtower.scope: \"{scope}\"\n    cap_add:\n      - NET_ADMIN\n    environment:\n      PUID: \"0\"\n      PGID: \"0\"\n      TZ: UTC\n      LOG_CONFS: \"false\"\n    sysctls:\n      net.ipv4.ip_forward: \"1\"\n      net.ipv4.conf.all.src_valid_mark: \"1\"\n    ports:\n      - \"${{WIREGUARD_PORT}}:51820/udp\"\n    volumes:\n      - ./vpn:/config/wg_confs\n      - ./state:/var/lib/vpn-appliance-manager\n  dns:\n    image: {}\n    restart: unless-stopped\n    labels:\n      com.centurylinklabs.watchtower.enable: \"true\"\n      com.centurylinklabs.watchtower.scope: \"{scope}\"\n    network_mode: service:gateway\n    depends_on:\n      - gateway\n    volumes:\n      - ./dns/Corefile:/etc/coredns/Corefile:ro\n      - ./dns/zones:/etc/coredns/zones:ro\n    command:\n      - -conf\n      - /etc/coredns/Corefile\n  watchtower:\n    image: {}\n    restart: unless-stopped\n    labels:\n      com.centurylinklabs.watchtower.enable: \"true\"\n      com.centurylinklabs.watchtower.scope: \"{scope}\"\n    environment:\n      WATCHTOWER_LABEL_ENABLE: \"true\"\n      WATCHTOWER_SCOPE: \"{scope}\"\n      WATCHTOWER_CLEANUP: \"true\"\n      WATCHTOWER_SCHEDULE: \"0 0 4 * * *\"\n      WATCHTOWER_NO_STARTUP_MESSAGE: \"true\"\n      WATCHTOWER_ROLLING_RESTART: \"true\"\n    volumes:\n      - /var/run/docker.sock:/var/run/docker.sock\n",
         state.instance.compose_project(),
         WIREGUARD_IMAGE,
-        COREDNS_IMAGE
+        COREDNS_IMAGE,
+        WATCHTOWER_IMAGE,
     )
 }
 
@@ -340,11 +343,13 @@ mod tests {
     }
 
     #[test]
-    fn pinned_images_are_not_floating() {
-        assert!(!WIREGUARD_IMAGE.contains(":latest"));
-        assert!(!COREDNS_IMAGE.contains(":latest"));
-        assert!(WIREGUARD_IMAGE.contains("@sha256:"));
-        assert!(COREDNS_IMAGE.contains("@sha256:"));
+    fn managed_images_use_watchtower_update_channels() {
+        assert!(WIREGUARD_IMAGE.ends_with(":latest"));
+        assert!(COREDNS_IMAGE.ends_with(":latest"));
+        assert!(WATCHTOWER_IMAGE.ends_with(":latest"));
+        assert!(!WIREGUARD_IMAGE.contains("@sha256:"));
+        assert!(!COREDNS_IMAGE.contains("@sha256:"));
+        assert!(!WATCHTOWER_IMAGE.contains("@sha256:"));
     }
 
     #[test]
@@ -355,8 +360,15 @@ mod tests {
         assert_eq!(first, second);
         assert!(first.contains(WIREGUARD_IMAGE));
         assert!(first.contains(COREDNS_IMAGE));
+        assert!(first.contains(WATCHTOWER_IMAGE));
         assert!(first.contains("network_mode: service:gateway"));
         assert!(first.contains("LOG_CONFS: \"false\""));
+        assert!(first.contains("WATCHTOWER_LABEL_ENABLE: \"true\""));
+        assert!(first.contains("WATCHTOWER_CLEANUP: \"true\""));
+        assert!(first.contains("WATCHTOWER_SCHEDULE: \"0 0 4 * * *\""));
+        assert!(first.contains(
+            "com.centurylinklabs.watchtower.scope: \"00000000-0000-0000-0000-000000000000\""
+        ));
         assert!(!first.contains("PEERS:"));
         assert!(!first.contains("SERVERURL:"));
     }
