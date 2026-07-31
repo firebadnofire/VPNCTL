@@ -16,13 +16,14 @@ use tokio::time::timeout;
 use tokio::{sync::Mutex, time::sleep};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use vam_backend_wireguard::{VpnBackend, WireGuardBackend};
+use vam_backend::{BackendError, BackendRegistry, VpnBackend};
+use vam_backend_wireguard::WireGuardBackend;
 use vam_core::{
-    DEFAULT_DNS_ZONE, DEFAULT_KEEPALIVE, DEFAULT_PORT, DEFAULT_SUBNET, DesiredState, Device,
-    DeviceBackendData, DnsConfig, DnsRecord, DnsRecordType, DockerHost, EndpointConfig,
-    NetworkConfig, RoutingMode, SecretReference, SshConnectionConfig, User, VpnBackendKind,
-    VpnInstance, WireGuardDeviceData, allocate_next_ipv4, first_usable, validate_host_instances,
-    validate_instance,
+    BackendSettings, DEFAULT_DNS_ZONE, DEFAULT_KEEPALIVE, DEFAULT_PORT, DEFAULT_SUBNET,
+    DesiredState, Device, DeviceBackendData, DnsConfig, DnsRecord, DnsRecordType, DockerHost,
+    EndpointConfig, NetworkConfig, RoutingMode, SecretReference, SshConnectionConfig, User,
+    VpnBackendKind, VpnInstance, WireGuardDeviceData, allocate_next_ipv4, first_usable,
+    validate_host_instances, validate_instance,
 };
 use vam_deployment::{
     COREDNS_IMAGE, DeploymentExecutor, DeploymentPlanner, RemoteManifest, WATCHTOWER_IMAGE,
@@ -156,6 +157,7 @@ pub struct ApplicationService {
     pub storage: Storage,
     pub secrets: Arc<dyn SecretStore>,
     transport: Arc<dyn SshTransport>,
+    backends: Arc<BackendRegistry>,
     instance_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
     cancellations: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
 }
@@ -172,10 +174,12 @@ impl ApplicationService {
         secrets: Arc<dyn SecretStore>,
         transport: Arc<dyn SshTransport>,
     ) -> Self {
+        let wireguard: Arc<dyn VpnBackend> = Arc::new(WireGuardBackend);
         Self {
             storage,
             secrets,
             transport,
+            backends: Arc::new(BackendRegistry::new([wireguard])),
             instance_locks: Arc::default(),
             cancellations: Arc::default(),
         }
@@ -444,6 +448,7 @@ fi
             host_id: input.host_id,
             display_name: input.display_name.trim().into(),
             backend: VpnBackendKind::WireGuard,
+            backend_settings: BackendSettings::default(),
             endpoint: EndpointConfig {
                 host: input.endpoint_host.trim().into(),
                 port: input.endpoint_port,
@@ -594,7 +599,7 @@ fi
             instance_id: input.instance_id,
             user_id: input.user_id,
             display_name: input.display_name.trim().into(),
-            ipv4_address: address,
+            ipv4_address: Some(address),
             ipv6_address: None,
             dns_name,
             enabled: true,
@@ -630,7 +635,7 @@ fi
                 instance_id: input.instance_id,
                 name,
                 record_type: DnsRecordType::A,
-                value: device.ipv4_address.to_string(),
+                value: address.to_string(),
                 ttl: 300,
                 enabled: true,
                 managed_by_device_id: Some(device.id),
@@ -644,7 +649,9 @@ fi
         let mut state = self.desired_state(device.instance_id).await?;
         state.devices.retain(|existing| existing.id != device.id);
         state.devices.push(device.clone());
-        WireGuardBackend
+        self.backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?
             .validate(&state)
             .map_err(|error| validation_error(&error.to_string()))?;
         let dns_changed = self
@@ -1379,7 +1386,9 @@ docker compose restart gateway
             .map_err(storage_error)?;
         let state = self.desired_state(device.instance_id).await?;
         let secrets = self.device_secret_map(&state, &device).await?;
-        WireGuardBackend
+        self.backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?
             .render_client(&state, &device, &secrets)
             .map_err(backend_error)
     }
@@ -1549,12 +1558,13 @@ docker compose restart gateway
     }
 
     async fn render_state(&self, state: &DesiredState) -> Result<Vec<RenderedFile>, AppError> {
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
         let mut secrets = HashMap::new();
-        for device in &state.devices {
-            let DeviceBackendData::WireGuard(data) = &device.backend_data;
-            if let Some(reference) = &data.preshared_key_ref {
-                secrets.insert(reference.clone(), self.secret_text(reference).await?);
-            }
+        for reference in backend.server_secret_references(state) {
+            secrets.insert(reference.clone(), self.secret_text(&reference).await?);
         }
         self.render_state_with_secrets(state, &secrets).await
     }
@@ -1563,17 +1573,16 @@ docker compose restart gateway
         &self,
         state: &DesiredState,
     ) -> Result<Vec<RenderedFile>, AppError> {
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
         let placeholder =
             Zeroizing::new(String::from("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
-        let secrets = state
-            .devices
-            .iter()
-            .filter_map(|device| {
-                let DeviceBackendData::WireGuard(data) = &device.backend_data;
-                data.preshared_key_ref
-                    .as_ref()
-                    .map(|reference| (reference.clone(), placeholder.clone()))
-            })
+        let secrets = backend
+            .server_secret_references(state)
+            .into_iter()
+            .map(|reference| (reference, placeholder.clone()))
             .collect();
         self.render_state_with_secrets(state, &secrets).await
     }
@@ -1587,14 +1596,16 @@ docker compose restart gateway
         render_state.dns_blocklist_domains = self
             .selected_dns_blocklist_domains(render_state.instance.id)
             .await?;
-        WireGuardBackend
-            .validate(&render_state)
+        let backend = self
+            .backends
+            .get(render_state.instance.backend)
             .map_err(backend_error)?;
+        backend.validate(&render_state).map_err(backend_error)?;
         let mut files = vam_deployment::DefaultDeploymentPlanner
             .render(&render_state)
             .map_err(deployment_error)?;
-        files.push(
-            WireGuardBackend
+        files.extend(
+            backend
                 .render_server(&render_state, secrets)
                 .map_err(backend_error)?,
         );
@@ -1775,31 +1786,36 @@ docker compose restart gateway
         state: &DesiredState,
         device: &Device,
     ) -> Result<HashMap<SecretReference, Zeroizing<String>>, AppError> {
-        let DeviceBackendData::WireGuard(data) = &device.backend_data;
         let mut secrets = HashMap::new();
-        secrets.insert(
-            data.private_key_ref.clone(),
-            self.secret_text(&data.private_key_ref).await?,
-        );
-        if let Some(reference) = &data.preshared_key_ref {
-            secrets.insert(reference.clone(), self.secret_text(reference).await?);
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
+        for reference in backend
+            .client_secret_references(device)
+            .map_err(backend_error)?
+        {
+            secrets.insert(reference.clone(), self.secret_text(&reference).await?);
         }
-        let server_reference = SecretReference(state.instance.id);
-        let server_public = self
-            .storage
-            .get_setting::<String>(&server_public_key_setting(state.instance.id))
-            .await
-            .map_err(storage_error)?
-            .ok_or_else(|| AppError {
-                code: "server_public_key_missing".into(),
-                message: "The server public key is unavailable; deploy the instance first.".into(),
-                scope: Some(state.instance.id.to_string()),
-                remote_state_changed: false,
-                rollback_succeeded: None,
-                remediation: Some("Apply the instance, then export the client.".into()),
-                technical_detail: None,
-            })?;
-        secrets.insert(server_reference.clone(), Zeroizing::new(server_public));
+        if state.instance.backend == VpnBackendKind::WireGuard {
+            let server_reference = SecretReference(state.instance.id);
+            let server_public = self
+                .storage
+                .get_setting::<String>(&server_public_key_setting(state.instance.id))
+                .await
+                .map_err(storage_error)?
+                .ok_or_else(|| AppError {
+                    code: "server_public_key_missing".into(),
+                    message: "The server public key is unavailable; deploy the instance first."
+                        .into(),
+                    scope: Some(state.instance.id.to_string()),
+                    remote_state_changed: false,
+                    rollback_succeeded: None,
+                    remediation: Some("Apply the instance, then export the client.".into()),
+                    technical_detail: None,
+                })?;
+            secrets.insert(server_reference, Zeroizing::new(server_public));
+        }
         Ok(secrets)
     }
 
@@ -3139,14 +3155,16 @@ fn deployment_error(error: vam_deployment::DeploymentError) -> AppError {
     }
 }
 
-fn backend_error(error: vam_backend_wireguard::BackendError) -> AppError {
+fn backend_error(error: BackendError) -> AppError {
     AppError {
-        code: "wireguard".into(),
+        code: "backend".into(),
         message: error.to_string(),
         scope: None,
         remote_state_changed: false,
         rollback_succeeded: None,
-        remediation: Some("Correct the WireGuard device data or replace missing secrets.".into()),
+        remediation: Some(
+            "Correct the backend settings or replace missing identity material.".into(),
+        ),
         technical_detail: None,
     }
 }
@@ -3486,7 +3504,13 @@ mod tests {
         assert_eq!(device.dns_name.as_deref(), Some("vm1.test.internal"));
         let records = service.list_dns_records(instance.id).await.unwrap();
         assert_eq!(records[0].name, "vm1.test.internal");
-        assert_eq!(records[0].value, device.ipv4_address.to_string());
+        assert_eq!(
+            records[0].value,
+            device
+                .ipv4_address
+                .expect("WireGuard device has an address")
+                .to_string()
+        );
 
         let invalid = service
             .create_device(CreateDeviceInput {
@@ -3546,7 +3570,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let DeviceBackendData::WireGuard(data) = &device.backend_data;
+        let DeviceBackendData::WireGuard(data) = &device.backend_data else {
+            panic!("expected WireGuard device");
+        };
         secrets.delete(&data.private_key_ref).await.unwrap();
         secrets
             .delete(data.preshared_key_ref.as_ref().unwrap())
@@ -3716,7 +3742,9 @@ mod tests {
             })
             .await
             .unwrap();
-        let DeviceBackendData::WireGuard(data) = &device.backend_data;
+        let DeviceBackendData::WireGuard(data) = &device.backend_data else {
+            panic!("expected WireGuard device");
+        };
         let psk = secrets
             .get(data.preshared_key_ref.as_ref().unwrap())
             .await

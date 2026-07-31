@@ -13,7 +13,13 @@ use uuid::Uuid;
 pub const DEFAULT_SUBNET: &str = "10.64.0.0/24";
 pub const DEFAULT_DNS_ZONE: &str = "internal";
 pub const DEFAULT_PORT: u16 = 51_820;
+pub const DEFAULT_AMNEZIAWG_PORT: u16 = 55_424;
+pub const DEFAULT_OPENVPN_PORT: u16 = 1_194;
+pub const DEFAULT_IKEV2_PORT: u16 = 500;
+pub const DEFAULT_XRAY_PORT: u16 = 443;
 pub const DEFAULT_KEEPALIVE: u16 = 25;
+pub const CURRENT_INSTANCE_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_DEVICE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DockerHost {
@@ -36,10 +42,275 @@ pub struct SshConnectionConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct SecretReference(pub Uuid);
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum VpnBackendKind {
+    #[serde(rename = "wireguard", alias = "wire_guard")]
     WireGuard,
+    #[serde(rename = "amnezia_wg", alias = "amneziawg", alias = "awg2")]
+    AmneziaWg,
+    #[serde(rename = "openvpn", alias = "open_vpn")]
+    OpenVpn,
+    #[serde(rename = "ikev2", alias = "ike_v2")]
+    Ikev2,
+    #[serde(rename = "xray")]
+    Xray,
+}
+
+impl VpnBackendKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::WireGuard => "wireguard",
+            Self::AmneziaWg => "amnezia_wg",
+            Self::OpenVpn => "openvpn",
+            Self::Ikev2 => "ikev2",
+            Self::Xray => "xray",
+        }
+    }
+
+    #[must_use]
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Self::WireGuard => "WireGuard",
+            Self::AmneziaWg => "AmneziaWG 2",
+            Self::OpenVpn => "OpenVPN",
+            Self::Ikev2 => "IKEv2",
+            Self::Xray => "Xray",
+        }
+    }
+
+    #[must_use]
+    pub const fn default_port(self) -> u16 {
+        match self {
+            Self::WireGuard => DEFAULT_PORT,
+            Self::AmneziaWg => DEFAULT_AMNEZIAWG_PORT,
+            Self::OpenVpn => DEFAULT_OPENVPN_PORT,
+            Self::Ikev2 => DEFAULT_IKEV2_PORT,
+            Self::Xray => DEFAULT_XRAY_PORT,
+        }
+    }
+}
+
+impl std::fmt::Display for VpnBackendKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.display_name())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportProtocol {
+    Tcp,
+    Udp,
+}
+
+impl TransportProtocol {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+}
+
+impl std::fmt::Display for TransportProtocol {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ListenerPort {
+    pub port: u16,
+    pub protocol: TransportProtocol,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct WireGuardSettings {
+    #[serde(default)]
+    pub userspace_fallback: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AmneziaWgGeneration {
+    #[default]
+    Awg2,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AmneziaWgSettings {
+    #[serde(default)]
+    pub generation: AmneziaWgGeneration,
+    pub jc: u16,
+    pub jmin: u16,
+    pub jmax: u16,
+    pub s1: u16,
+    pub s2: u16,
+    pub s3: u16,
+    pub s4: u16,
+    pub h1: u32,
+    pub h2: u32,
+    pub h3: u32,
+    pub h4: u32,
+}
+
+impl Default for AmneziaWgSettings {
+    fn default() -> Self {
+        Self {
+            generation: AmneziaWgGeneration::Awg2,
+            jc: 5,
+            jmin: 50,
+            jmax: 1_000,
+            s1: 0,
+            s2: 0,
+            s3: 0,
+            s4: 0,
+            h1: 1,
+            h2: 2,
+            h3: 3,
+            h4: 4,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenVpnTransport {
+    Tcp,
+    #[default]
+    Udp,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum OpenVpnCipher {
+    #[default]
+    Aes256Gcm,
+    Chacha20Poly1305,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenVpnSettings {
+    #[serde(default)]
+    pub transport: OpenVpnTransport,
+    #[serde(default)]
+    pub cipher: OpenVpnCipher,
+    pub certificate_lifetime_days: u16,
+}
+
+impl Default for OpenVpnSettings {
+    fn default() -> Self {
+        Self {
+            transport: OpenVpnTransport::Udp,
+            cipher: OpenVpnCipher::Aes256Gcm,
+            certificate_lifetime_days: 825,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Ikev2Settings {
+    pub server_identity: String,
+    pub certificate_lifetime_days: u16,
+}
+
+impl Default for Ikev2Settings {
+    fn default() -> Self {
+        Self {
+            server_identity: String::new(),
+            certificate_lifetime_days: 825,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum XraySecurity {
+    Tls,
+    #[default]
+    Reality,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum XrayTransport {
+    #[default]
+    Tcp,
+    Xhttp,
+    Mkcp,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct XraySettings {
+    #[serde(default)]
+    pub security: XraySecurity,
+    #[serde(default)]
+    pub transport: XrayTransport,
+    pub server_name: String,
+    pub fingerprint: String,
+    pub xhttp_path: String,
+}
+
+impl Default for XraySettings {
+    fn default() -> Self {
+        Self {
+            security: XraySecurity::Reality,
+            transport: XrayTransport::Tcp,
+            server_name: "www.cloudflare.com".into(),
+            fingerprint: "chrome".into(),
+            xhttp_path: "/".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "backend", content = "settings")]
+pub enum BackendSettings {
+    #[serde(rename = "wireguard", alias = "wire_guard")]
+    WireGuard(WireGuardSettings),
+    #[serde(rename = "amnezia_wg", alias = "amneziawg", alias = "awg2")]
+    AmneziaWg(AmneziaWgSettings),
+    #[serde(rename = "openvpn", alias = "open_vpn")]
+    OpenVpn(OpenVpnSettings),
+    #[serde(rename = "ikev2", alias = "ike_v2")]
+    Ikev2(Ikev2Settings),
+    #[serde(rename = "xray")]
+    Xray(XraySettings),
+}
+
+impl Default for BackendSettings {
+    fn default() -> Self {
+        Self::WireGuard(WireGuardSettings::default())
+    }
+}
+
+impl BackendSettings {
+    #[must_use]
+    pub const fn kind(&self) -> VpnBackendKind {
+        match self {
+            Self::WireGuard(_) => VpnBackendKind::WireGuard,
+            Self::AmneziaWg(_) => VpnBackendKind::AmneziaWg,
+            Self::OpenVpn(_) => VpnBackendKind::OpenVpn,
+            Self::Ikev2(_) => VpnBackendKind::Ikev2,
+            Self::Xray(_) => VpnBackendKind::Xray,
+        }
+    }
+
+    #[must_use]
+    pub fn defaults_for(kind: VpnBackendKind, endpoint_host: &str) -> Self {
+        match kind {
+            VpnBackendKind::WireGuard => Self::default(),
+            VpnBackendKind::AmneziaWg => Self::AmneziaWg(AmneziaWgSettings::default()),
+            VpnBackendKind::OpenVpn => Self::OpenVpn(OpenVpnSettings::default()),
+            VpnBackendKind::Ikev2 => Self::Ikev2(Ikev2Settings {
+                server_identity: endpoint_host.into(),
+                ..Ikev2Settings::default()
+            }),
+            VpnBackendKind::Xray => Self::Xray(XraySettings::default()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -75,6 +346,8 @@ pub struct VpnInstance {
     pub host_id: Uuid,
     pub display_name: String,
     pub backend: VpnBackendKind,
+    #[serde(default)]
+    pub backend_settings: BackendSettings,
     pub endpoint: EndpointConfig,
     pub network: NetworkConfig,
     pub dns: DnsConfig,
@@ -95,6 +368,37 @@ impl VpnInstance {
     pub fn compose_project(&self) -> String {
         format!("vam-{}", self.id)
     }
+
+    #[must_use]
+    pub fn listeners(&self) -> Vec<ListenerPort> {
+        match &self.backend_settings {
+            BackendSettings::WireGuard(_) | BackendSettings::AmneziaWg(_) => vec![ListenerPort {
+                port: self.endpoint.port,
+                protocol: TransportProtocol::Udp,
+            }],
+            BackendSettings::OpenVpn(settings) => vec![ListenerPort {
+                port: self.endpoint.port,
+                protocol: match settings.transport {
+                    OpenVpnTransport::Tcp => TransportProtocol::Tcp,
+                    OpenVpnTransport::Udp => TransportProtocol::Udp,
+                },
+            }],
+            BackendSettings::Ikev2(_) => vec![
+                ListenerPort {
+                    port: 500,
+                    protocol: TransportProtocol::Udp,
+                },
+                ListenerPort {
+                    port: 4_500,
+                    protocol: TransportProtocol::Udp,
+                },
+            ],
+            BackendSettings::Xray(_) => vec![ListenerPort {
+                port: self.endpoint.port,
+                protocol: TransportProtocol::Tcp,
+            }],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -112,9 +416,72 @@ pub struct WireGuardDeviceData {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AmneziaWgDeviceData {
+    pub public_key: String,
+    pub private_key_ref: SecretReference,
+    pub preshared_key_ref: SecretReference,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenVpnDeviceData {
+    pub common_name: String,
+    pub private_key_ref: SecretReference,
+    pub csr_ref: SecretReference,
+    pub certificate_serial: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Ikev2DeviceData {
+    pub identity: String,
+    pub bundle_password_ref: SecretReference,
+    pub certificate_serial: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct XrayDeviceData {
+    pub client_id: Uuid,
+    pub email: String,
+    pub flow: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "backend", content = "data", rename_all = "snake_case")]
 pub enum DeviceBackendData {
     WireGuard(WireGuardDeviceData),
+    AmneziaWg(AmneziaWgDeviceData),
+    OpenVpn(OpenVpnDeviceData),
+    Ikev2(Ikev2DeviceData),
+    Xray(XrayDeviceData),
+}
+
+impl DeviceBackendData {
+    #[must_use]
+    pub const fn kind(&self) -> VpnBackendKind {
+        match self {
+            Self::WireGuard(_) => VpnBackendKind::WireGuard,
+            Self::AmneziaWg(_) => VpnBackendKind::AmneziaWg,
+            Self::OpenVpn(_) => VpnBackendKind::OpenVpn,
+            Self::Ikev2(_) => VpnBackendKind::Ikev2,
+            Self::Xray(_) => VpnBackendKind::Xray,
+        }
+    }
+
+    #[must_use]
+    pub fn secret_references(&self) -> Vec<&SecretReference> {
+        match self {
+            Self::WireGuard(data) => {
+                let mut references = vec![&data.private_key_ref];
+                references.extend(data.preshared_key_ref.as_ref());
+                references
+            }
+            Self::AmneziaWg(data) => {
+                vec![&data.private_key_ref, &data.preshared_key_ref]
+            }
+            Self::OpenVpn(data) => vec![&data.private_key_ref, &data.csr_ref],
+            Self::Ikev2(data) => vec![&data.bundle_password_ref],
+            Self::Xray(_) => Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -123,7 +490,8 @@ pub struct Device {
     pub instance_id: Uuid,
     pub user_id: Option<Uuid>,
     pub display_name: String,
-    pub ipv4_address: Ipv4Addr,
+    #[serde(default)]
+    pub ipv4_address: Option<Ipv4Addr>,
     pub ipv6_address: Option<Ipv6Addr>,
     pub dns_name: Option<String>,
     pub enabled: bool,
@@ -178,10 +546,24 @@ pub enum ValidationError {
     InvalidDeviceAddress(Ipv4Addr),
     #[error("duplicate device address {0}")]
     DuplicateDeviceAddress(Ipv4Addr),
+    #[error("{0} devices require an allocated IPv4 tunnel address")]
+    MissingDeviceAddress(VpnBackendKind),
+    #[error("device backend {device} does not match instance backend {instance}")]
+    DeviceBackendMismatch {
+        instance: VpnBackendKind,
+        device: VpnBackendKind,
+    },
+    #[error("backend settings do not match instance backend {0}")]
+    BackendSettingsMismatch(VpnBackendKind),
+    #[error("VPN listener port must be between 1 and 65535")]
+    InvalidPort,
     #[error("instance subnets overlap")]
     OverlappingSubnet,
-    #[error("instances on one host cannot share UDP port {0}")]
-    DuplicatePort(u16),
+    #[error("instances on one host cannot share {protocol} port {port}")]
+    DuplicatePort {
+        port: u16,
+        protocol: TransportProtocol,
+    },
 }
 
 pub fn validate_instance(instance: &VpnInstance) -> Result<(), ValidationError> {
@@ -192,6 +574,12 @@ pub fn validate_instance(instance: &VpnInstance) -> Result<(), ValidationError> 
     }
     if instance.endpoint.host.trim().is_empty() {
         return Err(ValidationError::Required { field: "endpoint" });
+    }
+    if instance.endpoint.port == 0 {
+        return Err(ValidationError::InvalidPort);
+    }
+    if instance.backend_settings.kind() != instance.backend {
+        return Err(ValidationError::BackendSettingsMismatch(instance.backend));
     }
     if !is_private_subnet(instance.network.ipv4_subnet) {
         return Err(ValidationError::NonPrivateSubnet);
@@ -208,7 +596,18 @@ pub fn validate_device_addresses(
 ) -> Result<(), ValidationError> {
     let mut seen = HashSet::new();
     for device in devices.iter().filter(|device| device.deleted_at.is_none()) {
-        let address = device.ipv4_address;
+        if device.backend_data.kind() != instance.backend {
+            return Err(ValidationError::DeviceBackendMismatch {
+                instance: instance.backend,
+                device: device.backend_data.kind(),
+            });
+        }
+        let Some(address) = device.ipv4_address else {
+            if instance.backend != VpnBackendKind::Xray {
+                return Err(ValidationError::MissingDeviceAddress(instance.backend));
+            }
+            continue;
+        };
         if !instance.network.ipv4_subnet.contains(&address)
             || address == instance.network.ipv4_subnet.network()
             || address == instance.network.ipv4_subnet.broadcast()
@@ -232,8 +631,16 @@ pub fn validate_host_instances(instances: &[VpnInstance]) -> Result<(), Validati
             {
                 continue;
             }
-            if left.endpoint.port == right.endpoint.port {
-                return Err(ValidationError::DuplicatePort(left.endpoint.port));
+            let right_listeners: HashSet<_> = right.listeners().into_iter().collect();
+            if let Some(listener) = left
+                .listeners()
+                .into_iter()
+                .find(|listener| right_listeners.contains(listener))
+            {
+                return Err(ValidationError::DuplicatePort {
+                    port: listener.port,
+                    protocol: listener.protocol,
+                });
             }
             if left
                 .network
@@ -259,7 +666,7 @@ pub fn allocate_next_ipv4(
     let used: HashSet<_> = devices
         .iter()
         .filter(|device| device.deleted_at.is_none())
-        .map(|device| device.ipv4_address)
+        .filter_map(|device| device.ipv4_address)
         .collect();
     subnet
         .hosts()
@@ -297,6 +704,7 @@ mod tests {
             host_id,
             display_name: "test".into(),
             backend: VpnBackendKind::WireGuard,
+            backend_settings: BackendSettings::default(),
             endpoint: EndpointConfig {
                 host: "vpn.example.test".into(),
                 port,
@@ -328,7 +736,7 @@ mod tests {
             instance_id: Uuid::new_v4(),
             user_id: None,
             display_name: "old".into(),
-            ipv4_address: "10.64.0.2".parse().unwrap(),
+            ipv4_address: Some("10.64.0.2".parse().unwrap()),
             ipv6_address: None,
             dns_name: None,
             enabled: false,
@@ -364,7 +772,55 @@ mod tests {
         let duplicate_port = instance(host_id, "10.65.0.0/24", 51_820);
         assert_eq!(
             validate_host_instances(&[left, duplicate_port]).unwrap_err(),
-            ValidationError::DuplicatePort(51_820)
+            ValidationError::DuplicatePort {
+                port: 51_820,
+                protocol: TransportProtocol::Udp,
+            }
+        );
+    }
+
+    #[test]
+    fn tcp_and_udp_listeners_can_share_a_numeric_port() {
+        let host_id = Uuid::new_v4();
+        let udp = instance(host_id, "10.64.0.0/24", 443);
+        let mut tcp = instance(host_id, "10.65.0.0/24", 443);
+        tcp.backend = VpnBackendKind::Xray;
+        tcp.backend_settings = BackendSettings::Xray(XraySettings::default());
+
+        validate_host_instances(&[udp, tcp]).unwrap();
+    }
+
+    #[test]
+    fn legacy_wire_guard_json_deserializes_with_current_defaults() {
+        let value = serde_json::json!({
+            "id": Uuid::nil(),
+            "host_id": Uuid::from_u128(1),
+            "display_name": "legacy",
+            "backend": "wire_guard",
+            "endpoint": {"host": "vpn.example.test", "port": 51820},
+            "network": {
+                "ipv4_subnet": "10.64.0.0/24",
+                "gateway_ipv4": "10.64.0.1",
+                "ipv6_subnet": null,
+                "gateway_ipv6": null
+            },
+            "dns": {"zone": "vpn.internal", "soa_serial": 2_026_073_001_u64},
+            "routing_mode": "split_tunnel",
+            "persistent_keepalive": 25,
+            "created_at": Utc::now(),
+            "updated_at": Utc::now(),
+            "deleted_at": null
+        });
+        let decoded: VpnInstance = serde_json::from_value(value).unwrap();
+
+        assert_eq!(decoded.backend, VpnBackendKind::WireGuard);
+        assert_eq!(decoded.backend_settings, BackendSettings::default());
+        assert_eq!(
+            decoded.listeners(),
+            vec![ListenerPort {
+                port: 51_820,
+                protocol: TransportProtocol::Udp,
+            }]
         );
     }
 
@@ -376,7 +832,7 @@ mod tests {
             instance_id: instance.id,
             user_id: None,
             display_name: "only peer".into(),
-            ipv4_address: "10.64.0.2".parse().unwrap(),
+            ipv4_address: Some("10.64.0.2".parse().unwrap()),
             ipv6_address: None,
             dns_name: None,
             enabled: false,

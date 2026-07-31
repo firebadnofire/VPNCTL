@@ -591,4 +591,190 @@ Validation:
 
 Commit:
 
-- pending exact staged-file review and signature verification.
+- `c10b71b docs: dissect multi-protocol VPN architecture`;
+- created with `git commit -S`;
+- `git verify-commit HEAD` reported a good EDDSA signature from William Jones
+  using key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### Unit 1: backend contract, typed model, migration, and WireGuard compatibility
+
+Status: complete.
+
+#### Common backend crate
+
+Added `crates/backend` as the protocol-independent backend boundary. Its
+`VpnBackend` contract now requires each implementation to declare:
+
+- a stable `VpnBackendKind`;
+- behavioral `BackendCapabilities`;
+- typed TCP/UDP listeners;
+- desired-state validation;
+- secret references needed for server rendering;
+- secret references needed for client rendering;
+- deterministic server files;
+- deterministic client artifacts;
+- client artifact kind;
+- settings-change impact as live update, service restart, or reinstall.
+
+`BackendCapabilities` includes allocated tunnel addresses, managed DNS, quick
+credential refresh, live identity updates, QR export, traffic statistics, and
+certificate-authority behavior. These flags will gate application and UI
+features when the remaining backends are registered.
+
+`BackendRegistry` owns trait objects keyed by the typed enum. The application
+constructs one registry and uses it for validation, server rendering, client
+rendering, and backend secret discovery. At this point the only registered
+implementation is WireGuard, so unsupported enum variants fail with the
+structured `BackendError::NotRegistered` instead of falling through to
+WireGuard.
+
+Backend code remains pure with respect to infrastructure: it has no SSH,
+SQLite, keyring, Tauri, or Svelte dependency.
+
+#### Core model
+
+Expanded `VpnBackendKind` to:
+
+- `WireGuard`;
+- `AmneziaWg`;
+- `OpenVpn`;
+- `Ikev2`;
+- `Xray`.
+
+Canonical serialized names are `wireguard`, `amnezia_wg`, `openvpn`, `ikev2`,
+and `xray`. Aliases accept historical or likely transitional spellings,
+including the existing `wire_guard`. Stable `as_str`, display-name, and
+default-port methods prevent ad hoc string formatting in storage and UI
+adapters.
+
+Added typed `TransportProtocol` and `ListenerPort`. Instance conflict
+validation now compares `(port, transport)` listener pairs. TCP and UDP may
+therefore share one numeric port on a host, while two active instances may not
+claim the same transport and port. Subnet-overlap validation remains unchanged.
+
+Added a tagged `BackendSettings` enum and typed settings structures for all
+five target protocols:
+
+- `WireGuardSettings`;
+- `AmneziaWgSettings`, including AWG2 generation and the complete numeric
+  obfuscation field set;
+- `OpenVpnSettings`, with a typed TCP/UDP transport and modern cipher choice;
+- `Ikev2Settings`, with server identity and certificate lifetime;
+- `XraySettings`, with typed security/transport, SNI, fingerprint, and XHTTP
+  path fields.
+
+There is no arbitrary OpenVPN directive string or raw Xray JSON field. More
+specific range and hostname validation belongs to each backend implementation.
+
+`VpnInstance.backend_settings` has a serde default of WireGuard settings.
+Consequently, old deployment snapshots and old `model_json` rows deserialize
+without an eager rewrite.
+
+Added tagged device identity payloads for WireGuard, AmneziaWG, OpenVPN,
+IKEv2, and Xray. Each payload exposes its secret references generically for
+snapshot retention. Xray has no secret-store reference because its UUID is
+itself the client credential and will be treated as sensitive export material.
+
+`Device.ipv4_address` is now optional. Existing JSON address strings
+deserialize as `Some(address)`. WireGuard, AWG, OpenVPN, and IKEv2 validation
+require an address; Xray can omit one. The allocator ignores addressless
+identities and continues reserving addresses held by disabled devices.
+
+#### Additive SQLite migration
+
+Added `0002_multi_protocol_model.sql`. It:
+
+- adds `instance_schema_version` and `backend_settings_json` to
+  `vpn_instances`;
+- defaults existing rows to schema 1 and WireGuard settings;
+- adds `identity_schema_version` and `backend` to `devices`;
+- replaces the numeric-port-only unique index with
+  `instance_listeners(instance_id, host_id, port, transport, active)`;
+- backfills every existing instance listener as UDP using its current endpoint
+  port and deletion state;
+- enforces active host/port/transport uniqueness;
+- retains address uniqueness only for non-empty addresses, allowing multiple
+  addressless identities.
+
+The migration does not drop or recreate any desired-state, deployment,
+identity, DNS, host-key, or secret-reference row.
+
+`Storage::save_instance` now performs the instance upsert and listener
+replacement in one transaction. It writes the actual backend ID, current
+schema version, and typed settings JSON instead of the old hard-coded
+`wireguard` value. A listener conflict rolls back the entire save.
+
+`replace_desired_state` uses the same current instance metadata and listener
+reservation behavior so rollback cannot bypass the multi-protocol constraints.
+
+Device saves now write the identity backend and schema version. An absent IPv4
+address is represented by an empty indexed column while the canonical JSON
+retains `null`; the partial unique index excludes that empty representation.
+
+Secret-retention scans now call `DeviceBackendData::secret_references` rather
+than destructuring WireGuard. Retained OpenVPN and IKEv2 snapshots will
+therefore protect their referenced key/CSR/password material without another
+storage change.
+
+#### WireGuard adaptation
+
+Moved `VpnBackend` and `BackendError` out of `backend-wireguard`. The
+WireGuard crate now implements the common contract and declares:
+
+- allocated tunnel addresses;
+- managed DNS;
+- quick credential refresh;
+- live identity updates;
+- QR export;
+- traffic statistics;
+- no certificate authority.
+
+It declares one UDP listener, reports server-side PSK references separately
+from client-side private-key/PSK references, rejects a mismatched backend
+instead of relying on an irrefutable enum, and returns a vector of rendered
+server files so other backends can own multiple files.
+
+The existing WireGuard configuration content and remote paths are unchanged.
+The application now selects WireGuard through `BackendRegistry` for validation,
+server rendering, and client rendering. WireGuard creation and remote
+deployment remain WireGuard-only until the subsequent backend and generic
+orchestration units.
+
+#### Validation and diagnosis
+
+The first storage compile attempt found one stale test call to
+`Option<Ipv4Addr>::to_string`. It was corrected to explicitly unwrap the known
+WireGuard fixture address, and the same storage test command then passed.
+
+The first workspace check found the expected direct-construction and exhaustive
+matching sites in deployment/application code. Each was converted explicitly;
+no wildcard branch silently treats a new backend as WireGuard.
+
+The first strict Clippy pass found one unreadable numeric literal in the
+legacy-JSON fixture. It was changed to `2_026_073_001_u64`; the identical lint
+command then passed.
+
+Passing checks:
+
+- `cargo test -p vam-core -p vam-backend -p vam-backend-wireguard`: 9 tests;
+- `cargo test -p vam-storage`: 9 tests;
+- `cargo check --workspace --all-targets`;
+- `cargo test --workspace`: 47 tests;
+- `cargo fmt --all -- --check`;
+- `cargo clippy --workspace --all-targets -- -D warnings`.
+
+The new regression coverage proves:
+
+- old `wire_guard` JSON loads as WireGuard with default settings;
+- an actual schema-1 database upgraded by the SQL preserves and loads its old
+  instance;
+- the migration backfills the WireGuard UDP listener;
+- SQLite rejects duplicate active host/port/transport reservations;
+- SQLite permits TCP and UDP to share a numeric port;
+- existing WireGuard key generation, deterministic server rendering,
+  full-tunnel IPv4 behavior, secret-free planning, refresh isolation, host-key
+  decisions, backup retention, and application flows still pass.
+
+Commit:
+
+- pending exact diff review, whitespace validation, and signed commit.

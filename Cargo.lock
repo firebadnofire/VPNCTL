@@ -6546,6 +6546,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "vam-backend",
  "vam-backend-wireguard",
  "vam-core",
  "vam-deployment",
@@ -6558,13 +6559,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "vam-backend"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.19",
+ "vam-core",
+ "vam-protocol",
+ "zeroize",
+]
+
+[[package]]
 name = "vam-backend-wireguard"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "chrono",
- "thiserror 2.0.19",
  "uuid",
+ "vam-backend",
  "vam-core",
  "vam-protocol",
  "wireguard-conf",
@@ -6578,6 +6588,7 @@ dependencies = [
  "chrono",
  "ipnet",
  "serde",
+ "serde_json",
  "thiserror 2.0.19",
  "uuid",
 ]

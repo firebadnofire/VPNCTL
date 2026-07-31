@@ -8,7 +8,10 @@ use sqlx::{
 };
 use thiserror::Error;
 use uuid::Uuid;
-use vam_core::{DesiredState, Device, DeviceBackendData, DnsRecord, DockerHost, User, VpnInstance};
+use vam_core::{
+    CURRENT_DEVICE_SCHEMA_VERSION, CURRENT_INSTANCE_SCHEMA_VERSION, DesiredState, Device,
+    DnsRecord, DockerHost, User, VpnInstance,
+};
 use vam_protocol::{
     DeploymentPlan, DeploymentProgress, DeploymentStatus, DeploymentSummary, HostKeyInfo,
 };
@@ -275,20 +278,25 @@ impl Storage {
     }
 
     pub async fn save_instance(&self, instance: &VpnInstance) -> Result<(), StorageError> {
+        let mut transaction = self.pool.begin().await?;
         sqlx::query(
             "INSERT INTO vpn_instances
              (id, host_id, display_name, backend, endpoint_port, ipv4_subnet, dns_zone,
-              model_json, created_at, updated_at, deleted_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name,
+              model_json, created_at, updated_at, deleted_at, instance_schema_version,
+              backend_settings_json)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET host_id=excluded.host_id,
+              display_name=excluded.display_name, backend=excluded.backend,
               endpoint_port=excluded.endpoint_port, ipv4_subnet=excluded.ipv4_subnet,
               dns_zone=excluded.dns_zone, model_json=excluded.model_json,
-              updated_at=excluded.updated_at, deleted_at=excluded.deleted_at",
+              updated_at=excluded.updated_at, deleted_at=excluded.deleted_at,
+              instance_schema_version=excluded.instance_schema_version,
+              backend_settings_json=excluded.backend_settings_json",
         )
         .bind(instance.id.to_string())
         .bind(instance.host_id.to_string())
         .bind(&instance.display_name)
-        .bind("wireguard")
+        .bind(instance.backend.as_str())
         .bind(i64::from(instance.endpoint.port))
         .bind(instance.network.ipv4_subnet.to_string())
         .bind(&instance.dns.zone)
@@ -296,8 +304,29 @@ impl Storage {
         .bind(instance.created_at.to_rfc3339())
         .bind(instance.updated_at.to_rfc3339())
         .bind(instance.deleted_at.map(|value| value.to_rfc3339()))
-        .execute(&self.pool)
+        .bind(i64::from(CURRENT_INSTANCE_SCHEMA_VERSION))
+        .bind(serde_json::to_string(&instance.backend_settings)?)
+        .execute(&mut *transaction)
         .await?;
+        sqlx::query("DELETE FROM instance_listeners WHERE instance_id = ?")
+            .bind(instance.id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        for listener in instance.listeners() {
+            sqlx::query(
+                "INSERT INTO instance_listeners
+                 (instance_id, host_id, port, transport, active)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(instance.id.to_string())
+            .bind(instance.host_id.to_string())
+            .bind(i64::from(listener.port))
+            .bind(listener.protocol.as_str())
+            .bind(instance.deleted_at.is_none())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
         Ok(())
     }
 
@@ -405,22 +434,30 @@ impl Storage {
         sqlx::query(
             "INSERT INTO devices
              (id, instance_id, user_id, display_name, ipv4_address, enabled,
-              model_json, created_at, deleted_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              model_json, created_at, deleted_at, identity_schema_version, backend)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                user_id=excluded.user_id, display_name=excluded.display_name,
                ipv4_address=excluded.ipv4_address, enabled=excluded.enabled,
-               model_json=excluded.model_json, deleted_at=excluded.deleted_at",
+               model_json=excluded.model_json, deleted_at=excluded.deleted_at,
+               identity_schema_version=excluded.identity_schema_version,
+               backend=excluded.backend",
         )
         .bind(device.id.to_string())
         .bind(device.instance_id.to_string())
         .bind(device.user_id.map(|id| id.to_string()))
         .bind(&device.display_name)
-        .bind(device.ipv4_address.to_string())
+        .bind(
+            device
+                .ipv4_address
+                .map_or_else(String::new, |address| address.to_string()),
+        )
         .bind(device.enabled)
         .bind(serde_json::to_string(device)?)
         .bind(device.created_at.to_rfc3339())
         .bind(device.deleted_at.map(|value| value.to_rfc3339()))
+        .bind(i64::from(CURRENT_DEVICE_SCHEMA_VERSION))
+        .bind(device.backend_data.kind().as_str())
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -449,22 +486,30 @@ impl Storage {
         sqlx::query(
             "INSERT INTO devices
              (id, instance_id, user_id, display_name, ipv4_address, enabled,
-              model_json, created_at, deleted_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+              model_json, created_at, deleted_at, identity_schema_version, backend)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                user_id=excluded.user_id, display_name=excluded.display_name,
                ipv4_address=excluded.ipv4_address, enabled=excluded.enabled,
-               model_json=excluded.model_json, deleted_at=excluded.deleted_at",
+               model_json=excluded.model_json, deleted_at=excluded.deleted_at,
+               identity_schema_version=excluded.identity_schema_version,
+               backend=excluded.backend",
         )
         .bind(device.id.to_string())
         .bind(device.instance_id.to_string())
         .bind(device.user_id.map(|id| id.to_string()))
         .bind(&device.display_name)
-        .bind(device.ipv4_address.to_string())
+        .bind(
+            device
+                .ipv4_address
+                .map_or_else(String::new, |address| address.to_string()),
+        )
         .bind(device.enabled)
         .bind(serde_json::to_string(device)?)
         .bind(device.created_at.to_rfc3339())
         .bind(device.deleted_at.map(|value| value.to_rfc3339()))
+        .bind(i64::from(CURRENT_DEVICE_SCHEMA_VERSION))
+        .bind(device.backend_data.kind().as_str())
         .execute(&mut *transaction)
         .await?;
         for record in managed_records {
@@ -759,19 +804,42 @@ impl Storage {
     pub async fn replace_desired_state(&self, state: &DesiredState) -> Result<(), StorageError> {
         let mut transaction = self.pool.begin().await?;
         sqlx::query(
-            "UPDATE vpn_instances SET display_name=?, endpoint_port=?, ipv4_subnet=?,
-             dns_zone=?, model_json=?, updated_at=?, deleted_at=? WHERE id=?",
+            "UPDATE vpn_instances SET host_id=?, display_name=?, backend=?,
+             endpoint_port=?, ipv4_subnet=?, dns_zone=?, model_json=?, updated_at=?,
+             deleted_at=?, instance_schema_version=?, backend_settings_json=? WHERE id=?",
         )
+        .bind(state.instance.host_id.to_string())
         .bind(&state.instance.display_name)
+        .bind(state.instance.backend.as_str())
         .bind(i64::from(state.instance.endpoint.port))
         .bind(state.instance.network.ipv4_subnet.to_string())
         .bind(&state.instance.dns.zone)
         .bind(serde_json::to_string(&state.instance)?)
         .bind(state.instance.updated_at.to_rfc3339())
         .bind(state.instance.deleted_at.map(|value| value.to_rfc3339()))
+        .bind(i64::from(CURRENT_INSTANCE_SCHEMA_VERSION))
+        .bind(serde_json::to_string(&state.instance.backend_settings)?)
         .bind(state.instance.id.to_string())
         .execute(&mut *transaction)
         .await?;
+        sqlx::query("DELETE FROM instance_listeners WHERE instance_id=?")
+            .bind(state.instance.id.to_string())
+            .execute(&mut *transaction)
+            .await?;
+        for listener in state.instance.listeners() {
+            sqlx::query(
+                "INSERT INTO instance_listeners
+                 (instance_id, host_id, port, transport, active)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(state.instance.id.to_string())
+            .bind(state.instance.host_id.to_string())
+            .bind(i64::from(listener.port))
+            .bind(listener.protocol.as_str())
+            .bind(state.instance.deleted_at.is_none())
+            .execute(&mut *transaction)
+            .await?;
+        }
         for user in &state.users {
             sqlx::query(
                 "INSERT INTO users (id, display_name, model_json, created_at)
@@ -798,22 +866,30 @@ impl Storage {
             sqlx::query(
                 "INSERT INTO devices
                  (id, instance_id, user_id, display_name, ipv4_address, enabled,
-                  model_json, created_at, deleted_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  model_json, created_at, deleted_at, identity_schema_version, backend)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(id) DO UPDATE SET
                    user_id=excluded.user_id, display_name=excluded.display_name,
                    ipv4_address=excluded.ipv4_address, enabled=excluded.enabled,
-                   model_json=excluded.model_json, deleted_at=excluded.deleted_at",
+                   model_json=excluded.model_json, deleted_at=excluded.deleted_at,
+                   identity_schema_version=excluded.identity_schema_version,
+                   backend=excluded.backend",
             )
             .bind(device.id.to_string())
             .bind(device.instance_id.to_string())
             .bind(device.user_id.map(|id| id.to_string()))
             .bind(&device.display_name)
-            .bind(device.ipv4_address.to_string())
+            .bind(
+                device
+                    .ipv4_address
+                    .map_or_else(String::new, |address| address.to_string()),
+            )
             .bind(device.enabled)
             .bind(serde_json::to_string(device)?)
             .bind(device.created_at.to_rfc3339())
             .bind(device.deleted_at.map(|value| value.to_rfc3339()))
+            .bind(i64::from(CURRENT_DEVICE_SCHEMA_VERSION))
+            .bind(device.backend_data.kind().as_str())
             .execute(&mut *transaction)
             .await?;
         }
@@ -940,9 +1016,13 @@ impl Storage {
         for row in snapshots {
             let state: DesiredState = serde_json::from_str(row.get("desired_state_json"))?;
             for device in state.devices {
-                let DeviceBackendData::WireGuard(data) = device.backend_data;
-                retained.insert(data.private_key_ref.0);
-                retained.extend(data.preshared_key_ref.map(|reference| reference.0));
+                retained.extend(
+                    device
+                        .backend_data
+                        .secret_references()
+                        .into_iter()
+                        .map(|reference| reference.0),
+                );
             }
         }
         Ok(candidates
@@ -1027,9 +1107,9 @@ mod tests {
     use chrono::Utc;
     use std::path::PathBuf;
     use vam_core::{
-        DEFAULT_KEEPALIVE, DeviceBackendData, DnsConfig, DnsRecordType, EndpointConfig,
-        NetworkConfig, RoutingMode, SecretReference, SshConnectionConfig, VpnBackendKind,
-        WireGuardDeviceData,
+        BackendSettings, DEFAULT_KEEPALIVE, DeviceBackendData, DnsConfig, DnsRecordType,
+        EndpointConfig, NetworkConfig, RoutingMode, SecretReference, SshConnectionConfig,
+        VpnBackendKind, WireGuardDeviceData, XraySettings,
     };
     use vam_protocol::DeploymentPlan;
 
@@ -1079,6 +1159,7 @@ mod tests {
             host_id,
             display_name: format!("instance-{id}"),
             backend: VpnBackendKind::WireGuard,
+            backend_settings: BackendSettings::default(),
             endpoint: EndpointConfig {
                 host: "vpn.example.test".into(),
                 port,
@@ -1132,6 +1213,111 @@ mod tests {
                 .await,
             Err(StorageError::Database(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn database_allows_tcp_and_udp_on_the_same_numeric_port() {
+        let storage = Storage::in_memory().await.unwrap();
+        let host = host();
+        storage.save_host(&host).await.unwrap();
+        storage
+            .save_instance(&instance(host.id, Uuid::new_v4(), 443))
+            .await
+            .unwrap();
+        let mut xray = instance(host.id, Uuid::new_v4(), 443);
+        xray.network.ipv4_subnet = "10.65.0.0/24".parse().unwrap();
+        xray.network.gateway_ipv4 = "10.65.0.1".parse().unwrap();
+        xray.backend = VpnBackendKind::Xray;
+        xray.backend_settings = BackendSettings::Xray(XraySettings::default());
+
+        storage.save_instance(&xray).await.unwrap();
+
+        let listeners: Vec<(i64, String)> = sqlx::query_as(
+            "SELECT port, transport FROM instance_listeners
+             WHERE host_id=? AND active=1 ORDER BY transport",
+        )
+        .bind(host.id.to_string())
+        .fetch_all(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(listeners, vec![(443, "tcp".into()), (443, "udp".into())]);
+    }
+
+    #[tokio::test]
+    async fn legacy_schema_migration_backfills_wireguard_without_data_loss() {
+        let options = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(options)
+            .await
+            .unwrap();
+        sqlx::raw_sql(include_str!("../migrations/0001_initial.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let host = host();
+        sqlx::query(
+            "INSERT INTO docker_hosts
+             (id, display_name, hostname, ssh_port, username, private_key_path,
+              passphrase_secret_ref, model_json, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(host.id.to_string())
+        .bind(&host.display_name)
+        .bind(&host.ssh.hostname)
+        .bind(i64::from(host.ssh.port))
+        .bind(&host.ssh.username)
+        .bind(host.ssh.private_key_path.to_string_lossy())
+        .bind(Option::<String>::None)
+        .bind(serde_json::to_string(&host).unwrap())
+        .bind(host.created_at.to_rfc3339())
+        .bind(host.updated_at.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let legacy = instance(host.id, Uuid::new_v4(), 51_820);
+        let mut legacy_json = serde_json::to_value(&legacy).unwrap();
+        let object = legacy_json.as_object_mut().unwrap();
+        object.remove("backend_settings");
+        object.insert("backend".into(), serde_json::json!("wire_guard"));
+        sqlx::query(
+            "INSERT INTO vpn_instances
+             (id, host_id, display_name, backend, endpoint_port, ipv4_subnet,
+              dns_zone, model_json, created_at, updated_at, deleted_at)
+             VALUES (?, ?, ?, 'wireguard', ?, ?, ?, ?, ?, ?, NULL)",
+        )
+        .bind(legacy.id.to_string())
+        .bind(legacy.host_id.to_string())
+        .bind(&legacy.display_name)
+        .bind(i64::from(legacy.endpoint.port))
+        .bind(legacy.network.ipv4_subnet.to_string())
+        .bind(&legacy.dns.zone)
+        .bind(serde_json::to_string(&legacy_json).unwrap())
+        .bind(legacy.created_at.to_rfc3339())
+        .bind(legacy.updated_at.to_rfc3339())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::raw_sql(include_str!("../migrations/0002_multi_protocol_model.sql"))
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let storage = Storage { pool };
+        let restored = storage.get_instance(legacy.id).await.unwrap();
+        assert_eq!(restored.backend, VpnBackendKind::WireGuard);
+        assert_eq!(restored.backend_settings, BackendSettings::default());
+        let listener: (i64, String, bool) = sqlx::query_as(
+            "SELECT port, transport, active FROM instance_listeners WHERE instance_id=?",
+        )
+        .bind(legacy.id.to_string())
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(listener, (51_820, "udp".into(), true));
     }
 
     #[tokio::test]
@@ -1189,7 +1375,7 @@ mod tests {
             instance_id: instance.id,
             user_id: None,
             display_name: "peer".into(),
-            ipv4_address: "10.64.0.2".parse().unwrap(),
+            ipv4_address: Some("10.64.0.2".parse().unwrap()),
             ipv6_address: None,
             dns_name: Some("peer.vpn.internal".into()),
             enabled: true,
@@ -1212,7 +1398,10 @@ mod tests {
                 instance_id: instance.id,
                 name: "peer".into(),
                 record_type: DnsRecordType::A,
-                value: device.ipv4_address.to_string(),
+                value: device
+                    .ipv4_address
+                    .expect("WireGuard test device has an address")
+                    .to_string(),
                 ttl: 300,
                 enabled: true,
                 managed_by_device_id: Some(device.id),
@@ -1298,7 +1487,7 @@ mod tests {
             instance_id: instance.id,
             user_id: Some(user.id),
             display_name: "peer".into(),
-            ipv4_address: "10.64.0.2".parse().unwrap(),
+            ipv4_address: Some("10.64.0.2".parse().unwrap()),
             ipv6_address: None,
             dns_name: None,
             enabled: true,
@@ -1331,7 +1520,7 @@ mod tests {
             instance_id: instance.id,
             user_id: None,
             display_name: "peer".into(),
-            ipv4_address: "10.64.0.2".parse().unwrap(),
+            ipv4_address: Some("10.64.0.2".parse().unwrap()),
             ipv6_address: None,
             dns_name: None,
             enabled: true,

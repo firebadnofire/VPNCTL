@@ -358,8 +358,8 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use vam_core::{
-        DEFAULT_KEEPALIVE, Device, DnsConfig, EndpointConfig, NetworkConfig, RoutingMode,
-        VpnBackendKind, VpnInstance,
+        BackendSettings, DEFAULT_KEEPALIVE, Device, DnsConfig, EndpointConfig, NetworkConfig,
+        RoutingMode, VpnBackendKind, VpnInstance,
     };
 
     fn state() -> DesiredState {
@@ -370,6 +370,7 @@ mod tests {
                 host_id: Uuid::from_u128(1),
                 display_name: "Test VPN".into(),
                 backend: VpnBackendKind::WireGuard,
+                backend_settings: BackendSettings::default(),
                 endpoint: EndpointConfig {
                     host: "vpn.example.test".into(),
                     port: 51_820,
