@@ -30,6 +30,7 @@
     ClientActionView,
     DeploymentPreview,
     DeploymentResultView,
+    DeleteInstanceResult,
     DnsHostlist,
     DnsRecord,
     DnsRecordType,
@@ -761,17 +762,19 @@
 
   async function removeInstance(instance: VpnInstance) {
     const accepted = await confirm(
-      `Back up, stop, and move "${instance.display_name}" to recoverable remote trash?`,
+      `Delete "${instance.display_name}"? Undeployed instances are removed locally. If a successful remote deployment exists, it will be stopped and moved to recoverable remote trash.`,
       { title: "Delete VPN instance", kind: "warning" },
     );
     if (!accepted) return;
     const result = await task("Deleting instance", () =>
-      call<void>("delete_instance", { instanceId: instance.id }),
+      call<DeleteInstanceResult>("delete_instance", { instanceId: instance.id }),
     );
-    if (result === undefined && error) return;
+    if (!result) return;
     selectedInstanceId = "";
     await refresh();
-    notice = "Instance moved to remote trash and soft-deleted locally.";
+    notice = result.remote_content_moved
+      ? "Remote deployment stopped and moved to recoverable trash; the local instance was deleted."
+      : "Undeployed local instance deleted. No remote server existed to stop or move.";
   }
 
   function openDevice() {

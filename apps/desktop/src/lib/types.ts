@@ -491,6 +491,10 @@ export interface DeploymentResultView {
   health: InstanceHealthView;
 }
 
+export interface DeleteInstanceResult {
+  remote_content_moved: boolean;
+}
+
 export interface BackupInfo {
   name: string;
   created_at: string;

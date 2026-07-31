@@ -4,12 +4,15 @@ import { backendOptions, client, summary } from "./test/fixtures";
 import App from "./App.svelte";
 
 const invoke = vi.hoisted(() => vi.fn());
+const confirm = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), save: vi.fn(), confirm: vi.fn() }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), save: vi.fn(), confirm }));
 
 describe("desktop application workflows", () => {
   beforeEach(() => {
     invoke.mockReset();
+    confirm.mockReset();
+    confirm.mockResolvedValue(true);
     invoke.mockImplementation(async (command: string) => {
       switch (command) {
         case "app_info": return { name: "VPN Appliance Manager", version: "0.1.0", status: "ready", system_username: "tester" };
@@ -110,5 +113,25 @@ describe("desktop application workflows", () => {
     expect(alert.closest('[role="dialog"]')).toBeTruthy();
     await waitFor(() => expect(document.activeElement).toBe(alert));
     expect(screen.getAllByRole("alert")).toHaveLength(1);
+  });
+
+  it("deletes an undeployed instance locally and explains that no remote server existed", async () => {
+    const startup = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "delete_instance") return { remote_content_moved: false };
+      return startup(command, args);
+    });
+    render(App);
+    await waitFor(() => expect(screen.getByText("Lab host")).toBeTruthy());
+    await fireEvent.click(screen.getByRole("button", { name: "Instances" }));
+    await fireEvent.click(screen.getByLabelText("More actions for Xray VLESS appliance"));
+    await fireEvent.click(screen.getByRole("menuitem", { name: "Delete instance" }));
+
+    expect(confirm).toHaveBeenCalledWith(
+      expect.stringContaining("Undeployed instances are removed locally"),
+      expect.objectContaining({ title: "Delete VPN instance" }),
+    );
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("delete_instance", { instanceId: "instance-xray" }));
+    expect(await screen.findByText("Undeployed local instance deleted. No remote server existed to stop or move.")).toBeTruthy();
   });
 });

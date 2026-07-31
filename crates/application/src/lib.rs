@@ -611,6 +611,11 @@ pub struct DeploymentResultView {
     pub health: InstanceHealthView,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeleteInstanceResult {
+    pub remote_content_moved: bool,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendReadinessStatus {
@@ -3924,12 +3929,32 @@ fi
         Ok(result)
     }
 
-    pub async fn delete_instance(&self, instance_id: Uuid) -> Result<(), AppError> {
+    pub async fn delete_instance(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<DeleteInstanceResult, AppError> {
+        let lock = self.instance_lock(instance_id).await;
+        let _guard = lock.lock().await;
         let instance = self
             .storage
             .get_instance(instance_id)
             .await
             .map_err(storage_error)?;
+        let was_deployed = self
+            .storage
+            .last_successful_deployment(instance_id)
+            .await
+            .map_err(storage_error)?
+            .is_some();
+        if !was_deployed {
+            self.storage
+                .soft_delete_instance(instance_id, Utc::now())
+                .await
+                .map_err(storage_error)?;
+            return Ok(DeleteInstanceResult {
+                remote_content_moved: false,
+            });
+        }
         let (host, trusted, passphrase) = self.trusted_host(instance.host_id).await?;
         let trash = format!(
             "{APP_ROOT}/trash/{}-{}",
@@ -3937,7 +3962,7 @@ fi
             Utc::now().format("%Y%m%dT%H%M%SZ")
         );
         let command = format!(
-            "set -eu; cd {current}; docker compose stop; install -d {trash_parent}; mv {current} {trash}",
+            "set -eu; if test -d {current}; then cd {current}; docker compose stop; cd /; install -d {trash_parent}; mv {current} {trash}; printf 'remote_content_moved=1\\n'; else printf 'remote_content_moved=0\\n'; fi",
             current = shell_quote(&instance.remote_path()),
             trash_parent = shell_quote(&format!("{APP_ROOT}/trash")),
             trash = shell_quote(&trash),
@@ -3951,18 +3976,24 @@ fi
             &cancellation,
         )
         .await?;
-        self.checked_execute(
-            &host,
-            &trusted,
-            passphrase.as_ref(),
-            &command,
-            &cancellation,
-        )
-        .await?;
+        let result = self
+            .checked_execute(
+                &host,
+                &trusted,
+                passphrase.as_ref(),
+                &command,
+                &cancellation,
+            )
+            .await?;
         self.storage
             .soft_delete_instance(instance_id, Utc::now())
             .await
-            .map_err(storage_error)
+            .map_err(storage_error)?;
+        Ok(DeleteInstanceResult {
+            remote_content_moved: String::from_utf8_lossy(&result.stdout)
+                .lines()
+                .any(|line| line == "remote_content_moved=1"),
+        })
     }
 
     pub async fn client_configuration(&self, device_id: Uuid) -> Result<ClientArtifact, AppError> {
@@ -6662,10 +6693,10 @@ fn validation_command(stage: &str, runtime: &BackendRuntimeSpec, managed_dns: bo
                 .iter()
                 .find(|mount| config_path.starts_with(mount.host_path))
                 .expect("backend validation path must be under a declared mount");
-            let mount_value = format!("{stage}/{}:{}:ro", mount.host_path, mount.container_path);
+            let mount_value = format!("{stage}/{}:{}", mount.host_path, mount.container_path);
             write!(
                 command,
-                "; docker run --rm --entrypoint openvpn -v {} {} --config {} --test-crypto",
+                "; openvpn_probe=\"$(docker run -d --cap-add NET_ADMIN --device /dev/net/tun --entrypoint openvpn -v {} {} --config {} --verb 3)\"; cleanup_openvpn_probe() {{ docker rm -f \"$openvpn_probe\" >/dev/null 2>&1 || true; }}; trap cleanup_openvpn_probe EXIT INT TERM HUP; sleep 2; openvpn_running=\"$(docker inspect --format '{{{{.State.Running}}}}' \"$openvpn_probe\" 2>/dev/null || printf false)\"; if test \"$openvpn_running\" != true; then docker logs \"$openvpn_probe\" >&2 || true; exit 1; fi; cleanup_openvpn_probe; trap - EXIT INT TERM HUP",
                 shell_quote(&mount_value),
                 image,
                 shell_quote(&container_config)
@@ -9000,6 +9031,28 @@ mod tests {
         assert!(validation.contains("docker compose --env-file .env config --quiet"));
     }
 
+    #[test]
+    fn openvpn_validation_starts_an_isolated_server_probe_and_always_removes_it() {
+        let state = command_state(VpnBackendKind::OpenVpn);
+        let runtime = OpenVpnBackend
+            .runtime(&state.instance.backend_settings)
+            .unwrap();
+
+        let validation = validation_command("/safe/stage", &runtime, true);
+
+        assert!(validation.contains("docker run -d"));
+        assert!(validation.contains("--cap-add NET_ADMIN"));
+        assert!(validation.contains("--device /dev/net/tun"));
+        assert!(validation.contains("'/safe/stage/vpn:/etc/openvpn'"));
+        assert!(validation.contains("--config '/etc/openvpn/server.conf'"));
+        assert!(validation.contains("docker inspect --format '{{.State.Running}}'"));
+        assert!(validation.contains("docker logs \"$openvpn_probe\""));
+        assert!(validation.contains("docker rm -f \"$openvpn_probe\""));
+        assert!(validation.contains("trap cleanup_openvpn_probe EXIT INT TERM HUP"));
+        assert!(!validation.contains("--test-crypto"));
+        assert!(!validation.contains("/safe/stage/vpn:/etc/openvpn:ro"));
+    }
+
     #[tokio::test]
     async fn service_round_trips_local_models() {
         let storage = Storage::in_memory().await.unwrap();
@@ -10070,6 +10123,117 @@ mod tests {
             service.inspect_host(host.id).await.unwrap_err().code,
             "host_key_changed"
         );
+    }
+
+    #[tokio::test]
+    async fn undeployed_instance_deletion_is_local_and_requires_no_ssh() {
+        let storage = Storage::in_memory().await.unwrap();
+        let fake = fake_transport();
+        let service = ApplicationService::with_transport(
+            storage,
+            Arc::new(MemorySecretStore::default()),
+            fake.clone(),
+        );
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "lab".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let instance = service
+            .create_instance(CreateInstanceInput {
+                host_id: host.id,
+                display_name: "local only".into(),
+                endpoint_host: "vpn.example.test".into(),
+                backend: VpnBackendKind::OpenVpn,
+                backend_settings: None,
+                endpoint_port: Some(1_194),
+                ipv4_subnet: "10.66.0.0/24".into(),
+                dns_zone: DEFAULT_DNS_ZONE.into(),
+                routing_mode: None,
+                xray_tls_import: None,
+            })
+            .await
+            .unwrap();
+
+        let result = service.delete_instance(instance.id).await.unwrap();
+
+        assert!(!result.remote_content_moved);
+        assert!(service.list_instances(None).await.unwrap().is_empty());
+        assert!(fake.commands.lock().expect("test command lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn deployed_instance_deletion_tolerates_an_absent_remote_directory() {
+        let storage = Storage::in_memory().await.unwrap();
+        let fake = fake_transport();
+        let service = ApplicationService::with_transport(
+            storage.clone(),
+            Arc::new(MemorySecretStore::default()),
+            fake.clone(),
+        );
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "lab".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let probe = service.probe_host_key(host.id).await.unwrap();
+        service
+            .approve_host_key(host.id, probe.key, "SHA256:first", false)
+            .await
+            .unwrap();
+        let instance = service
+            .create_instance(CreateInstanceInput {
+                host_id: host.id,
+                display_name: "missing remote".into(),
+                endpoint_host: "vpn.example.test".into(),
+                backend: VpnBackendKind::Xray,
+                backend_settings: None,
+                endpoint_port: Some(8_443),
+                ipv4_subnet: DEFAULT_SUBNET.into(),
+                dns_zone: DEFAULT_DNS_ZONE.into(),
+                routing_mode: None,
+                xray_tls_import: None,
+            })
+            .await
+            .unwrap();
+        let state = service.desired_state(instance.id).await.unwrap();
+        let plan = DeploymentPlan {
+            id: Uuid::new_v4(),
+            instance_id: instance.id,
+            operations: Vec::new(),
+            warnings: Vec::new(),
+            desired_state_hash: "deployed".into(),
+        };
+        storage
+            .record_deployment(&plan, &state, DeploymentStatus::Succeeded)
+            .await
+            .unwrap();
+        fake.responses.lock().expect("test response lock").extend([
+            queued_result("", "", 0),
+            queued_result("remote_content_moved=0\n", "", 0),
+        ]);
+
+        let result = service.delete_instance(instance.id).await.unwrap();
+
+        assert!(!result.remote_content_moved);
+        assert!(service.list_instances(None).await.unwrap().is_empty());
+        let commands = fake.commands.lock().expect("test command lock");
+        assert_eq!(commands.len(), 2);
+        assert!(commands[1].contains("if test -d"));
+        assert!(commands[1].contains("remote_content_moved=0"));
+        assert!(!commands[1].contains("set -eu; cd"));
     }
 
     #[tokio::test]

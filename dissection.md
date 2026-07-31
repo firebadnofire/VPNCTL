@@ -5353,3 +5353,138 @@ Previous signed commit: `cff0e8e fix: show creation errors in active dialog`
 (good EDDSA signature).
 
 Planned signed commit: `fix: allow longer OpenVPN certificate lifetimes`.
+
+### 12M. Live OpenVPN deployment validation correction (2026-07-31)
+
+The desktop's two failed OpenVPN deployments reached the remote validation
+phase after SSH trust verification, upload, pinned image preparation, and
+certificate-authority initialization. Both recorded the same OpenVPN 2.6.20
+error: `Options error: You must define key file (--secret)`. The backend was
+correctly configured for certificate-based TLS with `tls-crypt`; the failure
+came from invoking OpenVPN's unrelated static-key `--test-crypto` mode against
+the complete server configuration.
+
+The supplied Linode development VM was probed through the application's real
+`russh` transport using `key.ppk`. Its ED25519 host key exactly matched the
+approved `SHA256:npTb+VUM22DNWCFWU/7USfv3bjQf7MKQFnBXUAjl8po` identity, and the
+inspection reported Linux x86_64, Docker 29.6.2, Compose 5.3.1, accessible TUN,
+kernel WireGuard support, manageable UFW, and writable application storage.
+The separate Windows OpenSSH path also authenticated as `william` using an
+ACL-restricted temporary copy of `key.pem`; the original key was not modified,
+and the temporary copy was removed after the check.
+
+Adding `--secret /etc/openvpn/tls-crypt.key` was tested and deliberately
+rejected because OpenVPN reports that `--server` and static-key `--secret`
+cannot be combined. A bounded isolated startup probe was then run against the
+failed deployment's staged tree. It mounted only that OpenVPN tree, used the
+same `NET_ADMIN` and `/dev/net/tun` privileges required by production, exposed
+no host port, reached `Initialization Sequence Completed`, and was forcibly
+removed by its cleanup trap.
+
+`validation_command` now generates that startup probe instead of
+`--test-crypto`: it starts an unexposed detached container, waits two seconds,
+checks the authoritative Docker running state, emits container logs on early
+exit, and removes the container on every success, failure, signal, or shell
+exit path. The staged OpenVPN mount is writable during the probe because the
+real server initializes its persistent pool state there; the directory is
+deployment staging and is validated before activation.
+
+A command-contract regression test requires the TUN device, `NET_ADMIN`,
+detached lifecycle, running-state inspection, failure logs, cleanup trap, and
+writable staged mount, and forbids `--test-crypto` and the former read-only
+mount.
+
+Validation so far:
+
+- live PPK/russh fingerprint, authentication, and readiness inspection passed;
+- live PEM/OpenSSH strict-host-key authentication passed;
+- the original `--test-crypto` failure was reproduced from saved deployment
+  events;
+- the `--secret` alternative was proven invalid and discarded;
+- the isolated live startup probe passed and cleaned up its container;
+- `cargo fmt --all -- --check` passed;
+- `git diff --check` passed.
+
+The first local rebuild was blocked when C: had only about 0.21 GiB free. The
+generated `target/debug/incremental` cache was measured at 12.17 GiB, but it was
+not deleted because explicit approval had not been provided. Available space
+later rose independently to 5.56 GiB. Single-job focused builds then passed
+without deleting any cache or modifying the machine.
+
+Completed local validation:
+
+- the focused OpenVPN validation-command regression passed 1/1;
+- both instance-deletion regressions passed 2/2;
+- the complete application crate passed 40/40 tests;
+- strict Clippy passed for `vam-application` and the Tauri application with all
+  targets and `-D warnings`;
+- the full frontend suite passed 28/28 tests across four files;
+- Svelte check passed with 0 errors and 0 warnings;
+- the Vite production build passed (134 modules, 135.84 kB JavaScript and 22.91
+  kB CSS before gzip);
+- `cargo fmt --all -- --check` and `git diff --check` passed.
+
+Previous signed commit:
+`94066c6 fix: allow longer OpenVPN certificate lifetimes` (good EDDSA
+signature).
+
+Planned signed commit: `fix: validate OpenVPN deployments with a startup probe`.
+
+### 12N. Local-only deletion for undeployed instances (2026-07-31)
+
+Instance deletion previously assumed every local instance had an activated
+remote directory. It removed firewall rules and ran `cd <remote-path>; docker
+compose stop` before changing local state. A locally created OpenVPN instance
+whose deployments failed during validation therefore produced `no such file or
+directory` and remained visible locally.
+
+Deletion is now serialized with the same per-instance lock used by deployment
+operations and consults successful deployment history before making any remote
+connection. With no successful deployment, it soft-deletes the local instance
+immediately. This path works without SSH trust or host connectivity and cannot
+alter firewall or Docker state.
+
+For a previously successful deployment, remote teardown remains required, but
+the fixed command is idempotent when the managed directory has already been
+removed outside the application. It conditionally stops Compose and moves an
+existing tree to timestamped recoverable trash, or reports that no remote tree
+was present. Rust returns this typed outcome to Tauri and Svelte.
+
+The confirmation now states both possible consequences instead of claiming
+that every instance will be backed up remotely. The success notice likewise
+distinguishes a stopped/trashed deployment from a local-only undeployed
+definition.
+
+Files changed:
+
+- `crates/application/src/lib.rs`: typed deletion result, deployment-aware local
+  fast path, per-instance locking, idempotent remote command, and two regression
+  tests;
+- `apps/desktop/src-tauri/src/lib.rs`: typed command result across the Tauri
+  boundary;
+- `apps/desktop/src/lib/types.ts`: serialized deletion outcome;
+- `apps/desktop/src/App.svelte`: accurate confirmation and result-specific
+  notices;
+- `apps/desktop/src/App.integration.test.ts`: local-only deletion message and
+  invocation coverage.
+
+Validation so far:
+
+- `cargo fmt --all -- --check` passed;
+- focused desktop integration suite passed 4/4 tests after correcting the
+  jsdom query for the labelled `<summary>` overflow trigger;
+- Svelte check passed with 0 errors and 0 warnings.
+
+The root pnpm wrapper again stopped before tests with
+`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`; direct npm scripts used the
+already-installed dependencies and passed. The first frontend test run found
+only that jsdom exposes the labelled `<summary>` overflow trigger as a group,
+not a button; the query was corrected to use the stable `aria-label` and the
+suite passed.
+
+This deletion fix is committed with the OpenVPN deployment probe as one
+remote-lifecycle reliability unit because both correct assumptions about remote
+state before mutating local desired state.
+
+Planned signed commit:
+`fix: harden OpenVPN validation and undeployed deletion`.

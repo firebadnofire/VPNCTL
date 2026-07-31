@@ -5,9 +5,10 @@ use uuid::Uuid;
 use vam_application::{
     ActivityFilter, ApplicationService, BackendOptionView, BackupRestorePreview, BackupView,
     ClientView, CreateDeviceInput, CreateDnsHostlistInput, CreateDnsRecordInput, CreateHostInput,
-    CreateInstanceInput, DeploymentPreviewView, DeploymentResultView, DeviceView, DnsHostlist,
-    HostInspectionView, InstanceDetailView, InstanceHealthView, InstanceSummaryView,
-    InstanceUpdatePreview, InstanceView, LogEventView, UpdateDeviceInput, UpdateInstanceInput,
+    CreateInstanceInput, DeleteInstanceResult, DeploymentPreviewView, DeploymentResultView,
+    DeviceView, DnsHostlist, HostInspectionView, InstanceDetailView, InstanceHealthView,
+    InstanceSummaryView, InstanceUpdatePreview, InstanceView, LogEventView, UpdateDeviceInput,
+    UpdateInstanceInput,
 };
 use vam_core::{DnsRecord, DockerHost, User};
 use vam_protocol::{
@@ -277,7 +278,10 @@ async fn update_images(
 }
 
 #[tauri::command]
-async fn delete_instance(state: State<'_, AppState>, instance_id: Uuid) -> Result<(), AppError> {
+async fn delete_instance(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+) -> Result<DeleteInstanceResult, AppError> {
     state.0.delete_instance(instance_id).await
 }
 
