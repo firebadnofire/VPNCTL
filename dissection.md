@@ -2451,3 +2451,107 @@ Runtime claims intentionally deferred until that fixture:
 - custom listener publishing;
 - UUID removal/replacement;
 - REALITY identity survival across restart/image update/rollback.
+
+Commit:
+
+- `6009e4d docs: plan secure Xray backend`;
+- created with `git commit -S`;
+- `git verify-commit HEAD` reported a good EDDSA signature from William Jones
+  using key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### Unit 5a: Xray identity metadata, listeners, and server-secret retention
+
+Status: complete. This unit extends the persisted model and secret-retention
+boundary without rendering or running Xray.
+
+#### Backward-compatible Xray settings
+
+Added four optional, `#[serde(default)]` fields to `XraySettings`:
+
+- `reality_public_key`;
+- `reality_short_id`;
+- `tls_certificate_ref`;
+- `tls_private_key_ref`.
+
+The first two are non-secret client-verification metadata that will be mirrored
+only after the later verified-SSH discovery step. The second two are opaque
+native-secret-store references. The model contains no REALITY private-key
+field.
+
+Existing Xray JSON containing only security, transport, server name,
+fingerprint, and XHTTP path still deserializes with all four fields set to
+`None`. `XraySettings::default()` also leaves them absent so creating a
+REALITY instance does not fabricate remote public material.
+
+Added `BackendSettings::secret_references()`. It returns Xray's present TLS
+certificate/private-key references and an empty set for every backend that
+currently keeps server material remote-only or manages secrets per device.
+The return values borrow opaque IDs; no secret contents enter core or storage.
+
+#### Transport-aware listener reservation
+
+`VpnInstance::listeners()` now maps:
+
+- Xray raw TCP to TCP;
+- Xray XHTTP to TCP;
+- Xray mKCP to UDP.
+
+The backend-specific listener method will use the same mapping in Unit 5b.
+This fixes both preview/firewall input and SQLite uniqueness before the backend
+can be selected operationally. A core test proves a TLS+mKCP instance declares
+UDP. A storage test proves it conflicts with an existing WireGuard UDP listener
+on the same host/port, while the existing TCP-Xray/UDP-WireGuard sharing test
+still passes.
+
+#### Instance-owned secret lifecycle
+
+The pre-refactor secret-reference table supports arbitrary owners, but cleanup
+and retained-snapshot discovery considered only device owners. TLS server keys
+belong to an instance, not a fabricated device. Storage now treats a candidate
+as instance-scoped when its owner is either:
+
+- the instance UUID itself; or
+- a device UUID belonging to the instance.
+
+When scanning retained deployment snapshots, it collects both the instance
+backend settings' server references and every device backend's references.
+This preserves Xray TLS certificate/key secrets for as long as either remains
+in the retained desired-state window.
+
+Soft-deleted host cleanup now deletes secret references owned directly by any
+of the host's instances in addition to device-owned references. The existing
+atomic cleanup test registers a synthetic instance-owned Xray TLS key and
+proves no secret-reference row survives host deletion.
+
+The new retention test:
+
+1. creates a TLS Xray instance with two opaque server references;
+2. registers both with the instance UUID as owner;
+3. marks them pending deletion;
+4. records a deployment snapshot that still contains both;
+5. proves neither is deletable;
+6. records ten newer snapshots after removing both settings references;
+7. proves both become deletable after the retention window advances.
+
+No schema migration is needed because `backend_settings_json` and `model_json`
+already hold typed JSON and the owner column already accepts instance UUIDs.
+
+#### Validation
+
+The focused gate passed on the first run:
+
+- `cargo fmt --all` and `cargo fmt --all -- --check`;
+- `cargo test -p vam-core -p vam-storage`: 20 tests;
+- strict clippy for both packages and all targets with `-D warnings`.
+
+The full workspace gate also passed:
+
+- `cargo check --workspace`;
+- `cargo test --workspace`: 74 tests;
+- `cargo clippy --workspace --all-targets -- -D warnings`;
+- `cargo fmt --all -- --check`;
+- `git diff --check`.
+
+Commit:
+
+- pending staged-patch inspection and signed commit.

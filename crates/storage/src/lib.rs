@@ -174,8 +174,11 @@ impl Storage {
              WHERE owner_id IN (
                SELECT id FROM devices
                WHERE instance_id IN (SELECT id FROM vpn_instances WHERE host_id = ?)
+               UNION
+               SELECT id FROM vpn_instances WHERE host_id = ?
              )",
         )
+        .bind(id.to_string())
         .bind(id.to_string())
         .execute(&mut *transaction)
         .await?;
@@ -991,9 +994,14 @@ impl Storage {
     ) -> Result<Vec<Uuid>, StorageError> {
         let rows = sqlx::query(
             "SELECT s.id
-             FROM secret_references s JOIN devices d ON d.id=s.owner_id
-             WHERE d.instance_id=? AND s.pending_delete_at IS NOT NULL",
+             FROM secret_references s
+             WHERE (
+               s.owner_id=?
+               OR s.owner_id IN (SELECT id FROM devices WHERE instance_id=?)
+             )
+             AND s.pending_delete_at IS NOT NULL",
         )
+        .bind(instance_id.to_string())
         .bind(instance_id.to_string())
         .fetch_all(&self.pool)
         .await?;
@@ -1015,6 +1023,14 @@ impl Storage {
         let mut retained = HashSet::new();
         for row in snapshots {
             let state: DesiredState = serde_json::from_str(row.get("desired_state_json"))?;
+            retained.extend(
+                state
+                    .instance
+                    .backend_settings
+                    .secret_references()
+                    .into_iter()
+                    .map(|reference| reference.0),
+            );
             for device in state.devices {
                 retained.extend(
                     device
@@ -1109,7 +1125,7 @@ mod tests {
     use vam_core::{
         BackendSettings, DEFAULT_KEEPALIVE, DeviceBackendData, DnsConfig, DnsRecordType,
         EndpointConfig, NetworkConfig, RoutingMode, SecretReference, SshConnectionConfig,
-        VpnBackendKind, WireGuardDeviceData, XraySettings,
+        VpnBackendKind, WireGuardDeviceData, XraySettings, XrayTransport,
     };
     use vam_protocol::DeploymentPlan;
 
@@ -1244,6 +1260,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn database_rejects_mkcp_on_an_existing_udp_listener() {
+        let storage = Storage::in_memory().await.unwrap();
+        let host = host();
+        storage.save_host(&host).await.unwrap();
+        storage
+            .save_instance(&instance(host.id, Uuid::new_v4(), 443))
+            .await
+            .unwrap();
+        let mut xray = instance(host.id, Uuid::new_v4(), 443);
+        xray.network.ipv4_subnet = "10.65.0.0/24".parse().unwrap();
+        xray.network.gateway_ipv4 = "10.65.0.1".parse().unwrap();
+        xray.backend = VpnBackendKind::Xray;
+        xray.backend_settings = BackendSettings::Xray(XraySettings {
+            transport: XrayTransport::Mkcp,
+            ..XraySettings::default()
+        });
+
+        assert!(matches!(
+            storage.save_instance(&xray).await,
+            Err(StorageError::Database(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn legacy_schema_migration_backfills_wireguard_without_data_loss() {
         let options = SqliteConnectOptions::from_str("sqlite::memory:")
             .unwrap()
@@ -1369,6 +1409,11 @@ mod tests {
             .unwrap();
         let instance = instance(host.id, Uuid::new_v4(), 51_820);
         storage.save_instance(&instance).await.unwrap();
+        let instance_secret = SecretReference(Uuid::new_v4());
+        storage
+            .register_secret_reference(instance_secret.0, "xray_tls_private_key", instance.id)
+            .await
+            .unwrap();
         let device_secret = SecretReference(Uuid::new_v4());
         let device = Device {
             id: Uuid::new_v4(),
@@ -1593,5 +1638,91 @@ mod tests {
                 .unwrap(),
             vec![secret.0]
         );
+    }
+
+    #[tokio::test]
+    async fn pending_instance_secrets_follow_xray_tls_snapshot_retention() {
+        let storage = Storage::in_memory().await.unwrap();
+        let host = host();
+        storage.save_host(&host).await.unwrap();
+        let certificate_ref = SecretReference(Uuid::new_v4());
+        let private_key_ref = SecretReference(Uuid::new_v4());
+        let mut instance = instance(host.id, Uuid::new_v4(), 443);
+        instance.backend = VpnBackendKind::Xray;
+        instance.backend_settings = BackendSettings::Xray(XraySettings {
+            tls_certificate_ref: Some(certificate_ref.clone()),
+            tls_private_key_ref: Some(private_key_ref.clone()),
+            ..XraySettings::default()
+        });
+        storage.save_instance(&instance).await.unwrap();
+        for (reference, purpose) in [
+            (&certificate_ref, "xray_tls_certificate"),
+            (&private_key_ref, "xray_tls_private_key"),
+        ] {
+            storage
+                .register_secret_reference(reference.0, purpose, instance.id)
+                .await
+                .unwrap();
+        }
+        storage
+            .mark_secrets_pending_delete(instance.id)
+            .await
+            .unwrap();
+
+        let retained_state = DesiredState {
+            instance: instance.clone(),
+            users: Vec::new(),
+            devices: Vec::new(),
+            dns_records: Vec::new(),
+            dns_blocklist_domains: Vec::new(),
+        };
+        let retained_plan = DeploymentPlan {
+            id: Uuid::new_v4(),
+            instance_id: instance.id,
+            operations: Vec::new(),
+            warnings: Vec::new(),
+            desired_state_hash: "xray-tls".into(),
+        };
+        storage
+            .record_deployment(&retained_plan, &retained_state, DeploymentStatus::Succeeded)
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .deletable_secret_references(instance.id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        instance.backend_settings = BackendSettings::Xray(XraySettings::default());
+        let released_state = DesiredState {
+            instance: instance.clone(),
+            users: Vec::new(),
+            devices: Vec::new(),
+            dns_records: Vec::new(),
+            dns_blocklist_domains: Vec::new(),
+        };
+        for index in 0..10 {
+            let plan = DeploymentPlan {
+                id: Uuid::new_v4(),
+                instance_id: instance.id,
+                operations: Vec::new(),
+                warnings: Vec::new(),
+                desired_state_hash: format!("xray-released-{index}"),
+            };
+            storage
+                .record_deployment(&plan, &released_state, DeploymentStatus::Succeeded)
+                .await
+                .unwrap();
+        }
+        let mut deletable = storage
+            .deletable_secret_references(instance.id, 10)
+            .await
+            .unwrap();
+        deletable.sort();
+        let mut expected = vec![certificate_ref.0, private_key_ref.0];
+        expected.sort();
+        assert_eq!(deletable, expected);
     }
 }

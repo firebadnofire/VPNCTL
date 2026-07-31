@@ -277,6 +277,14 @@ pub struct XraySettings {
     pub server_name: String,
     pub fingerprint: String,
     pub xhttp_path: String,
+    #[serde(default)]
+    pub reality_public_key: Option<String>,
+    #[serde(default)]
+    pub reality_short_id: Option<String>,
+    #[serde(default)]
+    pub tls_certificate_ref: Option<SecretReference>,
+    #[serde(default)]
+    pub tls_private_key_ref: Option<SecretReference>,
 }
 
 impl Default for XraySettings {
@@ -287,6 +295,10 @@ impl Default for XraySettings {
             server_name: "www.cloudflare.com".into(),
             fingerprint: "chrome".into(),
             xhttp_path: "/".into(),
+            reality_public_key: None,
+            reality_short_id: None,
+            tls_certificate_ref: None,
+            tls_private_key_ref: None,
         }
     }
 }
@@ -321,6 +333,21 @@ impl BackendSettings {
             Self::OpenVpn(_) => VpnBackendKind::OpenVpn,
             Self::Ikev2(_) => VpnBackendKind::Ikev2,
             Self::Xray(_) => VpnBackendKind::Xray,
+        }
+    }
+
+    #[must_use]
+    pub fn secret_references(&self) -> Vec<&SecretReference> {
+        match self {
+            Self::Xray(settings) => {
+                let mut references = Vec::new();
+                references.extend(settings.tls_certificate_ref.iter());
+                references.extend(settings.tls_private_key_ref.iter());
+                references
+            }
+            Self::WireGuard(_) | Self::AmneziaWg(_) | Self::OpenVpn(_) | Self::Ikev2(_) => {
+                Vec::new()
+            }
         }
     }
 
@@ -419,9 +446,12 @@ impl VpnInstance {
                     protocol: TransportProtocol::Udp,
                 },
             ],
-            BackendSettings::Xray(_) => vec![ListenerPort {
+            BackendSettings::Xray(settings) => vec![ListenerPort {
                 port: self.endpoint.port,
-                protocol: TransportProtocol::Tcp,
+                protocol: match settings.transport {
+                    XrayTransport::Tcp | XrayTransport::Xhttp => TransportProtocol::Tcp,
+                    XrayTransport::Mkcp => TransportProtocol::Udp,
+                },
             }],
         }
     }
@@ -841,6 +871,48 @@ mod tests {
         tcp.backend_settings = BackendSettings::Xray(XraySettings::default());
 
         validate_host_instances(&[udp, tcp]).unwrap();
+    }
+
+    #[test]
+    fn xray_settings_backfill_public_and_tls_metadata_and_reserve_transport() {
+        let legacy: XraySettings = serde_json::from_value(serde_json::json!({
+            "security": "reality",
+            "transport": "tcp",
+            "server_name": "www.example.test",
+            "fingerprint": "chrome",
+            "xhttp_path": "/"
+        }))
+        .unwrap();
+        assert!(legacy.reality_public_key.is_none());
+        assert!(legacy.reality_short_id.is_none());
+        assert!(legacy.tls_certificate_ref.is_none());
+        assert!(legacy.tls_private_key_ref.is_none());
+        assert!(BackendSettings::Xray(legacy).secret_references().is_empty());
+
+        let certificate_ref = SecretReference(Uuid::from_u128(1));
+        let private_key_ref = SecretReference(Uuid::from_u128(2));
+        let settings = XraySettings {
+            security: XraySecurity::Tls,
+            transport: XrayTransport::Mkcp,
+            tls_certificate_ref: Some(certificate_ref.clone()),
+            tls_private_key_ref: Some(private_key_ref.clone()),
+            ..XraySettings::default()
+        };
+        assert_eq!(
+            BackendSettings::Xray(settings.clone()).secret_references(),
+            vec![&certificate_ref, &private_key_ref]
+        );
+
+        let mut xray = instance(Uuid::new_v4(), "10.64.0.0/24", 443);
+        xray.backend = VpnBackendKind::Xray;
+        xray.backend_settings = BackendSettings::Xray(settings);
+        assert_eq!(
+            xray.listeners(),
+            vec![ListenerPort {
+                port: 443,
+                protocol: TransportProtocol::Udp,
+            }]
+        );
     }
 
     #[test]
