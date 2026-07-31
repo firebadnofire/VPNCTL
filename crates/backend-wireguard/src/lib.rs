@@ -1,7 +1,9 @@
 use std::{collections::HashMap, fmt::Write as _};
 
 use vam_backend::{
-    BackendCapabilities, BackendError, ChangeImpact, ClientArtifactKind, VpnBackend,
+    BackendCapabilities, BackendError, BackendHealthProbe, BackendRuntimeSpec, BackendValidation,
+    ChangeImpact, ClientArtifactKind, ContainerCapability, ContainerMount, ServerIdentityStrategy,
+    VpnBackend,
 };
 use vam_core::{
     BackendSettings, DesiredState, Device, DeviceBackendData, ListenerPort, RoutingMode,
@@ -13,6 +15,7 @@ use wireguard_conf::{PresharedKey, PrivateKey, PublicKey};
 use zeroize::Zeroizing;
 
 pub const SERVER_PRIVATE_KEY_SENTINEL: &str = "__VAM_SERVER_PRIVATE_KEY__";
+pub const WIREGUARD_IMAGE: &str = "ghcr.io/linuxserver/wireguard:latest";
 
 #[derive(Debug, Default)]
 pub struct WireGuardBackend;
@@ -46,6 +49,42 @@ impl VpnBackend for WireGuardBackend {
             qr_export: true,
             traffic_statistics: true,
             certificate_authority: false,
+        }
+    }
+
+    fn runtime(&self) -> BackendRuntimeSpec {
+        BackendRuntimeSpec {
+            image: WIREGUARD_IMAGE,
+            container_listeners: vec![ListenerPort {
+                port: 51_820,
+                protocol: TransportProtocol::Udp,
+            }],
+            capabilities: vec![ContainerCapability::NetAdmin],
+            devices: Vec::new(),
+            mounts: vec![ContainerMount {
+                host_path: "vpn",
+                container_path: "/config/wg_confs",
+                read_only: false,
+            }],
+            sysctls: vec![
+                ("net.ipv4.ip_forward", "1"),
+                ("net.ipv4.conf.all.src_valid_mark", "1"),
+            ],
+            identity: ServerIdentityStrategy::WireGuardLike {
+                tool: "wg",
+                private_key_path: "vpn/server.key",
+                template_path: "vpn/wg0.conf.template",
+                materialized_path: "vpn/wg0.conf",
+                sentinel: SERVER_PRIVATE_KEY_SENTINEL,
+            },
+            validation: BackendValidation::WireGuardQuick {
+                tool: "wg-quick",
+                config_path: "vpn/wg0.conf",
+            },
+            health: BackendHealthProbe::WireGuardLike {
+                tool: "wg",
+                interface: "wg0",
+            },
         }
     }
 

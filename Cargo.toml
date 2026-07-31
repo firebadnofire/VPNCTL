@@ -5,6 +5,7 @@ members = [
   "apps/desktop/src-tauri",
   "crates/application",
   "crates/backend",
+  "crates/backend-amneziawg",
   "crates/backend-wireguard",
   "crates/core",
   "crates/deployment",

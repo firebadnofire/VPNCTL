@@ -32,6 +32,75 @@ pub enum ClientArtifactKind {
     ProtectedPkcs12,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerCapability {
+    NetAdmin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerDevice {
+    Tun,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContainerMount {
+    pub host_path: &'static str,
+    pub container_path: &'static str,
+    pub read_only: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerIdentityStrategy {
+    WireGuardLike {
+        tool: &'static str,
+        private_key_path: &'static str,
+        template_path: &'static str,
+        materialized_path: &'static str,
+        sentinel: &'static str,
+    },
+    CertificateAuthority,
+    StructuredJson,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendValidation {
+    WireGuardQuick {
+        tool: &'static str,
+        config_path: &'static str,
+    },
+    OpenVpn {
+        config_path: &'static str,
+    },
+    Ikev2,
+    Xray {
+        config_path: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendHealthProbe {
+    WireGuardLike {
+        tool: &'static str,
+        interface: &'static str,
+    },
+    OpenVpn,
+    Ikev2,
+    Xray,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackendRuntimeSpec {
+    pub image: &'static str,
+    pub container_listeners: Vec<ListenerPort>,
+    pub capabilities: Vec<ContainerCapability>,
+    pub devices: Vec<ContainerDevice>,
+    pub mounts: Vec<ContainerMount>,
+    pub sysctls: Vec<(&'static str, &'static str)>,
+    pub identity: ServerIdentityStrategy,
+    pub validation: BackendValidation,
+    pub health: BackendHealthProbe,
+}
+
 #[derive(Debug, Error)]
 pub enum BackendError {
     #[error(transparent)]
@@ -45,6 +114,12 @@ pub enum BackendError {
     BackendMismatch(VpnBackendKind),
     #[error("{0} key or certificate material is invalid")]
     InvalidKeyMaterial(VpnBackendKind),
+    #[error("{backend} setting {field} is invalid: {message}")]
+    InvalidSetting {
+        backend: VpnBackendKind,
+        field: &'static str,
+        message: String,
+    },
     #[error("backend {0} is not registered")]
     NotRegistered(VpnBackendKind),
 }
@@ -52,6 +127,7 @@ pub enum BackendError {
 pub trait VpnBackend: Send + Sync {
     fn kind(&self) -> VpnBackendKind;
     fn capabilities(&self) -> BackendCapabilities;
+    fn runtime(&self) -> BackendRuntimeSpec;
     fn listeners(&self, settings: &BackendSettings, endpoint_port: u16) -> Vec<ListenerPort>;
     fn validate(&self, state: &DesiredState) -> Result<(), BackendError>;
     fn server_secret_references(&self, state: &DesiredState) -> Vec<SecretReference>;

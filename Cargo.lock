@@ -6569,6 +6569,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vam-backend-amneziawg"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "uuid",
+ "vam-backend",
+ "vam-core",
+ "vam-protocol",
+ "wireguard-conf",
+ "zeroize",
+]
+
+[[package]]
 name = "vam-backend-wireguard"
 version = "0.1.0"
 dependencies = [

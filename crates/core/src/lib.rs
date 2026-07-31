@@ -140,6 +140,12 @@ pub enum AmneziaWgGeneration {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AmneziaWgMagicRange {
+    pub min: u32,
+    pub max: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AmneziaWgSettings {
     #[serde(default)]
     pub generation: AmneziaWgGeneration,
@@ -150,10 +156,10 @@ pub struct AmneziaWgSettings {
     pub s2: u16,
     pub s3: u16,
     pub s4: u16,
-    pub h1: u32,
-    pub h2: u32,
-    pub h3: u32,
-    pub h4: u32,
+    pub h1: AmneziaWgMagicRange,
+    pub h2: AmneziaWgMagicRange,
+    pub h3: AmneziaWgMagicRange,
+    pub h4: AmneziaWgMagicRange,
 }
 
 impl Default for AmneziaWgSettings {
@@ -161,16 +167,25 @@ impl Default for AmneziaWgSettings {
         Self {
             generation: AmneziaWgGeneration::Awg2,
             jc: 5,
-            jmin: 50,
-            jmax: 1_000,
-            s1: 0,
-            s2: 0,
-            s3: 0,
-            s4: 0,
-            h1: 1,
-            h2: 2,
-            h3: 3,
-            h4: 4,
+            jmin: 10,
+            jmax: 50,
+            s1: 64,
+            s2: 96,
+            s3: 32,
+            s4: 8,
+            h1: AmneziaWgMagicRange { min: 5, max: 999 },
+            h2: AmneziaWgMagicRange {
+                min: 1_000,
+                max: 1_999,
+            },
+            h3: AmneziaWgMagicRange {
+                min: 2_000,
+                max: 2_999,
+            },
+            h4: AmneziaWgMagicRange {
+                min: 3_000,
+                max: 3_999,
+            },
         }
     }
 }

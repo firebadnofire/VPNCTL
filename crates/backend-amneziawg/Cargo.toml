@@ -1,0 +1,20 @@
+[package]
+name = "vam-backend-amneziawg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vam-backend = { path = "../backend" }
+vam-core = { path = "../core" }
+vam-protocol = { path = "../protocol" }
+wireguard-conf.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+chrono.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

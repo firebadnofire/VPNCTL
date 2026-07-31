@@ -777,4 +777,243 @@ The new regression coverage proves:
 
 Commit:
 
-- pending exact diff review, whitespace validation, and signed commit.
+- `1882ad4 refactor: add multi-protocol backend model`;
+- created with `git commit -S`;
+- `git verify-commit HEAD` reported a good EDDSA signature from William Jones
+  using key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### Unit 2: AmneziaWG 2 backend
+
+Status: complete as a pure backend implementation. Application registration
+and remote deployment are intentionally deferred to the generic orchestration
+unit; registering AWG while Compose and activation still assume WireGuard
+would advertise a path that cannot yet work end to end.
+
+#### Source behavior inspected
+
+The implementation was derived from the current adjacent Amnezia source rather
+than treating AWG as a renamed WireGuard:
+
+- `../amnezia-client/client/core/installers/awgInstaller.cpp` defines the
+  current parameter-generation behavior, including `Jc`, `Jmin`, `Jmax`,
+  `S1`-`S4`, the AWG2 ranged `H1`-`H4` representation, padding collision
+  avoidance, and a monotonically ordered header-range generator;
+- `../amnezia-client/client/server_scripts/awg/configure_container.sh` shows
+  the complete server-side AWG field set and confirms that those settings live
+  in the interface section;
+- `../amnezia-client/client/server_scripts/awg/template.conf` confirms that
+  the client must receive the same message padding and header values;
+- `../amnezia-client/client/server_scripts/awg/Dockerfile`,
+  `start.sh`, and `run_container.sh` identify the userspace implementation,
+  `awg`/`awg-quick` tools, TUN requirement, interface naming, and current
+  container family;
+- the official `amnezia-vpn/amneziawg-go` README documents `Jc`'s recommended
+  4-12 range, the `Jmin <= Jmax` rule, MTU-fragmentation risk, padding
+  semantics, and ranged-header syntax;
+- the official `amnezia-vpn/amneziawg-tools` releases identify ranged-header
+  support as the AWG 2 tool generation.
+
+The backend targets AWG 2 only. Historical `awg_legacy` scripts were inspected
+but were not copied because the task explicitly prioritizes current AWG and
+forbids blindly reintroducing obsolete compatibility paths.
+
+#### Runtime contract extension
+
+The common backend contract now describes the infrastructure a backend needs,
+not just the text it renders. `BackendRuntimeSpec` declares:
+
+- the immutable container image reference;
+- internal listener ports and transports;
+- Linux capabilities;
+- device mappings;
+- config mounts;
+- required sysctls;
+- server-identity materialization strategy;
+- syntax-validation strategy;
+- protocol-aware health probe.
+
+The supporting types are closed enums rather than Compose fragments or shell
+strings supplied by a backend. This keeps future generic deployment code in
+control of quoting and prevents a backend from silently requesting arbitrary
+privileges.
+
+The same runtime method was added to WireGuard so all implementations satisfy
+one contract. Its current image remains the pre-existing mutable LinuxServer
+reference only as a transitional compatibility value. The deployment
+generalization unit will replace the old WireGuard-only Compose constants,
+remove Watchtower, and pin all managed runtime images together; doing that
+partially in this unit would leave two competing image authorities.
+
+#### AWG2 runtime profile
+
+Added `crates/backend-amneziawg`. The runtime profile uses:
+
+- image
+  `amneziavpn/amneziawg-go:2.0.0@sha256:7ee1070c9d0131a3825c9ebc134a7ec474ae6c8ec3efcc01428c2610fc1b69b7`;
+- UDP container port `55424`, mapped to the instance's selected host endpoint
+  port by the future generic Compose renderer;
+- only `CAP_NET_ADMIN`;
+- only `/dev/net/tun`;
+- one writable instance-scoped `vpn` mount at `/etc/amneziawg`;
+- IPv4 forwarding and `src_valid_mark` sysctls;
+- `awg` for key materialization and health;
+- `awg-quick` for configuration validation and interface lifecycle;
+- interface name `awg0`.
+
+The image uses both a human-auditable AWG2 tag and Docker Hub's current
+multi-platform digest. That prevents a later registry tag update from changing
+deployed code invisibly. No host network mode, privileged mode, Docker socket,
+global ICMP filtering, or unrelated capability is requested.
+
+The backend renders `vpn/start-awg.sh` as a deterministic executable. It:
+
+1. selects `amneziawg-go` as the userspace implementation;
+2. brings `/etc/amneziawg/awg0.conf` up;
+3. remains alive as the container's foreground process;
+4. traps `INT` and `TERM`;
+5. brings the interface down before exiting.
+
+The first draft used `exec awg-quick up`, but `awg-quick up` is a setup command,
+not a long-running daemon. That would have made a successfully configured
+container exit immediately. The script was corrected before commit and a
+regression assertion now rejects that lifecycle form.
+
+#### Typed AWG2 settings and validation
+
+`AmneziaWgSettings` now models `H1`-`H4` as explicit inclusive
+`AmneziaWgMagicRange { min, max }` values. A single integer cannot faithfully
+represent the current AWG2 `x-y` syntax.
+
+Safe deterministic defaults are:
+
+| Field | Default |
+| --- | ---: |
+| `Jc` | 5 |
+| `Jmin` | 10 |
+| `Jmax` | 50 |
+| `S1` | 64 |
+| `S2` | 96 |
+| `S3` | 32 |
+| `S4` | 8 |
+| `H1` | 5-999 |
+| `H2` | 1000-1999 |
+| `H3` | 2000-2999 |
+| `H4` | 3000-3999 |
+
+Backend validation rejects:
+
+- a settings/backend discriminator mismatch;
+- `Jc` outside the official recommended 4-12 range;
+- zero junk-packet size, `Jmin > Jmax`, or a junk maximum above the
+  conservative 1280-byte non-fragmenting envelope;
+- an `S1`-`S4` padding above 1280 bytes;
+- duplicate raw padding values;
+- padding combinations that make AWG initiation, response, cookie, or
+  transport packet sizes collide after accounting for the base message sizes
+  148, 92, and 64 bytes;
+- a header range below 5, inverted, or above signed 32-bit maximum;
+- header ranges that are out of order, overlapping, or share a boundary;
+- missing allocated device addresses;
+- a non-AWG device identity or nil PSK reference.
+
+The 1280-byte ceiling is intentionally conservative because the official AWG
+documentation warns that fragmenting junk or signature packets produces a
+suspicious traffic shape. The adjacent Amnezia generator uses much smaller
+padding ranges; the application defaults stay inside those observed values.
+
+#### Identity and secret boundary
+
+AWG peer identities follow the secure WireGuard lifecycle where protocol
+semantics permit:
+
+- device private/public keypairs are generated locally with cryptographically
+  random WireGuard-format material;
+- every device gets a separately generated PSK;
+- private keys and PSKs are returned as `Zeroizing<String>`;
+- the device model stores only the public key and opaque secret references;
+- the server renderer asks only for peer PSKs;
+- the client renderer asks for that device's private key and PSK;
+- the server public key remains under the instance secret reference;
+- client private keys never enter the server artifact.
+
+The server configuration contains a backend-specific private-key sentinel.
+Generic remote activation will create the server key on the host, derive its
+public key, replace the sentinel in the staged file, and preserve the private
+key across ordinary updates. This retains the existing server-private-key
+boundary rather than generating or storing it in the frontend.
+
+#### Deterministic server and client rendering
+
+The backend renders `vpn/awg0.conf.template` with:
+
+- the instance gateway and prefix;
+- fixed internal UDP port `55424`;
+- the complete AWG2 numeric obfuscation set;
+- narrowly scoped DNS, forwarding, established-return, and instance-subnet NAT
+  rules;
+- only enabled, non-deleted peers;
+- newline-sanitized peer comments;
+- stable peer ordering by allocated address;
+- each peer's public key, distinct PSK, and `/32` address.
+
+There is no client private key in this output and there is no shared PSK.
+
+Client rendering mirrors all settings that affect the packet format, then adds
+the locally retained private key, device address, instance DNS gateway, server
+public key, per-device PSK, endpoint, route set, and keepalive. Split-tunnel
+profiles receive only the instance subnet. Full-tunnel profiles receive
+`0.0.0.0/0` and do not falsely advertise an IPv6 default route for the current
+IPv4-only data plane.
+
+AWG client output is a normal text configuration and declares QR export
+support. Settings changes are classified as a service restart; unchanged
+settings are a live update.
+
+#### Validation and diagnosis
+
+The first focused format check reported only rustfmt layout differences in the
+new AWG file and the WireGuard runtime import list. `cargo fmt --all` corrected
+them and the identical check then passed.
+
+The first startup script would have exited after interface creation. The
+lifecycle analysis above identified the problem before remote orchestration
+used the script; it was changed to a signal-aware foreground loop and tested.
+
+The first source-alignment pass also found that the initial validator did not
+reject duplicate raw `S1`-`S4` padding values. The adjacent generator avoids
+both raw-value duplicates and final packet-size collisions. The missing check
+was added. Official upstream documentation was used to retain the recommended
+`Jc` range of 4-12 rather than narrowing it to the adjacent client's current
+random generator range of 4-6.
+
+The first compile after that tightening found a single `&u16` versus `u16`
+comparison. The iterator value is now explicitly dereferenced, and the exact
+AWG test target passed on rerun.
+
+Passing checks after the final source-alignment change:
+
+- `cargo fmt --all -- --check`;
+- `cargo test -p vam-backend-amneziawg`: 4 tests;
+- `cargo check --workspace --all-targets`;
+- `cargo test --workspace`: 52 tests;
+- `cargo clippy --workspace --all-targets -- -D warnings`;
+- `git diff --check`.
+
+The new AWG tests prove:
+
+- deterministic server output;
+- client/server obfuscation mirroring;
+- absence of client private keys from server output;
+- per-peer PSK placement;
+- split-tunnel routing;
+- startup-script foreground and shutdown behavior;
+- invalid packet-size collisions are rejected;
+- duplicate raw padding values are rejected;
+- overlapping header ranges are rejected;
+- the image is version-and-digest pinned;
+- runtime privilege is limited to `NET_ADMIN` plus TUN;
+- generated keypairs and PSKs are unique and use zeroizing private storage.
+
+Commit:
+
+- pending final diff review, whitespace validation, and signed commit.
