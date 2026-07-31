@@ -33,6 +33,15 @@ pub enum ClientArtifactKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerImage {
+    Pull(&'static str),
+    Build {
+        tag: &'static str,
+        dockerfile_path: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContainerCapability {
     NetAdmin,
 }
@@ -90,7 +99,7 @@ pub enum BackendHealthProbe {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BackendRuntimeSpec {
-    pub image: &'static str,
+    pub image: ContainerImage,
     pub container_listeners: Vec<ListenerPort>,
     pub capabilities: Vec<ContainerCapability>,
     pub devices: Vec<ContainerDevice>,
@@ -99,6 +108,62 @@ pub struct BackendRuntimeSpec {
     pub identity: ServerIdentityStrategy,
     pub validation: BackendValidation,
     pub health: BackendHealthProbe,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialAction {
+    InitializeAuthority,
+    Issue,
+    Revoke,
+    Replace { previous_identity: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialArtifact {
+    CaCertificate,
+    ClientCertificate,
+    TlsCryptKey,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CredentialOperation {
+    InitializeOpenVpnAuthority {
+        ca_common_name: String,
+        server_common_name: String,
+        certificate_lifetime_days: u16,
+        tls_crypt: bool,
+    },
+    UploadSecret {
+        reference: SecretReference,
+        relative_path: String,
+        mode: u32,
+    },
+    ImportOpenVpnCsr {
+        common_name: String,
+        relative_path: String,
+    },
+    SignOpenVpnClient {
+        common_name: String,
+        certificate_lifetime_days: u16,
+    },
+    DownloadToSecret {
+        relative_path: String,
+        reference: SecretReference,
+        artifact: CredentialArtifact,
+    },
+    ReadCertificateSerial {
+        relative_path: String,
+    },
+    RevokeOpenVpnClient {
+        common_name: String,
+    },
+    RegenerateOpenVpnCrl,
+    ReloadGateway,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CredentialPlan {
+    pub operations: Vec<CredentialOperation>,
 }
 
 #[derive(Debug, Error)]
@@ -122,6 +187,11 @@ pub enum BackendError {
     },
     #[error("backend {0} is not registered")]
     NotRegistered(VpnBackendKind),
+    #[error("backend {backend} does not support credential operation {operation}")]
+    UnsupportedCredentialOperation {
+        backend: VpnBackendKind,
+        operation: &'static str,
+    },
 }
 
 pub trait VpnBackend: Send + Sync {
@@ -148,6 +218,23 @@ pub trait VpnBackend: Send + Sync {
     ) -> Result<ClientArtifact, BackendError>;
     fn client_artifact_kind(&self) -> ClientArtifactKind {
         ClientArtifactKind::TextConfiguration
+    }
+    fn plan_credentials(
+        &self,
+        _state: &DesiredState,
+        _device: Option<&Device>,
+        action: CredentialAction,
+    ) -> Result<CredentialPlan, BackendError> {
+        let operation = match action {
+            CredentialAction::InitializeAuthority => "initialize authority",
+            CredentialAction::Issue => "issue",
+            CredentialAction::Revoke => "revoke",
+            CredentialAction::Replace { .. } => "replace",
+        };
+        Err(BackendError::UnsupportedCredentialOperation {
+            backend: self.kind(),
+            operation,
+        })
     }
     fn classify_settings_change(
         &self,

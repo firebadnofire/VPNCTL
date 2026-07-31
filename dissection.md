@@ -1016,4 +1016,115 @@ The new AWG tests prove:
 
 Commit:
 
-- pending final diff review, whitespace validation, and signed commit.
+- `3222d12 feat: add AmneziaWG 2 backend`;
+- created with `git commit -S`;
+- `git verify-commit HEAD` reported a good EDDSA signature from William Jones
+  using key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### Unit 3a: certificate credential lifecycle contract
+
+Status: complete. This is the protocol-independent contract and persisted
+identity slice needed before the OpenVPN implementation.
+
+#### Why this is a separate unit
+
+WireGuard and AWG can create a usable peer entirely from locally generated
+key material plus a deterministic server-config update. OpenVPN and IKEv2
+cannot: a remotely retained certificate authority must issue and revoke
+certificates, the application must retrieve resulting artifacts, and CRL
+changes must be reloaded.
+
+Encoding those operations as backend-supplied shell fragments would move
+quoting, path safety, remote exit handling, and secret handling outside the
+existing SSH authority. The common backend contract therefore gained a closed,
+typed credential plan. The future application/SSH adapter will translate each
+variant into fixed commands and will remain responsible for verified-host
+execution, exit status, SFTP, cancellation, redaction, and rollback.
+
+#### Typed credential plan
+
+Added `CredentialAction` with:
+
+- authority initialization;
+- issue;
+- revoke;
+- replacement with an explicit previous identity.
+
+Added `CredentialOperation` variants for:
+
+- idempotent OpenVPN CA/server initialization;
+- uploading a named secret reference to a relative remote path with an
+  explicit file mode;
+- importing a CSR;
+- signing a client certificate with an explicit lifetime;
+- downloading a CA certificate, client certificate, or TLS-crypt key directly
+  into a secret reference;
+- reading the issued certificate serial;
+- revoking a client certificate;
+- regenerating the CRL;
+- reloading the gateway.
+
+There is deliberately no `RunShell(String)` escape hatch. Relative paths,
+common names, lifetimes, secret references, and artifact roles remain
+individually inspectable and validateable.
+
+`VpnBackend::plan_credentials` has a fail-closed default that returns
+`UnsupportedCredentialOperation`. WireGuard and AWG therefore cannot
+accidentally accept a certificate action. OpenVPN will implement the complete
+plan in Unit 3b, and IKEv2 can extend the closed operation enum with its own
+explicit variants later.
+
+#### Pull and local-build runtime images
+
+Changed `BackendRuntimeSpec.image` from a string to `ContainerImage`:
+
+- `Pull` is for an externally built tag-and-digest reference;
+- `Build` identifies a deterministic local tag and a rendered Dockerfile.
+
+WireGuard and AWG are explicitly `Pull` runtimes. OpenVPN will be `Build`
+because no current, official, maintained OpenVPN Community server image with
+Easy-RSA was found. Using the adjacent `amneziavpn/openvpn:2.6.3` image would
+freeze an OpenVPN release from more than two years ago. A digest-pinned current
+Alpine base with version-pinned packages is the smaller and auditable
+alternative.
+
+#### OpenVPN secret model
+
+Added typed `OpenVpnTlsProtection` with secure default `TlsCrypt` and an
+explicit `None` choice. The latter will be surfaced as a security tradeoff in
+the settings UI rather than inferred from a missing string.
+
+`OpenVpnDeviceData` now retains opaque references for:
+
+- the locally generated private key;
+- the locally generated CSR;
+- the retrieved client certificate;
+- the retrieved CA certificate;
+- the optional retrieved TLS-crypt key.
+
+The issued certificate serial remains non-secret model metadata and is
+initially absent. Secret-retention enumeration includes every new reference,
+so rollback snapshots prevent premature native-store deletion of both locally
+created and remotely retrieved credential material.
+
+SQLite still receives only the UUID references in `model_json`; this change
+does not add a plaintext-key or certificate column and needs no destructive
+migration.
+
+#### Validation
+
+Passing checks:
+
+- `cargo fmt --all -- --check`;
+- `cargo test -p vam-core -p vam-backend -p vam-backend-wireguard
+  -p vam-backend-amneziawg`: 14 tests;
+- `cargo check --workspace --all-targets`;
+- `cargo test --workspace`: 53 tests;
+- `cargo clippy --workspace --all-targets -- -D warnings`.
+
+The new regression test proves that all five OpenVPN secret references are
+retention-visible and that TLS-crypt is the default.
+
+Commit:
+
+- pending staged-diff validation and signed commit.

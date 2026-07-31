@@ -206,12 +206,22 @@ pub enum OpenVpnCipher {
     Chacha20Poly1305,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum OpenVpnTlsProtection {
+    #[default]
+    TlsCrypt,
+    None,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenVpnSettings {
     #[serde(default)]
     pub transport: OpenVpnTransport,
     #[serde(default)]
     pub cipher: OpenVpnCipher,
+    #[serde(default)]
+    pub tls_protection: OpenVpnTlsProtection,
     pub certificate_lifetime_days: u16,
 }
 
@@ -220,6 +230,7 @@ impl Default for OpenVpnSettings {
         Self {
             transport: OpenVpnTransport::Udp,
             cipher: OpenVpnCipher::Aes256Gcm,
+            tls_protection: OpenVpnTlsProtection::TlsCrypt,
             certificate_lifetime_days: 825,
         }
     }
@@ -442,6 +453,9 @@ pub struct OpenVpnDeviceData {
     pub common_name: String,
     pub private_key_ref: SecretReference,
     pub csr_ref: SecretReference,
+    pub certificate_ref: SecretReference,
+    pub ca_certificate_ref: SecretReference,
+    pub tls_crypt_key_ref: Option<SecretReference>,
     pub certificate_serial: Option<String>,
 }
 
@@ -492,7 +506,16 @@ impl DeviceBackendData {
             Self::AmneziaWg(data) => {
                 vec![&data.private_key_ref, &data.preshared_key_ref]
             }
-            Self::OpenVpn(data) => vec![&data.private_key_ref, &data.csr_ref],
+            Self::OpenVpn(data) => {
+                let mut references = vec![
+                    &data.private_key_ref,
+                    &data.csr_ref,
+                    &data.certificate_ref,
+                    &data.ca_certificate_ref,
+                ];
+                references.extend(data.tls_crypt_key_ref.as_ref());
+                references
+            }
             Self::Ikev2(data) => vec![&data.bundle_password_ref],
             Self::Xray(_) => Vec::new(),
         }
@@ -836,6 +859,39 @@ mod tests {
                 port: 51_820,
                 protocol: TransportProtocol::Udp,
             }]
+        );
+    }
+
+    #[test]
+    fn openvpn_identity_retains_all_local_and_retrieved_material() {
+        let private_key_ref = SecretReference(Uuid::from_u128(1));
+        let csr_ref = SecretReference(Uuid::from_u128(2));
+        let certificate_ref = SecretReference(Uuid::from_u128(3));
+        let ca_certificate_ref = SecretReference(Uuid::from_u128(4));
+        let tls_crypt_key_ref = SecretReference(Uuid::from_u128(5));
+        let data = DeviceBackendData::OpenVpn(OpenVpnDeviceData {
+            common_name: "client-01".into(),
+            private_key_ref: private_key_ref.clone(),
+            csr_ref: csr_ref.clone(),
+            certificate_ref: certificate_ref.clone(),
+            ca_certificate_ref: ca_certificate_ref.clone(),
+            tls_crypt_key_ref: Some(tls_crypt_key_ref.clone()),
+            certificate_serial: None,
+        });
+
+        assert_eq!(
+            data.secret_references(),
+            vec![
+                &private_key_ref,
+                &csr_ref,
+                &certificate_ref,
+                &ca_certificate_ref,
+                &tls_crypt_key_ref,
+            ]
+        );
+        assert_eq!(
+            OpenVpnSettings::default().tls_protection,
+            OpenVpnTlsProtection::TlsCrypt
         );
     }
 

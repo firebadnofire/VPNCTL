@@ -2,8 +2,8 @@ use std::{collections::HashMap, fmt::Write as _};
 
 use vam_backend::{
     BackendCapabilities, BackendError, BackendHealthProbe, BackendRuntimeSpec, BackendValidation,
-    ChangeImpact, ClientArtifactKind, ContainerCapability, ContainerMount, ServerIdentityStrategy,
-    VpnBackend,
+    ChangeImpact, ClientArtifactKind, ContainerCapability, ContainerImage, ContainerMount,
+    ServerIdentityStrategy, VpnBackend,
 };
 use vam_core::{
     BackendSettings, DesiredState, Device, DeviceBackendData, ListenerPort, RoutingMode,
@@ -54,7 +54,7 @@ impl VpnBackend for WireGuardBackend {
 
     fn runtime(&self) -> BackendRuntimeSpec {
         BackendRuntimeSpec {
-            image: WIREGUARD_IMAGE,
+            image: ContainerImage::Pull(WIREGUARD_IMAGE),
             container_listeners: vec![ListenerPort {
                 port: 51_820,
                 protocol: TransportProtocol::Udp,

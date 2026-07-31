@@ -2,8 +2,8 @@ use std::{collections::HashMap, fmt::Write as _};
 
 use vam_backend::{
     BackendCapabilities, BackendError, BackendHealthProbe, BackendRuntimeSpec, BackendValidation,
-    ChangeImpact, ClientArtifactKind, ContainerCapability, ContainerDevice, ContainerMount,
-    ServerIdentityStrategy, VpnBackend,
+    ChangeImpact, ClientArtifactKind, ContainerCapability, ContainerDevice, ContainerImage,
+    ContainerMount, ServerIdentityStrategy, VpnBackend,
 };
 use vam_core::{
     AmneziaWgMagicRange, AmneziaWgSettings, BackendSettings, DesiredState, Device,
@@ -76,7 +76,7 @@ impl VpnBackend for AmneziaWgBackend {
 
     fn runtime(&self) -> BackendRuntimeSpec {
         BackendRuntimeSpec {
-            image: AMNEZIAWG_IMAGE,
+            image: ContainerImage::Pull(AMNEZIAWG_IMAGE),
             container_listeners: vec![ListenerPort {
                 port: AWG_CONTAINER_PORT,
                 protocol: TransportProtocol::Udp,
@@ -540,7 +540,10 @@ mod tests {
     #[test]
     fn runtime_is_awg2_specific_pinned_and_least_privilege() {
         let runtime = AmneziaWgBackend.runtime();
-        assert!(runtime.image.contains(":2.0.0@sha256:"));
+        assert!(matches!(
+            runtime.image,
+            ContainerImage::Pull(image) if image.contains(":2.0.0@sha256:")
+        ));
         assert_eq!(runtime.capabilities, vec![ContainerCapability::NetAdmin]);
         assert_eq!(runtime.devices, vec![ContainerDevice::Tun]);
         assert!(matches!(
