@@ -31,8 +31,6 @@ use vam_backend_ikev2::Ikev2Backend;
 use vam_backend_openvpn::OpenVpnBackend;
 use vam_backend_wireguard::WireGuardBackend;
 use vam_backend_xray::{REALITY_PUBLIC_KEY_PATH, REALITY_SHORT_ID_PATH, XrayBackend};
-#[cfg(test)]
-use vam_core::DEFAULT_PORT;
 use vam_core::{
     AmneziaWgDeviceData, AmneziaWgSettings, BackendSettings, DEFAULT_DNS_ZONE, DEFAULT_KEEPALIVE,
     DEFAULT_SUBNET, DesiredState, Device, DeviceBackendData, DnsConfig, DnsRecord, DnsRecordType,
@@ -42,6 +40,8 @@ use vam_core::{
     WireGuardSettings, XraySecurity, XrayTransport, allocate_next_ipv4, first_usable,
     validate_host_instances, validate_instance,
 };
+#[cfg(test)]
+use vam_core::{DEFAULT_PORT, XrayDeviceData};
 use vam_deployment::{
     COREDNS_IMAGE, DeploymentExecutor, DeploymentPlanner, RemoteManifest, build_manifest,
     shell_quote,
@@ -421,6 +421,145 @@ impl From<BackendPresentation> for BackendPresentationView {
             identity_replacement_warning: value.identity_replacement_warning.into(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InstanceOperationalState {
+    Healthy,
+    Degraded,
+    Stopped,
+    Unknown,
+    NeedsDeployment,
+    Updating,
+    Error,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StateEvidence {
+    LocalDesiredState,
+    DeploymentHistory,
+    LiveHealth,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftState {
+    NotChecked,
+    UpToDate,
+    DesiredChanges,
+    RemoteDrift,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstanceSummaryView {
+    pub instance: InstanceView,
+    pub secondary_summary: String,
+    pub listener_summary: String,
+    pub client_count: usize,
+    pub state: InstanceOperationalState,
+    pub state_evidence: StateEvidence,
+    pub observed_at: Option<DateTime<Utc>>,
+    pub last_deployment: Option<DeploymentSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PresentationFact {
+    pub label: String,
+    pub value: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstanceDetailView {
+    pub summary: InstanceSummaryView,
+    pub host_display_name: String,
+    pub configured_image: String,
+    pub drift: DriftState,
+    pub last_backup_name: Option<String>,
+    pub facts: Vec<PresentationFact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HealthCheckView {
+    pub label: String,
+    pub passing: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstanceHealthView {
+    pub state: InstanceOperationalState,
+    pub observed_at: DateTime<Utc>,
+    pub configured_image: String,
+    pub checks: Vec<HealthCheckView>,
+    pub details: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientActionView {
+    pub action: ClientAction,
+    pub label: String,
+    pub warning: Option<String>,
+    pub destructive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientStatisticsView {
+    pub last_activity: Option<DateTime<Utc>>,
+    pub received_bytes: Option<u64>,
+    pub transmitted_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ClientView {
+    pub id: Uuid,
+    pub instance_id: Uuid,
+    pub user_id: Option<Uuid>,
+    pub display_name: String,
+    pub ipv4_address: Option<Ipv4Addr>,
+    pub ipv6_address: Option<Ipv6Addr>,
+    pub dns_name: Option<String>,
+    pub enabled: bool,
+    pub backend: VpnBackendKind,
+    pub identity_summary: String,
+    pub state_label: String,
+    pub actions: Vec<ClientActionView>,
+    pub export_formats: Vec<ClientExportFormat>,
+    pub statistics: Option<ClientStatisticsView>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DeploymentImpactView {
+    NoChanges,
+    DnsReload,
+    LiveReload,
+    ServiceRestart,
+    Rebuild,
+    Reinstall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeploymentOperationView {
+    pub label: String,
+    pub technical_detail: Option<String>,
+    pub sensitive: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeploymentPreviewView {
+    pub id: Uuid,
+    pub instance_id: Uuid,
+    pub operations: Vec<DeploymentOperationView>,
+    pub impact: DeploymentImpactView,
+    pub creates_backup: bool,
+    pub server_identity_effect: String,
+    pub client_effect: String,
+    pub affected_clients: usize,
+    pub drift: DriftState,
+    pub warnings: Vec<String>,
+    pub desired_state_hash: String,
 }
 
 struct PendingSecret {
@@ -1217,6 +1356,89 @@ fi
             .collect())
     }
 
+    pub async fn list_instance_summary_views(
+        &self,
+        host_id: Option<Uuid>,
+    ) -> Result<Vec<InstanceSummaryView>, AppError> {
+        let instances = self.list_instances(host_id).await?;
+        let mut summaries = Vec::with_capacity(instances.len());
+        for instance in &instances {
+            summaries.push(self.instance_summary_view(instance).await?);
+        }
+        Ok(summaries)
+    }
+
+    pub async fn instance_detail_view(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<InstanceDetailView, AppError> {
+        let instance = self
+            .storage
+            .get_instance(instance_id)
+            .await
+            .map_err(storage_error)?;
+        let host = self
+            .storage
+            .get_host(instance.host_id)
+            .await
+            .map_err(storage_error)?;
+        let summary = self.instance_summary_view(&instance).await?;
+        let backend = self.backends.get(instance.backend).map_err(backend_error)?;
+        let runtime = backend
+            .runtime(&instance.backend_settings)
+            .map_err(backend_error)?;
+        let configured_image = container_image_name(runtime.image);
+        let last_backup_name = summary
+            .last_deployment
+            .as_ref()
+            .and_then(|deployment| deployment.backup_name.clone());
+        let drift = if summary.state == InstanceOperationalState::NeedsDeployment {
+            DriftState::DesiredChanges
+        } else {
+            DriftState::NotChecked
+        };
+        Ok(InstanceDetailView {
+            facts: instance_presentation_facts(&instance),
+            summary,
+            host_display_name: host.display_name,
+            configured_image,
+            drift,
+            last_backup_name,
+        })
+    }
+
+    async fn instance_summary_view(
+        &self,
+        instance: &VpnInstance,
+    ) -> Result<InstanceSummaryView, AppError> {
+        let state = self.desired_state(instance.id).await?;
+        let deployments = self
+            .storage
+            .list_deployments(instance.id)
+            .await
+            .map_err(storage_error)?;
+        let last_deployment = deployments.first().cloned();
+        let last_successful = self
+            .storage
+            .last_successful_deployment(instance.id)
+            .await
+            .map_err(storage_error)?;
+        let (operational_state, state_evidence) =
+            local_operational_state(&state, last_deployment.as_ref(), last_successful.as_ref());
+        Ok(InstanceSummaryView {
+            instance: InstanceView::from(instance),
+            secondary_summary: instance_secondary_summary(instance),
+            listener_summary: listener_summary(&instance.listeners()),
+            client_count: state.devices.len(),
+            state: operational_state,
+            state_evidence,
+            observed_at: last_deployment
+                .as_ref()
+                .and_then(|deployment| deployment.finished_at.or(Some(deployment.started_at))),
+            last_deployment,
+        })
+    }
+
     pub fn backend_options(&self) -> Vec<BackendOptionView> {
         [
             VpnBackendKind::WireGuard,
@@ -1706,6 +1928,24 @@ fi
             .await?
             .iter()
             .map(DeviceView::from)
+            .collect())
+    }
+
+    pub async fn list_client_views(&self, instance_id: Uuid) -> Result<Vec<ClientView>, AppError> {
+        let instance = self
+            .storage
+            .get_instance(instance_id)
+            .await
+            .map_err(storage_error)?;
+        let presentation = self
+            .backends
+            .presentation(instance.backend)
+            .ok_or_else(|| backend_error(BackendError::NotRegistered(instance.backend)))?;
+        Ok(self
+            .list_devices(instance_id)
+            .await?
+            .iter()
+            .map(|device| client_view(device, &presentation))
             .collect())
     }
 
@@ -2246,6 +2486,20 @@ fi
         Ok(plan)
     }
 
+    pub async fn plan_instance_view(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<DeploymentPreviewView, AppError> {
+        let plan = self.plan_instance(instance_id).await?;
+        let client_count = self
+            .storage
+            .list_devices(instance_id)
+            .await
+            .map_err(storage_error)?
+            .len();
+        Ok(deployment_preview_view(plan, client_count))
+    }
+
     pub async fn apply_instance(
         &self,
         instance_id: Uuid,
@@ -2406,13 +2660,55 @@ fi
         self.compose_operation(instance_id, "up -d", true).await
     }
 
+    pub async fn start_instance_view(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<InstanceHealthView, AppError> {
+        let health = self.start_instance(instance_id).await?;
+        self.instance_health_view(instance_id, &health).await
+    }
+
     pub async fn stop_instance(&self, instance_id: Uuid) -> Result<InstanceHealth, AppError> {
         self.compose_operation(instance_id, "stop", false).await
+    }
+
+    pub async fn stop_instance_view(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<InstanceHealthView, AppError> {
+        let health = self.stop_instance(instance_id).await?;
+        self.instance_health_view(instance_id, &health).await
     }
 
     pub async fn update_images(&self, instance_id: Uuid) -> Result<InstanceHealth, AppError> {
         self.compose_operation(instance_id, "refresh_images", true)
             .await
+    }
+
+    pub async fn health_view(&self, instance_id: Uuid) -> Result<InstanceHealthView, AppError> {
+        let health = self.health(instance_id).await?;
+        self.instance_health_view(instance_id, &health).await
+    }
+
+    pub async fn instance_health_view(
+        &self,
+        instance_id: Uuid,
+        health: &InstanceHealth,
+    ) -> Result<InstanceHealthView, AppError> {
+        let instance = self
+            .storage
+            .get_instance(instance_id)
+            .await
+            .map_err(storage_error)?;
+        let backend = self.backends.get(instance.backend).map_err(backend_error)?;
+        let runtime = backend
+            .runtime(&instance.backend_settings)
+            .map_err(backend_error)?;
+        Ok(build_health_view(
+            instance.backend,
+            container_image_name(runtime.image),
+            health,
+        ))
     }
 
     async fn compose_operation(
@@ -5561,6 +5857,456 @@ fn parse_find_timestamp(value: &str) -> Option<chrono::DateTime<Utc>> {
     chrono::DateTime::from_timestamp(seconds, nanos.parse().ok()?)
 }
 
+fn local_operational_state(
+    desired: &DesiredState,
+    latest: Option<&DeploymentSummary>,
+    last_successful: Option<&vam_storage::StoredDeployment>,
+) -> (InstanceOperationalState, StateEvidence) {
+    if latest.is_some_and(|deployment| {
+        matches!(
+            deployment.status,
+            DeploymentStatus::Planned | DeploymentStatus::Applying
+        )
+    }) {
+        return (
+            InstanceOperationalState::Updating,
+            StateEvidence::DeploymentHistory,
+        );
+    }
+    if latest.is_some_and(|deployment| {
+        matches!(
+            deployment.status,
+            DeploymentStatus::Failed
+                | DeploymentStatus::RollbackFailed
+                | DeploymentStatus::RolledBack
+        )
+    }) {
+        return (
+            InstanceOperationalState::Error,
+            StateEvidence::DeploymentHistory,
+        );
+    }
+    if last_successful.is_none_or(|deployment| deployment.desired_state != *desired) {
+        return (
+            InstanceOperationalState::NeedsDeployment,
+            StateEvidence::LocalDesiredState,
+        );
+    }
+    (
+        InstanceOperationalState::Unknown,
+        StateEvidence::DeploymentHistory,
+    )
+}
+
+fn instance_secondary_summary(instance: &VpnInstance) -> String {
+    let endpoint = format!("{}:{}", instance.endpoint.host, instance.endpoint.port);
+    match &instance.backend_settings {
+        BackendSettings::WireGuard(_) => format!(
+            "WireGuard · {endpoint}/UDP · {}",
+            instance.network.ipv4_subnet
+        ),
+        BackendSettings::AmneziaWg(settings) => format!(
+            "AmneziaWG {:?} · {endpoint}/UDP · {}",
+            settings.generation, instance.network.ipv4_subnet
+        ),
+        BackendSettings::OpenVpn(settings) => format!(
+            "OpenVPN · {endpoint}/{} · {}",
+            openvpn_transport_name(settings.transport),
+            instance.network.ipv4_subnet
+        ),
+        BackendSettings::Ikev2(_) => format!(
+            "IKEv2 · {}:500/UDP + 4500/UDP · {}",
+            instance.endpoint.host, instance.network.ipv4_subnet
+        ),
+        BackendSettings::Xray(settings) => format!(
+            "Xray · {endpoint}/TCP · {:?} · {:?}",
+            settings.security, settings.transport
+        ),
+    }
+}
+
+fn instance_presentation_facts(instance: &VpnInstance) -> Vec<PresentationFact> {
+    let mut facts = vec![
+        PresentationFact {
+            label: "Endpoint".into(),
+            value: format!("{}:{}", instance.endpoint.host, instance.endpoint.port),
+        },
+        PresentationFact {
+            label: "Listener".into(),
+            value: listener_summary(&instance.listeners()),
+        },
+    ];
+    if !matches!(instance.backend_settings, BackendSettings::Xray(_)) {
+        facts.extend([
+            PresentationFact {
+                label: "Address pool".into(),
+                value: instance.network.ipv4_subnet.to_string(),
+            },
+            PresentationFact {
+                label: "Routing".into(),
+                value: format!("{:?}", instance.routing_mode),
+            },
+            PresentationFact {
+                label: "Private DNS".into(),
+                value: instance.dns.zone.clone(),
+            },
+        ]);
+    }
+    match &instance.backend_settings {
+        BackendSettings::WireGuard(settings) => facts.push(PresentationFact {
+            label: "Userspace fallback".into(),
+            value: if settings.userspace_fallback {
+                "Enabled"
+            } else {
+                "Disabled"
+            }
+            .into(),
+        }),
+        BackendSettings::AmneziaWg(settings) => facts.push(PresentationFact {
+            label: "AWG generation".into(),
+            value: format!("{:?}", settings.generation),
+        }),
+        BackendSettings::OpenVpn(settings) => facts.extend([
+            PresentationFact {
+                label: "Transport".into(),
+                value: openvpn_transport_name(settings.transport).into(),
+            },
+            PresentationFact {
+                label: "TLS protection".into(),
+                value: format!("{:?}", settings.tls_protection),
+            },
+        ]),
+        BackendSettings::Ikev2(settings) => facts.push(PresentationFact {
+            label: "Server identity".into(),
+            value: settings.server_identity.clone(),
+        }),
+        BackendSettings::Xray(settings) => facts.extend([
+            PresentationFact {
+                label: "Security".into(),
+                value: format!("{:?}", settings.security),
+            },
+            PresentationFact {
+                label: "Transport".into(),
+                value: format!("{:?}", settings.transport),
+            },
+            PresentationFact {
+                label: "Server name".into(),
+                value: settings.server_name.clone(),
+            },
+        ]),
+    }
+    facts
+}
+
+fn container_image_name(image: ContainerImage) -> String {
+    match image {
+        ContainerImage::Pull(reference) => reference.into(),
+        ContainerImage::Build { tag, .. } => tag.into(),
+    }
+}
+
+const fn openvpn_transport_name(transport: vam_core::OpenVpnTransport) -> &'static str {
+    match transport {
+        vam_core::OpenVpnTransport::Tcp => "TCP",
+        vam_core::OpenVpnTransport::Udp => "UDP",
+    }
+}
+
+fn build_health_view(
+    backend: VpnBackendKind,
+    configured_image: String,
+    health: &InstanceHealth,
+) -> InstanceHealthView {
+    let state = if !health.compose_project_exists {
+        InstanceOperationalState::NeedsDeployment
+    } else if !health.gateway_running {
+        InstanceOperationalState::Stopped
+    } else if health_is_healthy(health) {
+        InstanceOperationalState::Healthy
+    } else {
+        InstanceOperationalState::Degraded
+    };
+    let backend_label = match backend {
+        VpnBackendKind::WireGuard => "WireGuard interface ready",
+        VpnBackendKind::AmneziaWg => "AmneziaWG interface ready",
+        VpnBackendKind::OpenVpn => "OpenVPN daemon ready",
+        VpnBackendKind::Ikev2 => "IPsec daemon ready",
+        VpnBackendKind::Xray => "Xray configuration valid",
+    };
+    let mut checks = vec![
+        HealthCheckView {
+            label: "Compose project exists".into(),
+            passing: health.compose_project_exists,
+        },
+        HealthCheckView {
+            label: "Gateway container running".into(),
+            passing: health.gateway_running,
+        },
+        HealthCheckView {
+            label: backend_label.into(),
+            passing: health.backend_ready,
+        },
+        HealthCheckView {
+            label: "Required listeners published".into(),
+            passing: health.listeners_ready,
+        },
+        HealthCheckView {
+            label: "Client identities match desired state".into(),
+            passing: health.client_state_matches,
+        },
+    ];
+    if health.dns_required {
+        checks.extend([
+            HealthCheckView {
+                label: "Private DNS service running".into(),
+                passing: health.dns_running,
+            },
+            HealthCheckView {
+                label: "Private DNS resolution".into(),
+                passing: health.private_dns_resolves,
+            },
+            HealthCheckView {
+                label: "Public DNS forwarding".into(),
+                passing: health.public_dns_resolves,
+            },
+        ]);
+    }
+    InstanceHealthView {
+        state,
+        observed_at: Utc::now(),
+        configured_image,
+        checks,
+        details: health.details.clone(),
+    }
+}
+
+fn client_view(device: &Device, presentation: &BackendPresentation) -> ClientView {
+    let identity_summary = match &device.backend_data {
+        DeviceBackendData::WireGuard(data) => format!(
+            "WireGuard peer · {}",
+            if data.preshared_key_ref.is_some() {
+                "PSK enabled"
+            } else {
+                "No PSK"
+            }
+        ),
+        DeviceBackendData::AmneziaWg(_) => "AmneziaWG peer keypair".into(),
+        DeviceBackendData::OpenVpn(data) => data.certificate_serial.as_ref().map_or_else(
+            || format!("Certificate · {}", data.common_name),
+            |serial| format!("Certificate · {} · serial {serial}", data.common_name),
+        ),
+        DeviceBackendData::Ikev2(data) => data.certificate_serial.as_ref().map_or_else(
+            || format!("Certificate profile · {}", data.identity),
+            |serial| format!("Certificate profile · {} · serial {serial}", data.identity),
+        ),
+        DeviceBackendData::Xray(data) => data.flow.as_ref().map_or_else(
+            || format!("VLESS · {}", data.email),
+            |flow| format!("VLESS · {} · {flow}", data.email),
+        ),
+    };
+    let certificate_identity = matches!(
+        device.backend_data,
+        DeviceBackendData::OpenVpn(_) | DeviceBackendData::Ikev2(_)
+    );
+    let actions = presentation
+        .client_actions
+        .iter()
+        .copied()
+        .filter(|action| match action {
+            ClientAction::Enable => !certificate_identity && !device.enabled,
+            ClientAction::Disable => !certificate_identity && device.enabled,
+            ClientAction::Revoke => certificate_identity && device.enabled,
+            ClientAction::RotateIdentity => !certificate_identity,
+            ClientAction::ReplaceIdentity => certificate_identity,
+            _ => true,
+        })
+        .map(|action| client_action_view(action, presentation))
+        .collect();
+    ClientView {
+        id: device.id,
+        instance_id: device.instance_id,
+        user_id: device.user_id,
+        display_name: device.display_name.clone(),
+        ipv4_address: device.ipv4_address,
+        ipv6_address: device.ipv6_address,
+        dns_name: device.dns_name.clone(),
+        enabled: device.enabled,
+        backend: device.backend_data.kind(),
+        identity_summary,
+        state_label: if certificate_identity && !device.enabled {
+            "Revoked"
+        } else if device.enabled {
+            "Enabled"
+        } else {
+            "Disabled"
+        }
+        .into(),
+        actions,
+        export_formats: presentation.export_formats.to_vec(),
+        statistics: None,
+        created_at: device.created_at,
+    }
+}
+
+fn client_action_view(
+    action: ClientAction,
+    presentation: &BackendPresentation,
+) -> ClientActionView {
+    let (label, warning, destructive) = match action {
+        ClientAction::Enable => ("Enable", None, false),
+        ClientAction::Disable => ("Disable", None, false),
+        ClientAction::RotateIdentity => (
+            "Rotate identity",
+            Some(presentation.identity_replacement_warning.to_string()),
+            false,
+        ),
+        ClientAction::ReplaceIdentity => (
+            "Replace identity",
+            Some(presentation.identity_replacement_warning.to_string()),
+            false,
+        ),
+        ClientAction::Revoke => (
+            "Revoke",
+            Some("The current certificate will no longer authenticate this client.".into()),
+            true,
+        ),
+        ClientAction::Export => ("Export", None, false),
+        ClientAction::QrExport => ("QR", None, false),
+        ClientAction::Remove => (
+            "Remove",
+            Some("This client identity will be removed from desired server state.".into()),
+            true,
+        ),
+        ClientAction::InspectStatistics => ("Statistics", None, false),
+    };
+    ClientActionView {
+        action,
+        label: label.into(),
+        warning,
+        destructive,
+    }
+}
+
+fn deployment_preview_view(plan: DeploymentPlan, client_count: usize) -> DeploymentPreviewView {
+    let reinstall = plan
+        .warnings
+        .iter()
+        .any(|warning| warning.contains("Destructive reinstall-class"));
+    let impact = if plan.operations.is_empty() {
+        DeploymentImpactView::NoChanges
+    } else if reinstall {
+        DeploymentImpactView::Reinstall
+    } else if plan.operations.iter().any(|operation| {
+        matches!(
+            operation,
+            DeploymentOperation::ComposeBuild
+                | DeploymentOperation::ComposePull
+                | DeploymentOperation::ComposeUp
+        )
+    }) {
+        DeploymentImpactView::Rebuild
+    } else if plan
+        .operations
+        .iter()
+        .any(|operation| matches!(operation, DeploymentOperation::ComposeRestart { .. }))
+    {
+        DeploymentImpactView::ServiceRestart
+    } else if plan
+        .operations
+        .iter()
+        .any(|operation| matches!(operation, DeploymentOperation::ReloadDns))
+    {
+        DeploymentImpactView::DnsReload
+    } else {
+        DeploymentImpactView::LiveReload
+    };
+    let drift = if plan
+        .warnings
+        .iter()
+        .any(|warning| warning.starts_with("Remote drift detected"))
+    {
+        DriftState::RemoteDrift
+    } else if plan.operations.is_empty() {
+        DriftState::UpToDate
+    } else {
+        DriftState::DesiredChanges
+    };
+    let operations = plan
+        .operations
+        .iter()
+        .map(deployment_operation_view)
+        .collect();
+    DeploymentPreviewView {
+        id: plan.id,
+        instance_id: plan.instance_id,
+        operations,
+        impact,
+        creates_backup: plan
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, DeploymentOperation::CreateBackup { .. })),
+        server_identity_effect: if reinstall {
+            "Persistent server identity is protected by the pre-change backup; review backend warnings before applying."
+        } else {
+            "This plan does not rotate server identity."
+        }
+        .into(),
+        client_effect: if reinstall {
+            "Review all existing client profiles before applying this reinstall-class change."
+        } else {
+            "This plan does not rotate client identities."
+        }
+        .into(),
+        affected_clients: if reinstall { client_count } else { 0 },
+        drift,
+        warnings: plan.warnings,
+        desired_state_hash: plan.desired_state_hash,
+    }
+}
+
+fn deployment_operation_view(operation: &DeploymentOperation) -> DeploymentOperationView {
+    let (label, technical_detail, sensitive) = match operation {
+        DeploymentOperation::CreateDirectory { path } => (
+            "Create remote instance directory",
+            Some(path.clone()),
+            false,
+        ),
+        DeploymentOperation::GenerateServerKey => ("Initialize server identity", None, true),
+        DeploymentOperation::UploadFile { path, sensitive } => {
+            ("Upload configuration file", Some(path.clone()), *sensitive)
+        }
+        DeploymentOperation::ReplaceFile { path, sensitive } => {
+            ("Replace configuration file", Some(path.clone()), *sensitive)
+        }
+        DeploymentOperation::RemoveFile { path } => (
+            "Remove obsolete configuration file",
+            Some(path.clone()),
+            false,
+        ),
+        DeploymentOperation::ValidateConfiguration => {
+            ("Validate generated configuration", None, false)
+        }
+        DeploymentOperation::CreateBackup { name } => {
+            ("Create pre-change backup", Some(name.clone()), false)
+        }
+        DeploymentOperation::ComposePull => ("Pull configured container images", None, false),
+        DeploymentOperation::ComposeBuild => ("Build backend container image", None, false),
+        DeploymentOperation::ComposeUp => ("Apply the Compose project", None, false),
+        DeploymentOperation::ComposeRestart { service } => {
+            ("Restart backend service", Some(service.clone()), false)
+        }
+        DeploymentOperation::ReloadDns => ("Reload managed private DNS", None, false),
+        DeploymentOperation::HealthCheck { service } => {
+            ("Verify service health", Some(service.clone()), false)
+        }
+    };
+    DeploymentOperationView {
+        label: label.into(),
+        technical_detail,
+        sensitive,
+    }
+}
+
 fn health_is_healthy(health: &InstanceHealth) -> bool {
     health.compose_project_exists
         && health.gateway_running
@@ -6337,6 +7083,203 @@ mod tests {
     const FRESH_APT_HOST: &str = "operating_system=Linux\narchitecture=x86_64\npackage_manager=apt\neffective_user_is_root=1\ndocker_group_member=1\ndocker_installed=127\ndocker_version=\ndocker_accessible=127\ncompose_version=\ndocker_privileged_accessible=127\nwireguard=1\nroot_writable=1\nsudo_bootstrap=0\n";
     const READY_APT_HOST: &str = "operating_system=Linux\narchitecture=x86_64\npackage_manager=apt\neffective_user_is_root=1\ndocker_group_member=0\ndocker_installed=0\ndocker_version=29.0.0\ndocker_accessible=0\ncompose_version=2.40.0\ndocker_privileged_accessible=0\nwireguard=1\nroot_writable=1\nsudo_bootstrap=0\n";
     const HEALTHY_XRAY: &str = "project=1\ngateway=0\ndns=1\ngateway_status=running/none Up 1 second\ndns_status=absent\nbackend=0\nclient_count=0\nbackend_status=ready\nlistener_0=0\nprivate_dns=1\npublic_dns=1\n";
+
+    #[test]
+    fn presentation_health_uses_backend_specific_checks_without_fake_handshakes() {
+        let health = InstanceHealth {
+            compose_project_exists: true,
+            gateway_running: true,
+            backend_ready: true,
+            listeners_ready: true,
+            client_state_matches: true,
+            ..InstanceHealth::default()
+        };
+        let expectations = [
+            (VpnBackendKind::WireGuard, "WireGuard interface ready"),
+            (VpnBackendKind::AmneziaWg, "AmneziaWG interface ready"),
+            (VpnBackendKind::OpenVpn, "OpenVPN daemon ready"),
+            (VpnBackendKind::Ikev2, "IPsec daemon ready"),
+            (VpnBackendKind::Xray, "Xray configuration valid"),
+        ];
+        for (backend, expected) in expectations {
+            let view = build_health_view(backend, "image".into(), &health);
+            assert_eq!(view.state, InstanceOperationalState::Healthy);
+            assert!(view.checks.iter().any(|check| check.label == expected));
+            assert!(
+                view.checks
+                    .iter()
+                    .all(|check| !check.label.to_ascii_lowercase().contains("handshake"))
+            );
+        }
+
+        let stopped = build_health_view(
+            VpnBackendKind::OpenVpn,
+            "image".into(),
+            &InstanceHealth {
+                compose_project_exists: true,
+                ..InstanceHealth::default()
+            },
+        );
+        assert_eq!(stopped.state, InstanceOperationalState::Stopped);
+    }
+
+    #[test]
+    fn deployment_preview_reports_impact_and_hides_sensitive_contents() {
+        let plan = DeploymentPlan {
+            id: Uuid::from_u128(10),
+            instance_id: Uuid::from_u128(11),
+            operations: vec![
+                DeploymentOperation::ReplaceFile {
+                    path: "vpn/server.conf".into(),
+                    sensitive: true,
+                },
+                DeploymentOperation::CreateBackup {
+                    name: "snapshot".into(),
+                },
+                DeploymentOperation::ComposeRestart {
+                    service: "gateway".into(),
+                },
+            ],
+            warnings: vec![],
+            desired_state_hash: "hash".into(),
+        };
+        let view = deployment_preview_view(plan, 4);
+        assert_eq!(view.impact, DeploymentImpactView::ServiceRestart);
+        assert!(view.creates_backup);
+        assert!(view.operations[0].sensitive);
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("PrivateKey"));
+        assert!(!json.contains("secret contents"));
+
+        let reinstall = deployment_preview_view(
+            DeploymentPlan {
+                id: Uuid::from_u128(12),
+                instance_id: Uuid::from_u128(13),
+                operations: vec![DeploymentOperation::ComposeUp],
+                warnings: vec![
+                    settings_change_warning(ChangeImpact::Reinstall)
+                        .unwrap()
+                        .into(),
+                ],
+                desired_state_hash: "next".into(),
+            },
+            7,
+        );
+        assert_eq!(reinstall.impact, DeploymentImpactView::Reinstall);
+        assert_eq!(reinstall.affected_clients, 7);
+    }
+
+    #[test]
+    fn client_views_are_state_and_backend_aware_without_secret_identity_data() {
+        let now = Utc::now();
+        let xray = Device {
+            id: Uuid::from_u128(30),
+            instance_id: Uuid::from_u128(31),
+            user_id: None,
+            display_name: "Browser".into(),
+            ipv4_address: None,
+            ipv6_address: None,
+            dns_name: None,
+            enabled: true,
+            backend_data: DeviceBackendData::Xray(XrayDeviceData {
+                client_id_ref: SecretReference(Uuid::from_u128(32)),
+                email: "browser@example.test".into(),
+                flow: Some("xtls-rprx-vision".into()),
+            }),
+            created_at: now,
+            deleted_at: None,
+        };
+        let xray_view = client_view(&xray, &XrayBackend.presentation());
+        assert!(xray_view.ipv4_address.is_none());
+        assert!(
+            xray_view
+                .actions
+                .iter()
+                .any(|action| action.action == ClientAction::QrExport)
+        );
+        let json = serde_json::to_string(&xray_view).unwrap();
+        assert!(!json.contains(&Uuid::from_u128(32).to_string()));
+
+        let revoked = Device {
+            id: Uuid::from_u128(33),
+            instance_id: Uuid::from_u128(34),
+            user_id: None,
+            display_name: "Laptop".into(),
+            ipv4_address: Some("10.64.0.2".parse().unwrap()),
+            ipv6_address: None,
+            dns_name: Some("laptop.internal".into()),
+            enabled: false,
+            backend_data: DeviceBackendData::OpenVpn(OpenVpnDeviceData {
+                common_name: "laptop".into(),
+                private_key_ref: SecretReference(Uuid::from_u128(35)),
+                csr_ref: SecretReference(Uuid::from_u128(36)),
+                certificate_ref: SecretReference(Uuid::from_u128(37)),
+                ca_certificate_ref: SecretReference(Uuid::from_u128(38)),
+                tls_crypt_key_ref: None,
+                certificate_serial: Some("01AB".into()),
+            }),
+            created_at: now,
+            deleted_at: None,
+        };
+        let revoked_view = client_view(&revoked, &OpenVpnBackend.presentation());
+        assert_eq!(revoked_view.state_label, "Revoked");
+        assert!(
+            revoked_view
+                .actions
+                .iter()
+                .any(|action| action.action == ClientAction::ReplaceIdentity)
+        );
+        assert!(
+            revoked_view
+                .actions
+                .iter()
+                .all(|action| action.action != ClientAction::Revoke)
+        );
+    }
+
+    #[test]
+    fn local_operational_state_uses_desired_state_and_deployment_history() {
+        let desired = command_state(VpnBackendKind::WireGuard);
+        assert_eq!(
+            local_operational_state(&desired, None, None),
+            (
+                InstanceOperationalState::NeedsDeployment,
+                StateEvidence::LocalDesiredState
+            )
+        );
+        let summary = DeploymentSummary {
+            id: Uuid::from_u128(20),
+            instance_id: desired.instance.id,
+            status: DeploymentStatus::Succeeded,
+            backup_name: Some("backup".into()),
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+        };
+        let stored = vam_storage::StoredDeployment {
+            summary: summary.clone(),
+            desired_state: desired.clone(),
+            plan: DeploymentPlan {
+                id: summary.id,
+                instance_id: summary.instance_id,
+                operations: vec![],
+                warnings: vec![],
+                desired_state_hash: "hash".into(),
+            },
+        };
+        assert_eq!(
+            local_operational_state(&desired, Some(&summary), Some(&stored)),
+            (
+                InstanceOperationalState::Unknown,
+                StateEvidence::DeploymentHistory
+            )
+        );
+        let mut changed = desired;
+        changed.instance.display_name = "Changed".into();
+        assert_eq!(
+            local_operational_state(&changed, Some(&summary), Some(&stored)).0,
+            InstanceOperationalState::NeedsDeployment
+        );
+    }
 
     #[test]
     fn host_setup_plans_are_deterministic_and_noop_when_ready() {

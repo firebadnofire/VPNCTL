@@ -4573,3 +4573,55 @@ Their first sandboxed launch hit Windows `EPERM`; the approved unsandboxed read
 of existing dependencies passed.
 
 Planned signed commit: `feat: expose backend UI metadata`.
+
+### 12B. Presentation-safe instance, client, health, and deployment views
+
+The original Tauri boundary returned persisted instances and devices almost
+verbatim, exposed raw health booleans to Svelte, and represented deployment
+operations as untyped JSON records. The application layer now constructs four
+families of public-safe views while retaining the original internal APIs for
+compatibility:
+
+- instance summaries combine the persisted public instance, a backend-aware
+  secondary/listener summary, client count, last deployment, and one operational
+  state with its evidence source;
+- instance details add host name, configured image, applicable non-secret fact
+  rows, local desired-state drift, and the last deployment backup name;
+- client views contain a Rust-built identity summary, state-specific actions,
+  implemented export formats, optional statistics, and no secret identifiers;
+- health and deployment-preview views replace backend-specific booleans and raw
+  operation JSON with named checks, impact, drift, backup behavior, identity
+  effects, and human-readable operations.
+
+List state is deliberately local and honest. A new or locally changed desired
+state is `needs_deployment`; applying work is `updating`; failed/rolled-back work
+is `error`; and a matching successful deployment is `unknown` until an explicit
+live health request returns evidence. Merely opening the Instances screen does
+not create SSH connections. Live health produces Healthy, Degraded, Stopped, or
+Needs deployment and uses backend-specific readiness labels without inventing a
+handshake check. Statistics remain `null` until a real collector exists.
+
+The client-facing Tauri API now offers client-named list commands while the
+persisted `Device` model and original commands remain intact. Certificate rows
+cannot offer Enable after revocation; they offer Replace identity instead.
+Xray rows contain no managed address and no UUID or secret-reference fragment.
+Deployment previews preserve the expected desired-state hash used by Apply, but
+show sensitive file operations only as redacted labels/path metadata.
+
+Validation for this unit:
+
+- four focused application tests passed for five-backend health labels, local
+  state derivation, typed deployment impacts/redaction, and state-aware Xray and
+  OpenVPN client views;
+- `cargo check -p vam-application` and the Tauri manifest check passed;
+- strict application Clippy passed with all targets and `-D warnings` after
+  consolidating one duplicate rebuild-impact branch that Clippy identified;
+- `cargo fmt --all -- --check` and `git diff --check` passed;
+- Svelte check passed with 0 errors and 0 warnings;
+- Vitest passed 2/2 existing frontend tests.
+
+Validation used the existing portable NASM 3.02 in the process PATH. No remote
+host, Docker appliance, or secret store was contacted. Previous signed commit:
+`f7c4ded feat: expose backend UI metadata` (good EDDSA signature).
+
+Planned signed commit: `feat: add desktop presentation views`.

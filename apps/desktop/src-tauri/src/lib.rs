@@ -3,9 +3,10 @@ use std::{path::PathBuf, sync::Arc};
 use tauri::{Manager, State};
 use uuid::Uuid;
 use vam_application::{
-    ApplicationService, BackendOptionView, CreateDeviceInput, CreateDnsHostlistInput,
-    CreateDnsRecordInput, CreateHostInput, CreateInstanceInput, DeviceView, DnsHostlist,
-    InstanceView, UpdateDeviceInput,
+    ApplicationService, BackendOptionView, ClientView, CreateDeviceInput, CreateDnsHostlistInput,
+    CreateDnsRecordInput, CreateHostInput, CreateInstanceInput, DeploymentPreviewView, DeviceView,
+    DnsHostlist, InstanceDetailView, InstanceHealthView, InstanceSummaryView, InstanceView,
+    UpdateDeviceInput,
 };
 use vam_core::{DnsRecord, DockerHost, User};
 use vam_protocol::{
@@ -124,6 +125,22 @@ async fn list_instances(
 }
 
 #[tauri::command]
+async fn list_instance_summaries(
+    state: State<'_, AppState>,
+    host_id: Option<Uuid>,
+) -> Result<Vec<InstanceSummaryView>, AppError> {
+    state.0.list_instance_summary_views(host_id).await
+}
+
+#[tauri::command]
+async fn instance_detail(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+) -> Result<InstanceDetailView, AppError> {
+    state.0.instance_detail_view(instance_id).await
+}
+
+#[tauri::command]
 fn backend_options(state: State<'_, AppState>) -> Vec<BackendOptionView> {
     state.0.backend_options()
 }
@@ -148,6 +165,14 @@ async fn plan_instance(
     instance_id: Uuid,
 ) -> Result<DeploymentPlan, AppError> {
     state.0.plan_instance(instance_id).await
+}
+
+#[tauri::command]
+async fn plan_instance_preview(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+) -> Result<DeploymentPreviewView, AppError> {
+    state.0.plan_instance_view(instance_id).await
 }
 
 #[tauri::command]
@@ -176,6 +201,22 @@ async fn stop_instance(
     instance_id: Uuid,
 ) -> Result<InstanceHealth, AppError> {
     state.0.stop_instance(instance_id).await
+}
+
+#[tauri::command]
+async fn start_instance_view(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+) -> Result<InstanceHealthView, AppError> {
+    state.0.start_instance_view(instance_id).await
+}
+
+#[tauri::command]
+async fn stop_instance_view(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+) -> Result<InstanceHealthView, AppError> {
+    state.0.stop_instance_view(instance_id).await
 }
 
 #[tauri::command]
@@ -228,6 +269,14 @@ async fn list_devices(
     instance_id: Uuid,
 ) -> Result<Vec<DeviceView>, AppError> {
     state.0.list_device_views(instance_id).await
+}
+
+#[tauri::command]
+async fn list_clients(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+) -> Result<Vec<ClientView>, AppError> {
+    state.0.list_client_views(instance_id).await
 }
 
 #[tauri::command]
@@ -351,6 +400,14 @@ async fn health(state: State<'_, AppState>, instance_id: Uuid) -> Result<Instanc
 }
 
 #[tauri::command]
+async fn health_view(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+) -> Result<InstanceHealthView, AppError> {
+    state.0.health_view(instance_id).await
+}
+
+#[tauri::command]
 async fn list_deployments(
     state: State<'_, AppState>,
     instance_id: Uuid,
@@ -419,12 +476,17 @@ pub fn run() {
             apply_host_provisioning,
             create_instance,
             list_instances,
+            list_instance_summaries,
+            instance_detail,
             backend_options,
             render_instance,
             plan_instance,
+            plan_instance_preview,
             apply_instance,
             start_instance,
             stop_instance,
+            start_instance_view,
+            stop_instance_view,
             update_images,
             delete_instance,
             create_user,
@@ -433,6 +495,7 @@ pub fn run() {
             create_device,
             update_device,
             list_devices,
+            list_clients,
             delete_device,
             replace_device_identity,
             create_dns_record,
@@ -449,6 +512,7 @@ pub fn run() {
             list_backups,
             rollback,
             health,
+            health_view,
             list_deployments,
             logs,
             cancel_deployment,

@@ -195,6 +195,42 @@ export interface VpnInstance {
   updated_at: string;
 }
 
+export type InstanceOperationalState =
+  | "healthy"
+  | "degraded"
+  | "stopped"
+  | "unknown"
+  | "needs_deployment"
+  | "updating"
+  | "error";
+
+export type DriftState = "not_checked" | "up_to_date" | "desired_changes" | "remote_drift";
+
+export interface InstanceSummary {
+  instance: VpnInstance;
+  secondary_summary: string;
+  listener_summary: string;
+  client_count: number;
+  state: InstanceOperationalState;
+  state_evidence: "local_desired_state" | "deployment_history" | "live_health";
+  observed_at?: string | null;
+  last_deployment?: DeploymentSummary | null;
+}
+
+export interface PresentationFact {
+  label: string;
+  value: string;
+}
+
+export interface InstanceDetail {
+  summary: InstanceSummary;
+  host_display_name: string;
+  configured_image: string;
+  drift: DriftState;
+  last_backup_name?: string | null;
+  facts: PresentationFact[];
+}
+
 export interface User {
   id: UUID;
   display_name: string;
@@ -232,6 +268,37 @@ export interface Device {
         backend: "xray";
         identity: { email: string; flow?: string | null };
       };
+  created_at: string;
+}
+
+export interface ClientActionView {
+  action: ClientAction;
+  label: string;
+  warning?: string | null;
+  destructive: boolean;
+}
+
+export interface ClientStatistics {
+  last_activity?: string | null;
+  received_bytes?: number | null;
+  transmitted_bytes?: number | null;
+}
+
+export interface Client {
+  id: UUID;
+  instance_id: UUID;
+  user_id?: UUID | null;
+  display_name: string;
+  ipv4_address?: string | null;
+  ipv6_address?: string | null;
+  dns_name?: string | null;
+  enabled: boolean;
+  backend: VpnBackendKind;
+  identity_summary: string;
+  state_label: string;
+  actions: ClientActionView[];
+  export_formats: ClientExportFormat[];
+  statistics?: ClientStatistics | null;
   created_at: string;
 }
 
@@ -337,6 +404,14 @@ export interface InstanceHealth {
   details: string[];
 }
 
+export interface InstanceHealthView {
+  state: InstanceOperationalState;
+  observed_at: string;
+  configured_image: string;
+  checks: Array<{ label: string; passing: boolean }>;
+  details: string[];
+}
+
 export interface DeploymentSummary {
   id: UUID;
   instance_id: UUID;
@@ -368,4 +443,30 @@ export interface DeploymentProgress {
   phase: string;
   message: string;
   technical_detail?: string;
+}
+
+export type DeploymentImpact =
+  | "no_changes"
+  | "dns_reload"
+  | "live_reload"
+  | "service_restart"
+  | "rebuild"
+  | "reinstall";
+
+export interface DeploymentPreview {
+  id: UUID;
+  instance_id: UUID;
+  operations: Array<{
+    label: string;
+    technical_detail?: string | null;
+    sensitive: boolean;
+  }>;
+  impact: DeploymentImpact;
+  creates_backup: boolean;
+  server_identity_effect: string;
+  client_effect: string;
+  affected_clients: number;
+  drift: DriftState;
+  warnings: string[];
+  desired_state_hash: string;
 }
