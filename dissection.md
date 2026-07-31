@@ -1891,4 +1891,258 @@ Staged-patch inspection follows before the signed commit.
 
 Commit:
 
-- pending full validation and signed commit.
+- `d945f5d refactor: support protected binary client exports`;
+- created with `git commit -S`;
+- `git verify-commit HEAD` reported a good EDDSA signature from William Jones
+  using key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### Unit 4b: secure IKEv2 certificate backend
+
+Status: implementation and local static validation complete. Runtime behavior
+on a real Linux Docker host remains an explicit later integration gate.
+
+#### Backend boundary and dependencies
+
+Added `crates/backend-ikev2` as an independent implementation of the shared
+`VpnBackend` contract. The crate does not call SSH, Docker, SQLite, Tauri, or
+the operating-system keychain. It receives typed desired state and resolved
+secret references, validates them, then produces:
+
+- a pinned local image/runtime specification;
+- deterministic strongSwan `swanctl` configuration;
+- a narrowly scoped idempotent container entrypoint;
+- typed CA/client credential-operation plans;
+- password-protected binary PKCS#12 client artifacts.
+
+The only new direct runtime dependency is `p12-keystore 0.3.1`. Workspace
+configuration sets `default-features = false`, deliberately excluding its
+legacy PBES1 feature. PKCS#12 output is configured explicitly for PBES2 with
+AES-256, HMAC-SHA-256, and 600,000 derivation iterations for both encryption
+and MAC material.
+
+The first dependency-resolution attempt failed because the restricted sandbox
+could not reach crates.io. The approved retry downloaded and locked the exact
+dependency graph, after which the empty crate and then the complete backend
+compiled. This was an environment/network failure, not ignored as a test
+failure.
+
+`p12-keystore` redacts its private-key type's `Debug` output, but its internal
+key representation owns a normal `Vec<u8>` and does not promise zeroization.
+The backend zeroizes decoded PEM/DER buffers and the returned artifact bytes,
+and scopes the keystore object to the builder function, but it cannot prove
+that the library's internal cloned key buffer is erased before deallocation.
+This is a documented residual in-process memory tradeoff. Replacing it would
+require a different audited PKCS#12 implementation or an upstream zeroization
+change, not an unsafe local workaround.
+
+#### Local client identity generation
+
+`Ikev2Backend::generate_identity` creates client material locally:
+
+- an ECDSA P-384/SHA-384 key in PKCS#8 PEM;
+- a PKCS#10 CSR containing the normalized per-device identity as both common
+  name and DNS subject-alternative name;
+- `digitalSignature` key usage and `clientAuth` extended key usage;
+- a nonempty 64-character lowercase hexadecimal bundle password made from two
+  independent UUIDv4 values.
+
+The identity includes the device UUID so display-name collisions cannot become
+credential collisions. Returned key, CSR, and password values use
+`Zeroizing<String>`. Tests generate two identities and prove distinct private
+keys, CSRs, identities, and passwords, plus the required P-384 CSR algorithm.
+
+The password contains approximately 244 bits of UUIDv4 randomness. It is never
+embedded in model JSON or a client artifact's serializable metadata. The later
+application integration must persist it under the existing native
+`bundle_password_ref` and provide a deliberate native recovery/export
+interaction; it must not expose the password to the Svelte webview.
+
+#### Pinned strongSwan runtime
+
+The backend declares a local image named
+`vpn-appliance-manager/ikev2:alpine3.23.5-strongswan5.9.14-r3`. Its rendered
+Dockerfile:
+
+- pins the Alpine 3.23.5 base by SHA-256 digest;
+- installs exact `strongswan=5.9.14-r3` and `iptables=1.8.11-r1` packages;
+- copies only the backend entrypoint;
+- exposes UDP 500 and UDP 4500;
+- starts through the explicit entrypoint.
+
+The runtime contract requests only `NET_ADMIN`. It does not request
+`privileged`, `SYS_MODULE`, `/dev/net/tun`, PPP devices, or host module mounts.
+It mounts the backend configuration under `/etc/swanctl`, enables IPv4
+forwarding, uses a dedicated restart policy, and describes the CA directory as
+durable data requiring backup. The listener set is always exactly UDP 500 and
+UDP 4500. Instance endpoint validation rejects a custom IKE port instead of
+rendering a configuration that cannot satisfy native client/NAT-T behavior.
+
+This unit does not prove that the pinned image can build or that Alpine's
+strongSwan file layout and charon path match the entrypoint: Docker is not
+installed in the current Windows environment. Those remain hard Linux fixture
+requirements, not inferred successes.
+
+#### Desired-state validation
+
+The backend validates the shared model and IKEv2-specific invariants before
+rendering:
+
+- the instance and settings both select IKEv2;
+- the instance network and DNS configuration pass core validation;
+- endpoint port is exactly 500;
+- server identity is a syntactically valid DNS name or IP address;
+- client-certificate lifetime is between 30 and 825 days;
+- every device uses IKEv2 data and has an allocated IPv4 address;
+- every enabled client identity is nonempty, normalized, and unique;
+- private-key, CSR, client-certificate, CA-certificate, and bundle-password
+  references all exist in issued device data;
+- certificate serials, when present, are nonempty hexadecimal strings.
+
+Legacy IKEv2 JSON can still deserialize with absent optional references, but
+render/export/credential operations reject such incomplete records until the
+application credential bootstrap fills them. This keeps schema migration
+compatible without treating missing credentials as usable.
+
+Changing the server identity is classified as `Reinstall`, because it requires
+new server certificate material. Changing the client lifetime is classified
+as a live configuration update. The test suite fixes both expectations.
+
+#### Deterministic `swanctl` configuration
+
+The renderer sorts enabled devices by UUID, then emits one IKEv2 connection and
+one single-address `/32` pool per device. The fixed pool preserves the
+application's established invariant that a device's allocated VPN address also
+drives its managed DNS records and health expectations. Device connection and
+pool names use a collision-resistant UUID prefix rather than display names.
+
+Each connection uses:
+
+- IKEv2 only (`version = 2`);
+- ECDSA certificate authentication;
+- the configured server certificate and strict CA/CRL trust anchors;
+- explicit modern IKE and ESP proposal sets with P-384 ECDH and PFS;
+- fragmentation, MOBIKE, DPD, and forced UDP encapsulation;
+- the per-device remote identity and fixed pool;
+- configured VPN DNS servers;
+- either the VPN subnet or `0.0.0.0/0` as the local traffic selector.
+
+No IKEv1, XAuth, EAP-password, PSK, DES/3DES, RC4, NULL, MD5, SHA-1, or weak
+MODP proposal is rendered. The backend currently supports IPv4 routing only;
+client artifact metadata warns that IPv6 is not routed. Tests compare sorted
+output, modern algorithms, strict CRL behavior, fixed pools, split selectors,
+and full-tunnel selectors.
+
+The one-connection-per-device selection behavior, virtual-IP assignment, and
+client interoperability still require a live strongSwan test. Static rendering
+cannot prove how charon chooses otherwise-similar certificate connections.
+
+#### Idempotent entrypoint and firewall scope
+
+The rendered entrypoint:
+
+- fails immediately on command errors;
+- adds only backend-owned policy-aware forwarding and masquerade rules;
+- checks each rule with `iptables -C` before insertion;
+- records which rules it inserted and removes only those rules on exit;
+- never flushes tables or installs a host-wide terminal policy;
+- launches charon in the foreground and tracks its PID;
+- waits for VICI readiness before `swanctl --load-all --noprompt`;
+- tears down charon and its own rules if loading fails;
+- propagates charon's exit status after cleanup.
+
+The start script intentionally fails when the CA/server certificate/CRL has not
+been initialized. The later application planner must execute
+`InitializeIkev2Authority` against durable storage before bringing the service
+up. It must not mask the missing-credential failure with placeholder files.
+
+Policy matching, XFRM state, Docker bridge forwarding, NAT-T, shutdown signal
+handling, and coexistence with an active host firewall remain Linux fixture
+tests. The script test proves command shape and absence of broad flush or
+privileged behavior, not kernel-level correctness.
+
+#### Typed certificate lifecycle
+
+The backend produces only the closed credential operations added in Unit 4a.
+Initialization requests P-384/SHA-384 CA/server material with the configured
+server identity, ten-year CA and CRL lifetimes, and the configured client
+lifetime.
+
+Issue ordering is:
+
+1. upload the locally generated CSR at mode `0600`;
+2. sign it as a P-384/SHA-384 IKEv2 client certificate;
+3. download the certificate into its opaque secret reference;
+4. download the CA certificate into its opaque secret reference;
+5. read and retain the certificate serial;
+6. reload strongSwan credentials and connections.
+
+Revoke ordering is:
+
+1. require and validate the issued serial;
+2. extend the retained CRL;
+3. reload credentials and connections;
+4. terminate active SAs for the revoked identity only after the new CRL is
+   active.
+
+Replacement issues and retrieves the new credential before revoking the old
+serial, then reloads and terminates the old identity. Tests assert operation
+types and order for issue, revoke, and replacement. No shell command is carried
+inside the plan; the later SSH integration must translate each variant to a
+fixed, validated command template.
+
+#### Protected PKCS#12 export
+
+Client export resolves the five opaque secret references, verifies that the
+stored password is nonempty, decodes only expected PEM labels, and packages:
+
+- the local PKCS#8 private key;
+- the issued leaf certificate;
+- the CA certificate, ordered as the root of the chain.
+
+The result is `ClientArtifactPayload::Binary`, suggests a normalized `.p12`
+filename, and never becomes a QR payload. The focused regression fixture now
+uses an actual CA-signed client certificate. Strict re-import proves that the
+private-key chain contains the leaf and CA, and that the correct password
+succeeds while a wrong password fails.
+
+This export intentionally refuses the legacy 3DES PKCS#12 fallback sometimes
+needed by older Apple/Android importers. Compatibility must become an explicit
+future policy with a conspicuous security tradeoff; it will not silently weaken
+every exported bundle.
+
+#### Validation
+
+The first focused run stopped after one test failure: strict PKCS#12 re-import
+returned a one-certificate chain instead of the expected leaf plus CA. The
+implementation was already including both certificates; the fixture had
+self-signed the client certificate, so chain construction correctly could not
+associate its issuer with the separate CA. The fixture was corrected to have
+the CA sign the client certificate, after which all eight backend tests passed.
+
+The next focused run stopped at two clippy findings—an unnecessary raw-string
+delimiter and an explicit elidable lifetime. Both were corrected without
+changing behavior.
+
+The complete gate then passed:
+
+- `cargo fmt --all` and `cargo fmt --all -- --check`;
+- `cargo test -p vam-backend-ikev2`: 8 tests;
+- `cargo clippy -p vam-backend-ikev2 --all-targets -- -D warnings`;
+- `cargo check --workspace`;
+- `cargo test --workspace`: 71 tests;
+- `cargo clippy --workspace --all-targets -- -D warnings`.
+
+Still unvalidated because the necessary runtime is unavailable:
+
+- building the pinned IKEv2 image;
+- Compose build-context wiring;
+- strongSwan startup and `swanctl --load-all`;
+- CA/server initialization and persistence;
+- real Windows, Apple, Android, and strongSwan-client imports;
+- UDP 500/4500 reachability, NAT-T, XFRM, fixed-address selection, DNS,
+  full/split routing, CRL enforcement, and active-SA termination;
+- backup, restore, image update, rollback, and host-firewall coexistence.
+
+Commit:
+
+- pending staged-patch inspection and signed commit.

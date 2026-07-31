@@ -6,6 +6,7 @@ members = [
   "crates/application",
   "crates/backend",
   "crates/backend-amneziawg",
+  "crates/backend-ikev2",
   "crates/backend-openvpn",
   "crates/backend-wireguard",
   "crates/core",
@@ -30,6 +31,7 @@ chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.48", features = ["derive"] }
 ipnet = { version = "2.11.0", features = ["serde"] }
 keyring = { version = "4.1.5", default-features = false, features = ["v1", "apple-native-keyring-store"] }
+p12-keystore = { version = "0.3.1", default-features = false }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "ring"] }
 reqwest = { version = "0.12.25", default-features = false, features = ["native-tls"] }
