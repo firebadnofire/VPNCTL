@@ -74,8 +74,11 @@ impl VpnBackend for AmneziaWgBackend {
         }
     }
 
-    fn runtime(&self) -> BackendRuntimeSpec {
-        BackendRuntimeSpec {
+    fn runtime(&self, settings: &BackendSettings) -> Result<BackendRuntimeSpec, BackendError> {
+        if !matches!(settings, BackendSettings::AmneziaWg(_)) {
+            return Err(BackendError::BackendMismatch(self.kind()));
+        }
+        Ok(BackendRuntimeSpec {
             image: ContainerImage::Pull(AMNEZIAWG_IMAGE),
             container_listeners: vec![ListenerPort {
                 port: AWG_CONTAINER_PORT,
@@ -107,7 +110,7 @@ impl VpnBackend for AmneziaWgBackend {
                 tool: "awg",
                 interface: "awg0",
             },
-        }
+        })
     }
 
     fn listeners(&self, settings: &BackendSettings, endpoint_port: u16) -> Vec<ListenerPort> {
@@ -539,7 +542,9 @@ mod tests {
 
     #[test]
     fn runtime_is_awg2_specific_pinned_and_least_privilege() {
-        let runtime = AmneziaWgBackend.runtime();
+        let runtime = AmneziaWgBackend
+            .runtime(&BackendSettings::AmneziaWg(AmneziaWgSettings::default()))
+            .unwrap();
         assert!(matches!(
             runtime.image,
             ContainerImage::Pull(image) if image.contains(":2.0.0@sha256:")

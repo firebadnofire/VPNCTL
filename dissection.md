@@ -461,7 +461,7 @@ a routable address.
   handshake and transfer health/statistics.
 - **AWG2:** the WireGuard identity lifecycle plus matching server/client
   obfuscation parameters and AWG-specific validation/health commands.
-- **OpenVPN:** local RSA private key and CSR, upload only the CSR for remote CA
+- **OpenVPN:** local ECDSA P-256 private key and CSR, upload only the CSR for remote CA
   signing, retrieve CA/client certificate and TLS material, assemble `.ovpn`
   locally, list issued identities, revoke through the CA/CRL, replace by a new
   key/CSR, and never persist private keys remotely.
@@ -1070,9 +1070,9 @@ individually inspectable and validateable.
 
 `VpnBackend::plan_credentials` has a fail-closed default that returns
 `UnsupportedCredentialOperation`. WireGuard and AWG therefore cannot
-accidentally accept a certificate action. OpenVPN will implement the complete
-plan in Unit 3b, and IKEv2 can extend the closed operation enum with its own
-explicit variants later.
+accidentally accept a certificate action. OpenVPN implements the complete plan
+in Unit 3b, and IKEv2 can extend the closed operation enum with its own explicit
+variants later.
 
 #### Pull and local-build runtime images
 
@@ -1081,7 +1081,7 @@ Changed `BackendRuntimeSpec.image` from a string to `ContainerImage`:
 - `Pull` is for an externally built tag-and-digest reference;
 - `Build` identifies a deterministic local tag and a rendered Dockerfile.
 
-WireGuard and AWG are explicitly `Pull` runtimes. OpenVPN will be `Build`
+WireGuard and AWG are explicitly `Pull` runtimes. OpenVPN is `Build`
 because no current, official, maintained OpenVPN Community server image with
 Easy-RSA was found. Using the adjacent `amneziavpn/openvpn:2.6.3` image would
 freeze an OpenVPN release from more than two years ago. A digest-pinned current
@@ -1124,6 +1124,360 @@ Passing checks:
 
 The new regression test proves that all five OpenVPN secret references are
 retention-visible and that TLS-crypt is the default.
+
+Commit:
+
+- `a4bc758 refactor: model certificate credential lifecycle`;
+- created with `git commit -S`;
+- `git verify-commit HEAD` reported a good EDDSA signature from William Jones
+  using key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### Unit 3b: OpenVPN certificate backend
+
+Status: complete at the backend contract boundary. Local identity generation,
+deterministic server/client rendering, runtime declaration, typed CA
+operations, change classification, and unit coverage are implemented in
+`crates/backend-openvpn`. Registration in the application service, translation
+of credential operations into verified SSH commands, generic Compose
+generation, and fresh-host integration are intentionally later units. This
+distinction matters: the crate is functional and tested, but this commit alone
+does not claim that the desktop can provision a live OpenVPN instance.
+
+#### Behavioral reference and retained architecture
+
+The adjacent Amnezia client was used as a behavioral map for:
+
+- Easy-RSA authority initialization and persistent PKI storage;
+- a locally generated client key followed by CSR import and signing;
+- retrieval of the CA, issued certificate, and static TLS material;
+- client enumeration by certificate identity;
+- revocation, CRL regeneration, and gateway reload;
+- UDP/TCP listener selection and inline `.ovpn` output.
+
+The implementation does not copy Amnezia's raw shell-template substitution,
+remote client-private-key generation, raw `docker run`, or mutable/old image
+choices. Protocol behavior is represented through `VpnBackend`, rendered
+files, `BackendRuntimeSpec`, and the typed `CredentialPlan` introduced in Unit
+3a. The existing application/SSH/deployment layers remain the sole future
+authority for host trust, authentication, transfer, exit status, timeout,
+redaction, snapshots, and rollback.
+
+#### New workspace crate and dependency
+
+Added `crates/backend-openvpn` and registered it as a workspace member. The
+crate depends only on existing internal contracts plus `rcgen 0.14.8`,
+configured without its default features and with the explicit `crypto`, `pem`,
+and `ring` features needed for local key and PKCS#10 request generation.
+
+`Cargo.lock` consequently adds `rcgen`, `ring`, `x509-parser`, ASN.1/DER
+parsing support, PEM support, and their transitive dependencies. Cargo also
+coalesced several permissive existing Windows dependency edges onto the
+already-selected `windows-sys 0.61.2`; no application source was changed to
+depend on Windows-specific behavior.
+
+The first dependency resolution attempt could not reach crates.io from the
+restricted sandbox. It was repeated with the required network approval and
+completed normally. No machine-level package was installed.
+
+#### Local client identity generation
+
+`OpenVpnBackend::generate_identity` creates client identity material locally:
+
+- a new ECDSA P-256 key pair per device;
+- a PKCS#8 PEM private key retained in `Zeroizing<String>`;
+- a PKCS#10 PEM CSR retained in `Zeroizing<String>`;
+- `DigitalSignature` key usage;
+- `ClientAuth` extended key usage;
+- a deterministic common name derived from the display-name slug and UUID.
+
+The private key never becomes part of server rendering or typed credential
+operations. The server receives only the CSR through a `SecretReference`.
+This preserves the product rule that client private keys do not need to leave
+the local application.
+
+The common name is deliberately narrower than an arbitrary X.509 string. It
+must be 1-63 lowercase ASCII letters, digits, or hyphens; must start and end
+with an alphanumeric character; and must be unique among active identities.
+That makes it safe for Easy-RSA arguments, certificate identity matching, and
+CCD filenames without relying on last-minute shell escaping.
+
+The initial `rcgen` compile revealed that `CertificateParams` is
+`#[non_exhaustive]`. Construction was corrected to use `Default` followed by
+explicit field assignment. A subsequent test compile exposed a mutable borrow
+held across server rendering; the mutation was scoped before the render call.
+Both failures were diagnosed directly and the exact test target passed after
+each fix.
+
+#### Runtime and supply-chain declaration
+
+No current official OpenVPN Community server image containing the required
+Easy-RSA workflow was available. The adjacent `amneziavpn/openvpn:2.6.3`
+image is materially stale. The backend therefore declares a deterministic
+local image build:
+
+- local tag:
+  `vpn-appliance-manager/openvpn:alpine3.23.5-openvpn2.6.20-r0-easyrsa3.2.3-r0`;
+- Dockerfile path: `vpn/Dockerfile`;
+- base:
+  `alpine:3.23.5@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40`;
+- `openvpn=2.6.20-r0`;
+- `easy-rsa=3.2.3-r0`;
+- `iptables=1.8.11-r1`.
+
+Both the base image identity and installed package versions are fixed. The
+image has no mutable `latest` dependency and does not download an unchecked
+archive during the build.
+
+The declared runtime uses:
+
+- only `NET_ADMIN`, not `--privileged`;
+- only `/dev/net/tun`;
+- a writable per-instance `vpn` mount at `/etc/openvpn` so CA, server identity,
+  CRL, CCD files, and allocation state survive container replacement;
+- only the container-scoped `net.ipv4.ip_forward=1` sysctl;
+- internal port 1194 with the configured TCP or UDP transport;
+- the configured external listener port declared separately for host
+  firewall and Compose publication;
+- an OpenVPN-specific config validation and health probe.
+
+`VpnBackend::runtime` now accepts the typed settings and returns
+`Result<BackendRuntimeSpec, BackendError>`. That change is necessary because
+OpenVPN's container listener protocol is configuration-dependent. WireGuard
+and AWG were updated to fail closed on mismatched settings and retain their
+existing pinned pull runtimes.
+
+Docker is not installed in this Windows development environment. The rendered
+Dockerfile was inspected and asserted in tests, but an actual image build is
+not reported as passing. A Linux/Docker integration fixture must build it
+before the live-provisioning milestone.
+
+#### Deterministic server artifacts
+
+The server renderer produces:
+
+- `vpn/Dockerfile`, mode `0644`;
+- `vpn/server.conf`, mode `0600`;
+- `vpn/start-openvpn.sh`, mode `0700`;
+- deterministic directory anchors for `vpn/ccd` and `vpn/requests`;
+- one mode-`0600` CCD file for every enabled, non-deleted device.
+
+Devices are sorted by validated common name before CCD rendering. Each CCD
+contains an `ifconfig-push` for the address allocated by the shared core and
+the instance subnet's actual netmask. Disabled and deleted identities are not
+admitted by `ccd-exclusive`.
+
+The server configuration uses:
+
+- TUN with `topology subnet`;
+- a fixed container port and the selected `udp` or `tcp-server` transport;
+- a persistent CA, server certificate/key, CRL, CCD directory, and IP
+  allocation file under `/etc/openvpn`;
+- `dh none` with `ecdh-curve prime256v1`;
+- an explicit TLS-server role;
+- required client certificates and client-auth EKU checking;
+- TLS 1.3 as the minimum protocol;
+- the preferred OpenVPN certificate profile;
+- only AES-256-GCM or ChaCha20-Poly1305 as a typed data cipher;
+- SHA-256 control-channel authentication;
+- compression disabled;
+- CRL enforcement;
+- `tls-crypt` by default;
+- the managed private DNS gateway;
+- full-tunnel redirect plus IPv6 blocking, or a subnet-specific split route.
+
+There is no `duplicate-cn`, no password-only authentication, and no
+unvalidated custom OpenVPN directive field. Client private keys are absent
+from every server artifact.
+
+`tls-crypt` version 1 uses shared group material. It hides and authenticates
+the control channel and is materially stronger than an unprotected control
+channel, but compromise of one exported profile exposes that shared static
+key. It is the current typed default because it matches the requested
+retrievable TLS-material lifecycle. A future `tls-crypt-v2` mode would improve
+per-client key isolation and should be added as its own typed setting and
+credential operations rather than silently changing file semantics.
+
+#### Idempotent container networking
+
+The rendered entrypoint:
+
+- uses `set -eu`;
+- checks every iptables rule with `iptables -C` before insertion;
+- permits ingress from `tun0`;
+- permits only established/related return traffic toward `tun0`;
+- masquerades only the configured VPN subnet through `eth0`;
+- starts OpenVPN as a tracked foreground child;
+- traps normal termination signals;
+- removes only the rules it owns on shutdown;
+- waits for the actual OpenVPN process and returns its result.
+
+It does not call `killall`, flush a table, alter unrelated host sysctls, or
+globally block ICMP. Repeated starts do not accumulate duplicate rules.
+
+#### Client profile export
+
+`.ovpn` profiles are rendered only in Rust and only after all required secret
+references have been resolved. Before embedding, the renderer validates and
+extracts exactly one expected PEM block for:
+
+- the local PKCS#8 private key;
+- the issued client certificate;
+- the CA certificate.
+
+When selected, it also validates the exact OpenVPN static-key fence and
+hex-only body before emitting an inline `<tls-crypt>` block. Comments or
+unexpected data surrounding validated material are discarded. Missing,
+mismatched, nil, malformed, or unexpected TLS references fail closed.
+
+Profiles include:
+
+- the configured endpoint host and external port;
+- `udp` or `tcp-client`;
+- UDP-only `explicit-exit-notify 1`;
+- server certificate role verification;
+- exact generated server common-name verification;
+- TLS 1.3 minimum and the selected modern data cipher;
+- `auth-nocache`;
+- compression disabled;
+- full- or split-tunnel routes;
+- the private DNS gateway;
+- inline CA, client certificate, local private key, and optional TLS key.
+
+Endpoint hosts are accepted only when they parse as an IP address or pass a
+strict DNS-name validator. Newlines, whitespace, shell/config metacharacters,
+empty labels, and overlong labels are rejected, preventing a hostname from
+injecting additional OpenVPN directives.
+
+The generated profile is returned through the backend's secret-bearing
+`ClientArtifact` boundary. It is not a DTO exposed to Svelte. The application
+export adapter remains responsible for writing it directly to a user-selected
+path.
+
+#### CA, issue, revoke, and replacement plans
+
+Authority initialization declares:
+
+- an instance-derived CA common name;
+- an instance-derived server common name;
+- a 3,650-day CA lifetime;
+- the configured client/server certificate lifetime;
+- a 3,650-day CRL lifetime;
+- whether a `tls-crypt` key is required.
+
+Client certificate lifetime is validated to 30-825 days. CA and CRL lifetimes
+are explicit operation fields rather than hidden Easy-RSA environment
+defaults.
+
+Issuance is ordered as:
+
+1. upload the local CSR reference with mode `0600`;
+2. import the CSR under the validated common name;
+3. sign it as a client certificate for the configured lifetime;
+4. download the certificate directly into its secret reference;
+5. download the CA certificate directly into its secret reference;
+6. when configured, download the static TLS key directly into its reference;
+7. read the issued serial as non-secret identity metadata.
+
+Revocation is ordered as certificate revocation, CRL regeneration with the
+explicit lifetime, then gateway reload.
+
+Replacement first completes issuance and retrieval of the new identity. Only
+then does it revoke the validated previous identity, regenerate the CRL, and
+reload. A signing or retrieval failure therefore cannot revoke the currently
+working identity first.
+
+The operation list is declarative. No Easy-RSA command string or remote path
+derived from unchecked user input enters the backend result. The later SSH
+adapter must implement every variant with fixed argument-safe commands, check
+the real remote exit code, and perform downloads directly into the native
+secret store.
+
+#### Capabilities and update impact
+
+The backend advertises routed address allocation, managed DNS, live identity
+updates, traffic statistics, and a certificate authority. It intentionally
+does not advertise quick peer refresh or QR export.
+
+Settings change impact is conservative but not destructive:
+
+- unchanged settings and certificate-lifetime-only changes are live-update
+  class;
+- cipher, transport, and TLS-protection changes require a service restart;
+- changing to or from another backend kind is reinstall class.
+
+Transport and TLS-protection changes were initially classified as reinstall.
+Review found that neither rotates the CA or requires rebuilding the image.
+They were corrected to service restart and covered by a regression test so
+the future planner will not present those safe changes as destructive
+reinstalls.
+
+#### Validation and failure history
+
+The backend rejects:
+
+- backend/settings/device variant mismatches;
+- invalid instance networks or device address allocation;
+- certificate lifetimes outside 30-825 days;
+- unsafe or duplicate active common names;
+- nil secret references;
+- missing or unexpected `tls-crypt` references;
+- malformed certificate serials;
+- endpoint hosts that could inject config;
+- missing or malformed client export material.
+
+Development checks deliberately stopped on each failure:
+
+1. the restricted network prevented crates.io resolution; dependency fetching
+   was rerun only after approval;
+2. `rcgen` non-exhaustive construction failed compilation and was replaced by
+   explicit post-default field assignment;
+3. a test borrow crossed a render call and was scoped correctly;
+4. strict clippy rejected field reassignment after `Default`, so fixtures were
+   changed to struct-update construction;
+5. the new TCP/full-tunnel test first failed formatting, so the formatter ran
+   before any behavioral check continued;
+6. strict clippy rejected an implicit test-only `Default` type, so
+   `WireGuardSettings::default()` was named explicitly.
+
+Passing checks after the final code change:
+
+- `cargo fmt --all -- --check`;
+- `cargo test -p vam-backend-openvpn`: 8 tests;
+- `cargo clippy -p vam-backend-openvpn --all-targets -- -D warnings`;
+- `cargo check --workspace --all-targets`;
+- `cargo test --workspace`: 61 tests;
+- `cargo clippy --workspace --all-targets -- -D warnings`.
+
+The OpenVPN tests prove:
+
+- unique local ECDSA keys and PKCS#10 CSRs;
+- deterministic server rendering;
+- pinned local-build inputs and least container privilege;
+- dynamic TCP/UDP runtime declarations;
+- fixed CCD address rendering;
+- no client private keys in server files;
+- modern TLS/cipher/compression policy;
+- split-tunnel UDP profiles with TLS protection;
+- full-tunnel TCP profiles without TLS protection;
+- UDP-only exit notification;
+- correct issue/revoke/replacement ordering;
+- issue-before-revoke replacement safety;
+- injection, common-name, and secret-reference rejection;
+- non-destructive transport/TLS change classification.
+
+Remaining validation before OpenVPN can be called provisionable:
+
+- implement typed credential operations in the verified SSH executor;
+- teach generic Compose rendering to build this local image and map the
+  selected TCP/UDP host listener;
+- integrate persistent PKI paths into snapshots, backups, and restore;
+- validate Easy-RSA initialization/sign/revoke/CRL commands in a disposable
+  Linux Docker fixture;
+- build the Dockerfile and run config validation;
+- exercise health, statistics, CA persistence, revoke, replacement, image
+  upgrade, rollback, custom port, and both transports end to end;
+- wire secret-store creation/retrieval and direct export through application,
+  CLI, and desktop boundaries.
 
 Commit:
 

@@ -52,8 +52,11 @@ impl VpnBackend for WireGuardBackend {
         }
     }
 
-    fn runtime(&self) -> BackendRuntimeSpec {
-        BackendRuntimeSpec {
+    fn runtime(&self, settings: &BackendSettings) -> Result<BackendRuntimeSpec, BackendError> {
+        if !matches!(settings, BackendSettings::WireGuard(_)) {
+            return Err(BackendError::BackendMismatch(self.kind()));
+        }
+        Ok(BackendRuntimeSpec {
             image: ContainerImage::Pull(WIREGUARD_IMAGE),
             container_listeners: vec![ListenerPort {
                 port: 51_820,
@@ -85,7 +88,7 @@ impl VpnBackend for WireGuardBackend {
                 tool: "wg",
                 interface: "wg0",
             },
-        }
+        })
     }
 
     fn listeners(&self, settings: &BackendSettings, endpoint_port: u16) -> Vec<ListenerPort> {

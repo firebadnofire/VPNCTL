@@ -130,7 +130,9 @@ pub enum CredentialOperation {
     InitializeOpenVpnAuthority {
         ca_common_name: String,
         server_common_name: String,
+        ca_lifetime_days: u16,
         certificate_lifetime_days: u16,
+        crl_lifetime_days: u16,
         tls_crypt: bool,
     },
     UploadSecret {
@@ -157,7 +159,9 @@ pub enum CredentialOperation {
     RevokeOpenVpnClient {
         common_name: String,
     },
-    RegenerateOpenVpnCrl,
+    RegenerateOpenVpnCrl {
+        lifetime_days: u16,
+    },
     ReloadGateway,
 }
 
@@ -192,12 +196,14 @@ pub enum BackendError {
         backend: VpnBackendKind,
         operation: &'static str,
     },
+    #[error("backend {0} credential operation requires a device identity")]
+    MissingCredentialDevice(VpnBackendKind),
 }
 
 pub trait VpnBackend: Send + Sync {
     fn kind(&self) -> VpnBackendKind;
     fn capabilities(&self) -> BackendCapabilities;
-    fn runtime(&self) -> BackendRuntimeSpec;
+    fn runtime(&self, settings: &BackendSettings) -> Result<BackendRuntimeSpec, BackendError>;
     fn listeners(&self, settings: &BackendSettings, endpoint_port: u16) -> Vec<ListenerPort>;
     fn validate(&self, state: &DesiredState) -> Result<(), BackendError>;
     fn server_secret_references(&self, state: &DesiredState) -> Vec<SecretReference>;
