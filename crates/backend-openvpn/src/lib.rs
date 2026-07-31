@@ -332,16 +332,16 @@ impl VpnBackend for OpenVpnBackend {
             config.push_str(&format!("<tls-crypt>\n{key}\n</tls-crypt>\n"));
         }
 
-        Ok(ClientArtifact {
-            suggested_filename: format!("{}.ovpn", slug(&device.display_name)),
-            contents: config,
-            ipv6_warning: state
+        Ok(ClientArtifact::text(
+            format!("{}.ovpn", slug(&device.display_name)),
+            config,
+            state
                 .instance
                 .network
                 .ipv6_subnet
                 .is_none()
                 .then(|| "IPv6 is blocked because this OpenVPN instance routes IPv4 only.".into()),
-        })
+        ))
     }
 
     fn client_artifact_kind(&self) -> ClientArtifactKind {
@@ -385,7 +385,9 @@ impl VpnBackend for OpenVpnBackend {
                     CredentialOperation::ReloadGateway,
                 ]
             }
-            CredentialAction::Replace { previous_identity } => {
+            CredentialAction::Replace {
+                previous_identity, ..
+            } => {
                 validate_common_name(&previous_identity)?;
                 let data = openvpn_device(device, self.kind())?;
                 let mut operations = issue_operations(settings, data);
@@ -934,14 +936,15 @@ mod tests {
             .unwrap();
 
         assert_eq!(artifact.suggested_filename, "work-laptop.ovpn");
-        assert!(artifact.contents.contains("proto udp"));
-        assert!(artifact.contents.contains("explicit-exit-notify 1"));
-        assert!(artifact.contents.contains("tls-version-min 1.3"));
-        assert!(artifact.contents.contains("verify-x509-name vam-server-"));
-        assert!(artifact.contents.contains("route 10.88.0.0 255.255.255.0"));
-        assert!(artifact.contents.contains("<tls-crypt>"));
-        assert!(!artifact.contents.contains("# generated"));
-        assert!(!artifact.contents.contains("redirect-gateway"));
+        let contents = artifact.contents.as_text().unwrap();
+        assert!(contents.contains("proto udp"));
+        assert!(contents.contains("explicit-exit-notify 1"));
+        assert!(contents.contains("tls-version-min 1.3"));
+        assert!(contents.contains("verify-x509-name vam-server-"));
+        assert!(contents.contains("route 10.88.0.0 255.255.255.0"));
+        assert!(contents.contains("<tls-crypt>"));
+        assert!(!contents.contains("# generated"));
+        assert!(!contents.contains("redirect-gateway"));
     }
 
     #[test]
@@ -975,15 +978,12 @@ mod tests {
         let client = OpenVpnBackend
             .render_client(&state, &device, &secrets)
             .unwrap();
-        assert!(client.contents.contains("proto tcp-client"));
-        assert!(
-            client
-                .contents
-                .contains("redirect-gateway def1 bypass-dhcp")
-        );
-        assert!(client.contents.contains("block-ipv6"));
-        assert!(!client.contents.contains("<tls-crypt>"));
-        assert!(!client.contents.contains("explicit-exit-notify"));
+        let client_contents = client.contents.as_text().unwrap();
+        assert!(client_contents.contains("proto tcp-client"));
+        assert!(client_contents.contains("redirect-gateway def1 bypass-dhcp"));
+        assert!(client_contents.contains("block-ipv6"));
+        assert!(!client_contents.contains("<tls-crypt>"));
+        assert!(!client_contents.contains("explicit-exit-notify"));
     }
 
     #[test]
@@ -1023,6 +1023,7 @@ mod tests {
                 Some(&device),
                 CredentialAction::Replace {
                     previous_identity: "retired-client-01".into(),
+                    previous_certificate_serial: None,
                 },
             )
             .unwrap();

@@ -115,7 +115,16 @@ pub enum CredentialAction {
     InitializeAuthority,
     Issue,
     Revoke,
-    Replace { previous_identity: String },
+    Replace {
+        previous_identity: String,
+        previous_certificate_serial: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CertificateKeyAlgorithm {
+    EcdsaP256Sha256,
+    EcdsaP384Sha384,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -161,6 +170,28 @@ pub enum CredentialOperation {
     },
     RegenerateOpenVpnCrl {
         lifetime_days: u16,
+    },
+    InitializeIkev2Authority {
+        ca_common_name: String,
+        server_identity: String,
+        key_algorithm: CertificateKeyAlgorithm,
+        ca_lifetime_days: u16,
+        certificate_lifetime_days: u16,
+        crl_lifetime_days: u16,
+    },
+    SignIkev2Client {
+        identity: String,
+        relative_path: String,
+        certificate_lifetime_days: u16,
+        key_algorithm: CertificateKeyAlgorithm,
+    },
+    RevokeIkev2Client {
+        identity: String,
+        certificate_serial: String,
+        crl_lifetime_days: u16,
+    },
+    TerminateIkev2Identity {
+        identity: String,
     },
     ReloadGateway,
 }

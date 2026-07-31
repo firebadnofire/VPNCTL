@@ -280,16 +280,16 @@ impl VpnBackend for AmneziaWgBackend {
             state.instance.endpoint.port,
             state.instance.persistent_keepalive,
         );
-        Ok(ClientArtifact {
-            suggested_filename: format!("{}.conf", slug(&device.display_name)),
-            contents: output,
-            ipv6_warning: state
+        Ok(ClientArtifact::text(
+            format!("{}.conf", slug(&device.display_name)),
+            output,
+            state
                 .instance
                 .network
                 .ipv6_subnet
                 .is_none()
                 .then(|| "IPv6 is not routed by this IPv4-only instance.".into()),
-        })
+        ))
     }
 
     fn client_artifact_kind(&self) -> ClientArtifactKind {
@@ -496,6 +496,7 @@ mod tests {
         let client = AmneziaWgBackend
             .render_client(&state, &device, &secrets)
             .unwrap();
+        let client_contents = client.contents.as_text().unwrap();
         for expected in [
             "Jc = 5",
             "S3 = 32",
@@ -504,11 +505,11 @@ mod tests {
             "H4 = 3000-3999",
         ] {
             assert!(server.contents.contains(expected));
-            assert!(client.contents.contains(expected));
+            assert!(client_contents.contains(expected));
         }
         assert!(server.contents.contains("PresharedKey = unique-peer-psk"));
         assert!(!server.contents.contains("client-private"));
-        assert!(client.contents.contains("AllowedIPs = 10.64.0.0/24"));
+        assert!(client_contents.contains("AllowedIPs = 10.64.0.0/24"));
         let start_script = first
             .iter()
             .find(|file| file.path == "vpn/start-awg.sh")

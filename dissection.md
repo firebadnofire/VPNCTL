@@ -1758,4 +1758,137 @@ Later integration units:
 
 Commit:
 
-- pending staged-diff validation and signed planning commit.
+- `8827773 docs: plan secure IKEv2 backend`;
+- created with `git commit -S`;
+- `git verify-commit HEAD` reported a good EDDSA signature from William Jones
+  using key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### Unit 4a: binary artifact and IKEv2 credential contract
+
+Status: complete. This unit changes the secret-bearing export boundary and
+credential model required by the IKEv2 backend without implementing strongSwan
+behavior.
+
+#### Zeroizing text-or-binary client artifacts
+
+Replaced `ClientArtifact.contents: String` with
+`ClientArtifactPayload`, a closed internal enum:
+
+- `Text(Zeroizing<String>)`;
+- `Binary(Zeroizing<Vec<u8>>)`.
+
+The payload offers only explicit operations:
+
+- `as_text()` returns `None` for binary data;
+- `as_bytes()` supports private file export for both forms;
+- `is_binary()` permits capability/error decisions;
+- `ClientArtifact::text` and `ClientArtifact::binary` make construction
+  explicit at each backend.
+
+Its custom `Debug` implementation reports only payload kind and byte length,
+with contents shown as `[REDACTED]`. Serde skips the entire field in both
+directions, so text configurations and future PKCS#12 bytes cannot be returned
+by a Tauri command merely because an internal artifact is serialized. The
+default used when deserializing skipped metadata is an empty zeroizing text
+payload.
+
+WireGuard, AWG, and OpenVPN now construct text artifacts through the explicit
+constructor. Their tests obtain text through `as_text()` rather than assuming
+every future backend is UTF-8.
+
+The application QR path now fails with `qr_not_supported` when it receives a
+binary artifact. It does not reinterpret arbitrary certificate bytes as text
+or pass them into the QR encoder. The remediation directs the caller to the
+private-file export. The direct export path uses `as_bytes()` and retains the
+existing private file creation semantics.
+
+`vam-protocol` now depends on the already-pinned workspace `zeroize` crate and
+uses the already-present `serde_json` only for its regression test. No new
+runtime crypto or platform dependency was introduced in this sub-unit.
+
+The new protocol regression test proves:
+
+- text and binary access are distinct;
+- bytes are preserved;
+- text and binary secret markers do not appear in debug output;
+- neither payload appears in serialized `ClientArtifact` metadata.
+
+#### Backward-compatible IKEv2 device material
+
+Expanded `Ikev2DeviceData` with optional opaque references for:
+
+- the local PKCS#8 client private key;
+- the local PKCS#10 CSR;
+- the downloaded client certificate;
+- the downloaded CA certificate.
+
+The existing required `bundle_password_ref` and optional certificate serial are
+retained. Each new field uses `#[serde(default)]`, so device JSON written by the
+earlier multi-backend model—with only identity, password reference, and
+serial—continues to deserialize. Missing references mean the credential has
+not yet been issued; the IKEv2 backend will reject export or credential actions
+that require absent material.
+
+`DeviceBackendData::secret_references` now retains the password and every
+present IKEv2 key/CSR/certificate reference. SQLite still stores only these
+UUID references in `model_json`; no certificate or private material is added
+to the database.
+
+The new core regression test proves both:
+
+- old IKEv2 JSON backfills all four new fields to `None`;
+- a fully issued identity exposes all five secret references to snapshot
+  retention.
+
+#### Typed IKEv2 credential operations
+
+Added `CertificateKeyAlgorithm` with explicit P-256/SHA-256 and
+P-384/SHA-384 values. The IKEv2 backend will select only P-384/SHA-384; the
+P-256 value makes the contract capable of describing the existing OpenVPN
+policy without a future stringly typed algorithm field.
+
+Added closed `CredentialOperation` variants for:
+
+- `InitializeIkev2Authority`, including CA common name, server identity, key
+  algorithm, CA/certificate/CRL lifetimes;
+- `SignIkev2Client`, including identity, relative CSR path, lifetime, and key
+  algorithm;
+- `RevokeIkev2Client`, including identity, certificate serial, and CRL
+  lifetime;
+- `TerminateIkev2Identity`, making active-SA termination part of revocation
+  instead of an output-string heuristic.
+
+The existing generic upload, download-to-secret, serial-read, reload, and plan
+types remain shared. There is still no arbitrary command or shell-text
+operation.
+
+`CredentialAction::Replace` now carries
+`previous_certificate_serial: Option<String>` alongside the previous identity.
+OpenVPN intentionally ignores the optional serial and retains its common-name
+revocation flow. Its replacement regression fixture explicitly supplies
+`None`. IKEv2 will require and validate `Some(serial)` before planning a
+replacement.
+
+#### Validation
+
+The first focused gate passed without a code or test failure:
+
+- `cargo fmt --all -- --check`;
+- `cargo test -p vam-protocol -p vam-core -p vam-backend
+  -p vam-backend-wireguard -p vam-backend-amneziawg
+  -p vam-backend-openvpn -p vam-application`: 35 tests;
+- strict clippy over the same packages and all targets with `-D warnings`.
+
+Full workspace validation also passed:
+
+- `cargo check --workspace --all-targets`;
+- `cargo test --workspace`: 63 tests;
+- `cargo clippy --workspace --all-targets -- -D warnings`;
+- `cargo fmt --all -- --check`;
+- `git diff --check`.
+
+Staged-patch inspection follows before the signed commit.
+
+Commit:
+
+- pending full validation and signed commit.

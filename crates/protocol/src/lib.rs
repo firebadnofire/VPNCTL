@@ -1,7 +1,10 @@
+use std::fmt;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RenderedFile {
@@ -11,12 +14,90 @@ pub struct RenderedFile {
     pub sensitive: bool,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub enum ClientArtifactPayload {
+    Text(Zeroizing<String>),
+    Binary(Zeroizing<Vec<u8>>),
+}
+
+impl ClientArtifactPayload {
+    pub fn text(contents: impl Into<String>) -> Self {
+        Self::Text(Zeroizing::new(contents.into()))
+    }
+
+    pub fn binary(contents: Vec<u8>) -> Self {
+        Self::Binary(Zeroizing::new(contents))
+    }
+
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(contents) => Some(contents.as_str()),
+            Self::Binary(_) => None,
+        }
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Text(contents) => contents.as_bytes(),
+            Self::Binary(contents) => contents.as_slice(),
+        }
+    }
+
+    pub const fn is_binary(&self) -> bool {
+        matches!(self, Self::Binary(_))
+    }
+}
+
+impl Default for ClientArtifactPayload {
+    fn default() -> Self {
+        Self::text(String::new())
+    }
+}
+
+impl fmt::Debug for ClientArtifactPayload {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = if self.is_binary() { "binary" } else { "text" };
+        formatter
+            .debug_struct("ClientArtifactPayload")
+            .field("kind", &kind)
+            .field("bytes", &self.as_bytes().len())
+            .field("contents", &"[REDACTED]")
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClientArtifact {
     pub suggested_filename: String,
-    #[serde(skip_serializing)]
-    pub contents: String,
+    #[serde(skip)]
+    pub contents: ClientArtifactPayload,
     pub ipv6_warning: Option<String>,
+}
+
+impl ClientArtifact {
+    pub fn text(
+        suggested_filename: impl Into<String>,
+        contents: impl Into<String>,
+        ipv6_warning: Option<String>,
+    ) -> Self {
+        Self {
+            suggested_filename: suggested_filename.into(),
+            contents: ClientArtifactPayload::text(contents),
+            ipv6_warning,
+        }
+    }
+
+    pub fn binary(
+        suggested_filename: impl Into<String>,
+        contents: Vec<u8>,
+        ipv6_warning: Option<String>,
+    ) -> Self {
+        Self {
+            suggested_filename: suggested_filename.into(),
+            contents: ClientArtifactPayload::binary(contents),
+            ipv6_warning,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -209,5 +290,29 @@ mod tests {
         assert!(!redacted.contains("abc"));
         assert!(!redacted.contains("secret"));
         assert!(redacted.contains("safe=yes"));
+    }
+
+    #[test]
+    fn client_artifact_payload_supports_text_and_binary_without_serializing_secrets() {
+        let text = ClientArtifact::text("client.conf", "text-secret", None);
+        assert_eq!(text.contents.as_text(), Some("text-secret"));
+        assert_eq!(text.contents.as_bytes(), b"text-secret");
+        assert!(!format!("{:?}", text.contents).contains("text-secret"));
+        assert!(
+            !serde_json::to_string(&text)
+                .unwrap()
+                .contains("text-secret")
+        );
+
+        let binary = ClientArtifact::binary("client.p12", b"binary-secret".to_vec(), None);
+        assert!(binary.contents.is_binary());
+        assert_eq!(binary.contents.as_text(), None);
+        assert_eq!(binary.contents.as_bytes(), b"binary-secret");
+        assert!(!format!("{:?}", binary.contents).contains("binary-secret"));
+        assert!(
+            !serde_json::to_string(&binary)
+                .unwrap()
+                .contains("binary-secret")
+        );
     }
 }

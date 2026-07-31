@@ -462,6 +462,14 @@ pub struct OpenVpnDeviceData {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Ikev2DeviceData {
     pub identity: String,
+    #[serde(default)]
+    pub private_key_ref: Option<SecretReference>,
+    #[serde(default)]
+    pub csr_ref: Option<SecretReference>,
+    #[serde(default)]
+    pub certificate_ref: Option<SecretReference>,
+    #[serde(default)]
+    pub ca_certificate_ref: Option<SecretReference>,
     pub bundle_password_ref: SecretReference,
     pub certificate_serial: Option<String>,
 }
@@ -516,7 +524,14 @@ impl DeviceBackendData {
                 references.extend(data.tls_crypt_key_ref.as_ref());
                 references
             }
-            Self::Ikev2(data) => vec![&data.bundle_password_ref],
+            Self::Ikev2(data) => {
+                let mut references = vec![&data.bundle_password_ref];
+                references.extend(data.private_key_ref.iter());
+                references.extend(data.csr_ref.iter());
+                references.extend(data.certificate_ref.iter());
+                references.extend(data.ca_certificate_ref.iter());
+                references
+            }
             Self::Xray(_) => Vec::new(),
         }
     }
@@ -892,6 +907,46 @@ mod tests {
         assert_eq!(
             OpenVpnSettings::default().tls_protection,
             OpenVpnTlsProtection::TlsCrypt
+        );
+    }
+
+    #[test]
+    fn ikev2_identity_backfills_optional_material_and_retains_all_new_references() {
+        let bundle_password_ref = SecretReference(Uuid::from_u128(1));
+        let legacy: Ikev2DeviceData = serde_json::from_value(serde_json::json!({
+            "identity": "client-01",
+            "bundle_password_ref": bundle_password_ref,
+            "certificate_serial": null
+        }))
+        .unwrap();
+        assert!(legacy.private_key_ref.is_none());
+        assert!(legacy.csr_ref.is_none());
+        assert!(legacy.certificate_ref.is_none());
+        assert!(legacy.ca_certificate_ref.is_none());
+
+        let private_key_ref = SecretReference(Uuid::from_u128(2));
+        let csr_ref = SecretReference(Uuid::from_u128(3));
+        let certificate_ref = SecretReference(Uuid::from_u128(4));
+        let ca_certificate_ref = SecretReference(Uuid::from_u128(5));
+        let data = DeviceBackendData::Ikev2(Ikev2DeviceData {
+            identity: "client-01".into(),
+            private_key_ref: Some(private_key_ref.clone()),
+            csr_ref: Some(csr_ref.clone()),
+            certificate_ref: Some(certificate_ref.clone()),
+            ca_certificate_ref: Some(ca_certificate_ref.clone()),
+            bundle_password_ref: bundle_password_ref.clone(),
+            certificate_serial: None,
+        });
+
+        assert_eq!(
+            data.secret_references(),
+            vec![
+                &bundle_password_ref,
+                &private_key_ref,
+                &csr_ref,
+                &certificate_ref,
+                &ca_certificate_ref,
+            ]
         );
     }
 

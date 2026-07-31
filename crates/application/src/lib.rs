@@ -1395,7 +1395,16 @@ docker compose restart gateway
 
     pub async fn client_qr_svg(&self, device_id: Uuid) -> Result<String, AppError> {
         let artifact = self.client_configuration(device_id).await?;
-        let code = QrCode::new(artifact.contents.as_bytes()).map_err(|error| AppError {
+        let contents = artifact.contents.as_text().ok_or_else(|| AppError {
+            code: "qr_not_supported".into(),
+            message: "This backend exports a binary client credential that cannot be encoded as a QR code.".into(),
+            scope: Some(device_id.to_string()),
+            remote_state_changed: false,
+            rollback_succeeded: None,
+            remediation: Some("Export the client credential as a private file instead.".into()),
+            technical_detail: None,
+        })?;
+        let code = QrCode::new(contents.as_bytes()).map_err(|error| AppError {
             code: "qr_generation_failed".into(),
             message: "The client configuration is too large for a QR code.".into(),
             scope: Some(device_id.to_string()),

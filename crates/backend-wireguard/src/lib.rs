@@ -247,16 +247,16 @@ impl VpnBackend for WireGuardBackend {
         )
         .expect("writing to a String cannot fail");
         let filename = format!("{}.conf", slug(&device.display_name));
-        Ok(ClientArtifact {
-            suggested_filename: filename,
-            contents: output,
-            ipv6_warning: state
+        Ok(ClientArtifact::text(
+            filename,
+            output,
+            state
                 .instance
                 .network
                 .ipv6_subnet
                 .is_none()
                 .then(|| "IPv6 is not routed by this IPv4-only instance.".into()),
-        })
+        ))
     }
 
     fn client_artifact_kind(&self) -> ClientArtifactKind {
@@ -433,8 +433,9 @@ mod tests {
         let artifact = WireGuardBackend
             .render_client(&state, &device, &secrets)
             .unwrap();
-        assert!(artifact.contents.contains("AllowedIPs = 0.0.0.0/0"));
-        assert!(!artifact.contents.contains("::/0"));
+        let contents = artifact.contents.as_text().unwrap();
+        assert!(contents.contains("AllowedIPs = 0.0.0.0/0"));
+        assert!(!contents.contains("::/0"));
         assert!(artifact.ipv6_warning.is_some());
         assert_eq!(artifact.suggested_filename, "macbook-injected.conf");
     }
