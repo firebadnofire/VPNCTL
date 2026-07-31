@@ -46,6 +46,8 @@ use vam_protocol::{
     HostKeyProbe, HostKeyState, InstanceHealth, RenderedFile, redact,
 };
 use vam_secrets::{SecretStore, SecretStoreError};
+#[cfg(test)]
+use vam_ssh::DownloadRequest;
 use vam_ssh::{CommandResult, RusshTransport, SshError, SshTransport, UploadRequest};
 use vam_storage::{Storage, StorageError};
 use zeroize::Zeroizing;
@@ -3958,6 +3960,15 @@ mod tests {
                 String::from_utf8_lossy(request.contents).into_owned(),
             ));
             Ok(())
+        }
+
+        async fn download(
+            &self,
+            _request: DownloadRequest<'_>,
+        ) -> Result<Zeroizing<Vec<u8>>, SshError> {
+            Err(SshError::Protocol(
+                "the fake transport has no requested download".into(),
+            ))
         }
     }
 

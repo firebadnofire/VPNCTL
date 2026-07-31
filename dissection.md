@@ -3310,3 +3310,145 @@ Remaining environment-limited validation is explicit:
   have not been executed;
 - OpenVPN and IKEv2 certificate-authority provisioning is the next functional
   unit and is required before those backends can reach live healthy state.
+
+Commit:
+
+- `2b3ecf3 feat: generalize SSH backend deployment`;
+- verified good EDDSA signature from William Jones' configured YubiKey-backed
+  key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+## Implementation Unit 8: certificate authority and device transactions
+
+### Plan
+
+This unit connects the already-reviewed `CredentialPlan` operations to the
+verified SSH, native secret-store, and SQLite boundaries. It is split into
+three independently validated signed checkpoints.
+
+#### 8A: bounded verified-SFTP download
+
+1. Add a `DownloadRequest` to `SshTransport`, using the same approved host key,
+   encrypted OpenSSH/PPK key loading, passphrase, cancellation, and operation
+   timeout as upload.
+2. Read remote artifacts as bytes through SFTP rather than `cat`, output
+   parsing, temporary local files, or frontend-visible data.
+3. Enforce an application-supplied maximum size while reading so a compromised
+   host cannot force unbounded local allocation.
+4. Add fake-transport and SSH unit coverage. Preserve the PPK authentication
+   code path unchanged.
+
+#### 8B: staged CA bootstrap and persistent activation
+
+1. Extend `ServerIdentityStrategy::CertificateAuthority` with explicit
+   persistent host-relative paths. OpenVPN owns its Easy-RSA PKI and optional
+   TLS-crypt key; IKEv2 owns its CA, issued certificates, private keys, CRL,
+   and serial/index state.
+2. Before rendered upload, copy only those declared paths from the existing
+   current directory into same-filesystem staging. Reject symlinks and
+   incomplete authority state rather than following or regenerating it.
+3. After the selected pinned image is prepared, execute the backend-generated
+   initialization plan in staging:
+   - OpenVPN: Easy-RSA CA, P-256 server certificate, CRL, and optional
+     TLS-crypt key;
+   - IKEv2: strongSwan `pki` P-384 CA/server keys and certificates, CRL, and a
+     protected revocation/serial ledger.
+4. Initialization is idempotent only for a complete, validated authority. A
+   partial authority fails closed. Normal apply never rotates an existing CA
+   or server identity.
+5. Validate the complete staged configuration, back up current state, then
+   activate the declared persistent identity together with rendered files.
+6. Mark the local authority initialized only after Compose health succeeds.
+   The marker is not itself trusted: credential operations also verify remote
+   authority files.
+
+#### 8C: backend-aware device lifecycle
+
+1. Build each device identity through its backend:
+   - WireGuard: local keypair and optional unique PSK;
+   - AWG2: local AWG-compatible keypair plus mandatory unique PSK;
+   - OpenVPN: local EC private key and PKCS#10 CSR;
+   - IKEv2: local P-384 private key/CSR plus a 64-character random protected
+     PKCS#12 password;
+   - Xray: UUID and structured client metadata, with no secret reference.
+2. Allocate tunnel addresses and managed DNS only when capabilities declare
+   those concepts. Xray receives neither a fake tunnel address nor CoreDNS
+   record.
+3. For certificate devices, require a successfully deployed remote authority,
+   upload only the CSR, sign inside the pinned server image, retrieve only
+   certificate/CA/public TLS material through bounded SFTP, validate it inside
+   the backend, and store it in the native secret store.
+4. Persist the new device and all secret-reference rows only after issuance
+   succeeds. If local persistence fails, execute a compensating remote
+   revocation and remove newly stored local secrets.
+5. Revoke remotely and regenerate/load the CRL before disabling or deleting
+   certificate devices. Re-enable requires identity replacement because
+   certificate revocation is irreversible.
+6. Replacement issues and validates the new credential before revoking the
+   previous identity, then atomically replaces local device metadata and
+   retires old secret references. If local persistence fails, revoke the newly
+   issued identity as compensation and report that remote state changed.
+7. Xray/WireGuard/AWG identity changes remain desired-state operations and are
+   applied through the reviewed deployment/quick-refresh path; no frontend
+   receives private material.
+8. Serialize all remote credential mutations with the existing per-instance
+   lock. Treat every non-zero remote exit as failure; stdout parsing is limited
+   to the certificate serial emitted by a command that already exited zero.
+
+### Security/atomicity boundary
+
+SQLite and an OS-native secret store cannot share a true distributed
+transaction with a remote CA. The safe ordering is therefore:
+
+1. create private material locally;
+2. mutate/validate the remote authority;
+3. store returned public credential material locally;
+4. commit local metadata;
+5. compensate remotely and delete new local secrets if step 4 fails.
+
+For revocation, remote access is removed before local metadata changes. If the
+local write then fails, the product reports an explicit remotely-changed
+error; it never reports a still-valid revoked credential as safe. Every
+authority mutation is backed up or uses an operation-specific rollback copy
+before it starts.
+
+### 8A implementation and validation
+
+`SshTransport` now has a byte-oriented `download` operation alongside upload.
+`DownloadRequest` carries:
+
+- the same `SshConnectionConfig`;
+- the exact approved host public key;
+- the optional zeroizing passphrase;
+- the exact remote path;
+- a caller-selected byte limit;
+- the same cancellation token.
+
+`RusshTransport::download` authenticates through the existing
+`authenticated()` path. This is important: it preserves russh's native
+OpenSSH/PPK loading and compares the presented host key to the approved key
+before opening SFTP. It does not invoke the system SSH client or relax host
+verification.
+
+The SFTP file is streamed in 16 KiB chunks into `Zeroizing<Vec<u8>>`. The
+buffer is also heap-allocated under `Zeroizing`, both to erase certificate
+material and to keep the async future small. The read stops with the dedicated
+`DownloadTooLarge` error before appending any chunk that would exceed the
+limit. Cancellation and the configured operation timeout wrap session setup
+and the complete bounded read.
+
+The first strict-clippy run stopped because the initial 16 KiB stack buffer
+made the async future exceed the large-future threshold. The buffer was moved
+to a zeroizing heap allocation instead of suppressing the lint.
+
+Validation used the temporary ring-provider diagnostic only because the
+delivered AWS-LC build remains blocked by missing NASM:
+
+- 4 SSH tests passed, including PPK loading, cancellation, upload metadata, and
+  exact-limit/oversize download behavior;
+- all 12 application tests passed with its fake transport implementing the new
+  trait contract;
+- strict clippy passed for both crates and all targets with `-D warnings`;
+- formatting and `git diff --check` passed.
+
+`Cargo.toml` and `Cargo.lock` were restored to the delivered AWS-LC graph
+before staging.

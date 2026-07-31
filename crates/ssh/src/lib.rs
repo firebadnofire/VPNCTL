@@ -14,7 +14,7 @@ use russh_sftp::{
 };
 use thiserror::Error;
 use tokio::{
-    io::AsyncWriteExt,
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     net::lookup_host,
     time::{sleep, timeout},
 };
@@ -37,6 +37,15 @@ pub struct UploadRequest<'a> {
     pub remote_path: &'a str,
     pub contents: &'a [u8],
     pub mode: u32,
+    pub cancellation: &'a CancellationToken,
+}
+
+pub struct DownloadRequest<'a> {
+    pub config: &'a SshConnectionConfig,
+    pub trusted_key_base64: &'a str,
+    pub passphrase: Option<&'a Zeroizing<String>>,
+    pub remote_path: &'a str,
+    pub max_bytes: usize,
     pub cancellation: &'a CancellationToken,
 }
 
@@ -64,6 +73,8 @@ pub enum SshError {
     Protocol(String),
     #[error("SFTP error: {0}")]
     Sftp(String),
+    #[error("remote file exceeds the {max_bytes}-byte download limit")]
+    DownloadTooLarge { max_bytes: usize },
     #[error("SSH key file could not be loaded: {0}")]
     KeyFile(String),
     #[error("SSH command did not report an exit status")]
@@ -88,6 +99,7 @@ pub trait SshTransport: Send + Sync {
     ) -> Result<CommandResult, SshError>;
 
     async fn upload(&self, request: UploadRequest<'_>) -> Result<(), SshError>;
+    async fn download(&self, request: DownloadRequest<'_>) -> Result<Zeroizing<Vec<u8>>, SshError>;
 }
 
 #[derive(Debug)]
@@ -249,6 +261,27 @@ fn file_attributes(mode: u32) -> FileAttributes {
     FileAttributes {
         permissions: Some(mode),
         ..FileAttributes::empty()
+    }
+}
+
+async fn read_bounded(
+    reader: &mut (impl AsyncRead + Unpin),
+    max_bytes: usize,
+) -> Result<Zeroizing<Vec<u8>>, SshError> {
+    let mut contents = Zeroizing::new(Vec::with_capacity(max_bytes.min(16 * 1024)));
+    let mut buffer = Zeroizing::new(vec![0_u8; 16 * 1024]);
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .await
+            .map_err(|error| SshError::Sftp(error.to_string()))?;
+        if count == 0 {
+            return Ok(contents);
+        }
+        if contents.len().saturating_add(count) > max_bytes {
+            return Err(SshError::DownloadTooLarge { max_bytes });
+        }
+        contents.extend_from_slice(&buffer[..count]);
     }
 }
 
@@ -418,6 +451,60 @@ impl SshTransport for RusshTransport {
             .await;
         Ok(())
     }
+
+    async fn download(&self, request: DownloadRequest<'_>) -> Result<Zeroizing<Vec<u8>>, SshError> {
+        let handle = self
+            .authenticated(
+                request.config,
+                request.trusted_key_base64,
+                request.passphrase,
+                request.cancellation,
+            )
+            .await?;
+        let channel = guarded(
+            request.cancellation,
+            self.operation_timeout,
+            handle.channel_open_session(),
+        )
+        .await
+        .map_err(map_russh)?;
+        guarded(
+            request.cancellation,
+            self.operation_timeout,
+            channel.request_subsystem(true, "sftp"),
+        )
+        .await
+        .map_err(map_russh)?;
+        let sftp = guarded(
+            request.cancellation,
+            self.operation_timeout,
+            SftpSession::new(channel.into_stream()),
+        )
+        .await
+        .map_err(map_sftp)?;
+        let mut file = guarded(
+            request.cancellation,
+            self.operation_timeout,
+            sftp.open(request.remote_path),
+        )
+        .await
+        .map_err(map_sftp)?;
+        let contents = guarded(
+            request.cancellation,
+            self.operation_timeout,
+            read_bounded(&mut file, request.max_bytes),
+        )
+        .await
+        .map_err(|error| match error {
+            GuardError::Cancelled => SshError::Cancelled,
+            GuardError::Timeout => SshError::Timeout,
+            GuardError::Inner(error) => error,
+        })?;
+        let _ = handle
+            .disconnect(Disconnect::ByApplication, "download complete", "en")
+            .await;
+        Ok(contents)
+    }
 }
 
 #[cfg(test)]
@@ -450,6 +537,27 @@ Private-MAC: 94140d0344fad6aa1bf7b71e9c93db11ccac8a232f8a51e11c024869d608c82d
         )
         .await;
         assert!(matches!(result, Err(GuardError::Cancelled)));
+    }
+
+    #[tokio::test]
+    async fn bounded_download_accepts_limit_and_rejects_oversize_input() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(b"certificate").await.unwrap();
+        });
+        let contents = read_bounded(&mut reader, 11).await.unwrap();
+        writer_task.await.unwrap();
+        assert_eq!(contents.as_slice(), b"certificate");
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let writer_task = tokio::spawn(async move {
+            writer.write_all(b"certificate").await.unwrap();
+        });
+        assert!(matches!(
+            read_bounded(&mut reader, 10).await,
+            Err(SshError::DownloadTooLarge { max_bytes: 10 })
+        ));
+        writer_task.await.unwrap();
     }
 
     #[test]
