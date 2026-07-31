@@ -5488,3 +5488,121 @@ state before mutating local desired state.
 
 Planned signed commit:
 `fix: harden OpenVPN validation and undeployed deletion`.
+
+### 12O. Certificate-backend ownership and native secret capacity (2026-07-31)
+
+The corrected OpenVPN validation probe exposed two later stages that the former
+probe had masked. The first real activation failed while moving
+`stage/vpn/pki` into the active tree: Easy-RSA had run in a root container and
+left the persistent PKI directory `0700 root:root`, while activation runs as the
+managed SSH user. A reversible rename test against the staged tree reproduced
+the permission denial. Running a second pinned-image container with only
+`chown -R <host uid>:<host gid>` over the authority mount made the same rename
+succeed and restore cleanly.
+
+Authority initialization and each later certificate mutation now finish with
+that explicit ownership normalization. The host UID and GID are captured from
+the authenticated SSH session, the correction runs inside the already-pinned
+backend image as root, and the command does not assume passwordless `sudo`.
+The implementation is shared by OpenVPN and IKEv2 because both persist a
+container-managed certificate authority that the host-side transactional
+deployment and SFTP layers must subsequently read or move. It does not change
+ownership outside the selected instance's mounted OpenVPN or swanctl authority
+root.
+
+With activation fixed, real OpenVPN client issuance reached a second ownership
+boundary. Easy-RSA wrote the issued certificate as `0600 root:root`; the CSR
+upload and signing succeeded, but the SSH user could not download the
+certificate. Applying the same post-operation ownership normalization to every
+certificate container command allowed SFTP retrieval without making certificate
+files world-readable.
+
+The next retry reached Windows Credential Manager and exposed its 2,560-byte
+per-value limit. OpenVPN certificates and IKEv2 PKCS#12 material can exceed that
+limit, so the native secret adapter now stores values over 2,048 bytes as
+generation-scoped credential chunks. The primary credential contains only a
+versioned manifest with generation UUID, chunk count, original byte length, and
+SHA-256 digest. Reads require every chunk and verify both length and digest
+before returning any reconstructed value. Writes create chunks before atomically
+switching the small primary manifest; failed writes clean their uncommitted
+generation, and replacement failures attempt to restore the prior manifest.
+Deletes remove the referenced chunk generation before removing the manifest.
+
+Existing values at or below the limit remain in their original one-credential
+format, and non-manifest legacy values continue to read unchanged. A 4,096-chunk
+parser ceiling rejects corrupt or hostile metadata before allocation or lookup.
+Credential errors contain operation context and integrity state but never secret
+bytes. User-facing error copy now says `native credential store` rather than the
+incorrect platform-specific `macOS Keychain` wording.
+
+Live validation used the isolated database at
+`C:\Users\william\AppData\Local\Temp\vam-live-matrix-20260731-134342\state.sqlite`
+and the user-supplied disposable Linode. The OpenVPN instance used UDP 31194 and
+subnet `10.73.0.0/24`, avoiding the host's unrelated managed deployments. No
+secret value or exported profile content was printed.
+
+The validated lifecycle was:
+
+1. apply the full 19-operation server plan after the ownership fix;
+2. verify Compose, gateway, backend, listener, DNS, and resolver health;
+3. generate a real local private key and CSR, sign it with the deployed remote
+   authority, retrieve the client and CA certificates plus tls-crypt material,
+   and persist the resulting identity;
+4. observe the expected client-state drift before deployment;
+5. review and apply the exact nine-operation plan with expected-state hash
+   `0255ff1bd48ebb080c35983ae2f7416c2f47024e3f582a0359ef0d3eb20cfe4a`;
+6. recheck all health fields, including client-state agreement; and
+7. export a 2,888-byte `.ovpn` profile by reading the real Windows credential
+   store through a fresh process.
+
+The server deployment succeeded as
+`d2e67959-c890-40f5-8aeb-5d94bd7647ec`; the client-state deployment succeeded as
+`94c6085f-31f2-48c5-85b7-d4df8ca4f231`. The final explicit health check reported
+Compose, gateway, OpenVPN backend, listeners, client state, DNS, and both DNS
+resolution checks healthy. Watchtower remained intentionally absent for this
+test instance and is reported separately rather than weakening backend health.
+
+One apparent `secret_missing` export result was diagnosed as a harness-context
+artifact: issuance ran under the real Windows user outside the restricted Codex
+sandbox, while the first local-only export process could not see that user's
+credential vault. A read-only database check confirmed five active OpenVPN
+secret registrations with no retirement markers. Repeating export under the
+same Windows identity as the desktop application succeeded. This did not require
+a production-code change.
+
+Files changed:
+
+- `crates/application/src/lib.rs`: host-user ownership normalization for
+  authority initialization and credential mutation, generic native-store error
+  wording, and OpenVPN/IKEv2 command-contract tests;
+- `crates/secrets/src/lib.rs`: backward-compatible chunked native credentials,
+  integrity validation, transactional replacement/cleanup behavior, and
+  manifest parser tests;
+- `crates/secrets/Cargo.toml` and `Cargo.lock`: the existing workspace SHA-256
+  implementation is now a direct secret-store dependency.
+
+Validation completed before documentation:
+
+- `cargo fmt --all -- --check` passed;
+- `cargo clippy -p vam-secrets -p vam-application --all-targets -- -D warnings`
+  passed after replacing allocation-heavy digest formatting with a preallocated
+  string writer;
+- `cargo test -p vam-secrets -p vam-application -j 1` passed: 2/2 secret-store
+  tests and 40/40 application tests;
+- `cargo build -p vam-dev -j 1` passed using the existing portable NASM path;
+- live OpenVPN server apply, client issuance, drift deployment, fresh-process
+  export, and explicit health verification all passed.
+
+The first post-fix client attempt was safely rolled back after SFTP reported the
+root-owned certificate. The second was safely rolled back when Credential
+Manager rejected the oversized value. Neither failed attempt persisted a local
+client. Remote credential operations created pre-change backups, and the later
+successful attempts preserved the same recovery behavior. No build cache was
+deleted and no tool or package was installed.
+
+Previous signed commit:
+`ca41f09 fix: harden OpenVPN validation and undeployed deletion` (good EDDSA
+signature).
+
+Planned signed commit:
+`fix: complete certificate backend deployment lifecycle`.

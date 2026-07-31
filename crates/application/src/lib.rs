@@ -5973,9 +5973,10 @@ rm -rf -- "$new""#,
         }
     };
     Ok(format!(
-        "docker run --rm --user 0:0 --entrypoint /bin/sh -v {mount} {image} -c {script}",
+        "set -eu; host_owner=\"$(id -u):$(id -g)\"; docker run --rm --user 0:0 --entrypoint /bin/sh -v {mount} {image} -c {script}; docker run --rm --user 0:0 --entrypoint chown -v {mount} {image} -R \"$host_owner\" {root}",
         mount = shell_quote(&mount),
         script = shell_quote(&script),
+        root = shell_quote(root),
     ))
 }
 
@@ -5984,12 +5985,14 @@ fn credential_container_command(
     runtime: &BackendRuntimeSpec,
     script: &str,
 ) -> Result<String, &'static str> {
-    let (mount, _) = authority_mount(current, runtime)?;
+    let (mount, root) = authority_mount(current, runtime)?;
+    let image = shell_quote(runtime_image_reference(runtime));
     Ok(format!(
-        "docker run --rm --user 0:0 --entrypoint /bin/sh -v {mount} {image} -c {script}",
+        "set -eu; host_owner=\"$(id -u):$(id -g)\"; docker run --rm --user 0:0 --entrypoint /bin/sh -v {mount} {image} -c {script}; docker run --rm --user 0:0 --entrypoint chown -v {mount} {image} -R \"$host_owner\" {root}",
         mount = shell_quote(&mount),
-        image = shell_quote(runtime_image_reference(runtime)),
+        image = image,
         script = shell_quote(script),
+        root = shell_quote(root),
     ))
 }
 
@@ -8078,9 +8081,9 @@ fn secret_error(error: SecretStoreError) -> AppError {
         }
         .into(),
         message: if matches!(error, SecretStoreError::NotFound) {
-            "Required private material is missing from the macOS Keychain."
+            "Required private material is missing from the native credential store."
         } else {
-            "The macOS Keychain operation failed."
+            "The native credential store operation failed."
         }
         .into(),
         scope: None,
@@ -8829,6 +8832,10 @@ mod tests {
         assert!(initialize.contains("EASYRSA_CURVE=prime256v1"));
         assert!(initialize.contains("easyrsa build-ca nopass"));
         assert!(initialize.contains("openssl verify"));
+        assert!(initialize.contains("host_owner=\"$(id -u):$(id -g)\""));
+        assert!(initialize.contains("--entrypoint chown"));
+        assert!(initialize.contains("-R \"$host_owner\" '/etc/openvpn'"));
+        assert!(!initialize.contains("sudo"));
         assert!(!initialize.contains("latest"));
 
         let files = openvpn_backend
@@ -8879,6 +8886,8 @@ mod tests {
         assert!(command.contains("pki --signcrl"));
         assert!(command.contains("pki --verify"));
         assert!(command.contains("IKEv2 authority is partial"));
+        assert!(command.contains("--entrypoint chown"));
+        assert!(command.contains("-R \"$host_owner\" '/etc/swanctl'"));
         assert!(!command.contains("--type rsa"));
     }
 
@@ -8956,6 +8965,8 @@ mod tests {
         assert!(command.contains("easyrsa import-req"));
         assert!(command.contains("EASYRSA_DN=cn_only"));
         assert!(command.contains("'/safe/current/vpn:/etc/openvpn'"));
+        assert!(command.contains("--entrypoint chown"));
+        assert!(command.contains("-R \"$host_owner\" '/etc/openvpn'"));
 
         let revoke = CredentialOperation::RevokeOpenVpnClient {
             common_name: "laptop-1234".into(),
@@ -8970,6 +8981,7 @@ mod tests {
         .unwrap();
         assert!(command.contains("index.txt"));
         assert!(command.contains("easyrsa revoke"));
+        assert!(command.contains("--entrypoint chown"));
 
         let ikev2 = command_state(VpnBackendKind::Ikev2);
         let runtime = Ikev2Backend
@@ -8988,6 +9000,7 @@ mod tests {
         assert!(command.contains("--serial"));
         assert!(command.contains("revoked"));
         assert!(command.contains("test -f"));
+        assert!(command.contains("-R \"$host_owner\" '/etc/swanctl'"));
         assert_eq!(
             parse_certificate_serial("certificate_serial=00a1b2\n").as_deref(),
             Some("00A1B2")
