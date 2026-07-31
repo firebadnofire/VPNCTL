@@ -492,11 +492,8 @@ impl VpnBackend for OpenVpnBackend {
 }
 
 fn validate_settings(settings: &OpenVpnSettings) -> Result<(), BackendError> {
-    if !(30..=825).contains(&settings.certificate_lifetime_days) {
-        return invalid(
-            "certificate_lifetime_days",
-            "must be between 30 and 825 days",
-        );
+    if settings.certificate_lifetime_days == 0 {
+        return invalid("certificate_lifetime_days", "must be at least 1 day");
     }
     Ok(())
 }
@@ -1168,6 +1165,23 @@ mod tests {
             ),
             ChangeImpact::Reinstall
         );
+    }
+
+    #[test]
+    fn certificate_lifetime_has_no_825_day_ceiling_but_rejects_zero() {
+        let (mut state, _, secrets) = fixture();
+        let BackendSettings::OpenVpn(settings) = &mut state.instance.backend_settings else {
+            panic!("fixture must use OpenVPN settings");
+        };
+        settings.certificate_lifetime_days = 1365;
+        assert!(OpenVpnBackend.render_server(&state, &secrets).is_ok());
+
+        let BackendSettings::OpenVpn(settings) = &mut state.instance.backend_settings else {
+            unreachable!();
+        };
+        settings.certificate_lifetime_days = 0;
+        let error = OpenVpnBackend.render_server(&state, &secrets).unwrap_err();
+        assert!(error.to_string().contains("must be at least 1 day"));
     }
 
     #[test]

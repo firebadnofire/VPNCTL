@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/svelte";
+import { fireEvent, render, screen } from "@testing-library/svelte";
 import { describe, expect, it } from "vitest";
 import BackendFormHarness from "../../../test/BackendFormHarness.svelte";
 
@@ -28,5 +28,15 @@ describe("backend form isolation", () => {
     expect(screen.queryByText("Certificate file")).toBeNull();
     expect(document.body.textContent).not.toContain("PRIVATE KEY");
     xray.unmount();
+  });
+
+  it("allows OpenVPN certificate lifetimes beyond 825 days", async () => {
+    render(BackendFormHarness, { kind: "openvpn" });
+    const lifetime = screen.getByLabelText("Client certificate lifetime (days)") as HTMLInputElement;
+    expect(lifetime.getAttribute("min")).toBe("1");
+    expect(lifetime.getAttribute("max")).toBeNull();
+    await fireEvent.input(lifetime, { target: { value: "1365" } });
+    expect(lifetime.value).toBe("1365");
+    expect(screen.getByText(/Shorter-lived client certificates reduce exposure/)).toBeTruthy();
   });
 });

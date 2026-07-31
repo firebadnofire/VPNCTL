@@ -5299,3 +5299,57 @@ Previous signed commit: `71f0b7e fix: clarify instance settings workspace`
 (good EDDSA signature).
 
 Planned signed commit: `fix: show creation errors in active dialog`.
+
+### 12L. OpenVPN certificate lifetime policy (2026-07-31)
+
+OpenVPN creation exposed a numeric client-certificate lifetime field with an
+HTML maximum of 825 days. The OpenVPN backend independently rejected any value
+outside 30-825 days, so removing only the browser constraint would have moved
+the same failure into Rust. The screenshot's 1,365-day value could not advance
+past native HTML validation and would not have passed application validation.
+
+The OpenVPN-only policy ceiling is removed at both boundaries. The form retains
+`min=1` and required validation but has no `max` attribute. Rust now accepts any
+positive lifetime representable by the existing persisted `u16` field, including
+1,365 days, and rejects zero with `must be at least 1 day`. IKEv2 remains
+unchanged because the request and screenshot concern OpenVPN creation.
+
+The form explicitly notes the security tradeoff: longer lifetimes are allowed,
+but shorter-lived client certificates reduce exposure when an exported profile
+is lost or copied. This is a user-selected credential policy rather than a
+silent compatibility relaxation. TLS 1.3 minimums, certificate validation,
+revocation behavior, `tls-crypt`, ciphers, private-key storage, and export
+protection are unchanged.
+
+Files changed:
+
+- `apps/desktop/src/lib/components/forms/OpenVpnForm.svelte`: remove the 825-day
+  maximum and add the lifetime/exposure explanation;
+- `crates/backend-openvpn/src/lib.rs`: positive-only validation and a regression
+  test for 1,365 days plus zero rejection;
+- `apps/desktop/src/lib/components/forms/backend-forms.test.ts`: DOM constraint,
+  entered value, and security-note coverage.
+
+Validation:
+
+- focused OpenVPN lifetime test passed;
+- complete OpenVPN backend suite passed 9/9 tests;
+- strict Clippy for `vam-backend-openvpn` with all targets and `-D warnings`
+  passed;
+- Rust formatting passed after applying the formatter's one-line return style;
+- focused backend-form suite passed 2/2 tests;
+- full frontend suite passed 27/27 tests across four files;
+- Svelte check passed with 0 errors and 0 warnings;
+- Vite production build passed (134 modules, 135.60 kB JavaScript and 22.91 kB
+  CSS before gzip);
+- `git diff --check` passed.
+
+The first combined gate stopped on the formatter's required line wrapping. No
+semantic failure occurred; the mechanical format was applied and every masked
+gate was rerun. Concurrent Clippy/test validation briefly waited on Cargo's
+normal target-directory lock and then passed.
+
+Previous signed commit: `cff0e8e fix: show creation errors in active dialog`
+(good EDDSA signature).
+
+Planned signed commit: `fix: allow longer OpenVPN certificate lifetimes`.
