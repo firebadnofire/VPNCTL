@@ -123,7 +123,9 @@ impl VpnBackend for OpenVpnBackend {
             entrypoint: Vec::new(),
             command: Vec::new(),
             sysctls: vec![("net.ipv4.ip_forward", "1")],
-            identity: ServerIdentityStrategy::CertificateAuthority,
+            identity: ServerIdentityStrategy::CertificateAuthority {
+                persistent_paths: &["vpn/pki", "vpn/requests", "vpn/tls-crypt.key"],
+            },
             validation: BackendValidation::OpenVpn {
                 config_path: "vpn/server.conf",
             },

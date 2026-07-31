@@ -3452,3 +3452,130 @@ delivered AWS-LC build remains blocked by missing NASM:
 
 `Cargo.toml` and `Cargo.lock` were restored to the delivered AWS-LC graph
 before staging.
+
+Commit:
+
+- `2ffc038 feat: add bounded verified SFTP downloads`;
+- verified good EDDSA signature from William Jones' configured YubiKey-backed
+  key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### 8B implementation
+
+`ServerIdentityStrategy::CertificateAuthority` now declares its persistent
+host-relative paths. The application does not infer these from backend names:
+
+- OpenVPN declares `vpn/pki`, `vpn/requests`, and `vpn/tls-crypt.key`;
+- IKEv2 declares its `private`, `x509`, `x509ca`, `x509crl`, `requests`, and
+  `issued` directories under `ikev2/`.
+
+Before rendered upload, each existing declared path is copied from `current`
+into the unique same-filesystem staging directory. The seed command:
+
+- accepts only a regular file or directory;
+- rejects a symlink at the declared root;
+- scans directories and rejects any contained symlink;
+- requires the staged destination not to exist;
+- copies only exact backend-declared paths.
+
+This prevents a compromised persistent directory from redirecting privileged
+container writes while retaining the existing CA, server private key, serial
+database, issued certificates, and CRL across updates.
+
+After the exact image is pulled/built, `InitializeAuthority` is executed
+against staging. A certificate plan must contain exactly one typed
+initialization operation at this boundary.
+
+#### OpenVPN Easy-RSA authority
+
+The OpenVPN command runs the pinned local image as root only for the declared
+staged `vpn` mount and replaces the service entrypoint with `/bin/sh`. It:
+
+- counts five required non-empty authority/server/CRL files and the optional
+  sixth TLS-crypt key;
+- treats a complete set as an idempotent validation and verifies the server
+  certificate with OpenSSL;
+- rejects any partial set, existing empty PKI root, or symlink instead of
+  regenerating;
+- generates a fresh authority under `.vam-pki-new` with a cleanup trap;
+- uses Easy-RSA batch mode, EC `prime256v1`, SHA-256, a 3650-day CA, the
+  configured bounded leaf lifetime, and a 3650-day CRL;
+- generates the server key remotely and never downloads it;
+- generates a unique TLS-crypt key only when the typed settings require it;
+- verifies the staged server certificate before atomically renaming the PKI;
+- sets private directories/files to 0700/0600 and public certificates/CRL to
+  0644.
+
+Client private keys remain local. Easy-RSA is used only for the CA/server key
+and to sign locally generated PKCS#10 client requests.
+
+#### IKEv2 strongSwan authority
+
+The IKEv2 command similarly runs only the pinned locally built strongSwan
+image against the declared staged `ikev2` mount. It:
+
+- requires a complete CA key/certificate, server key/certificate, and CRL;
+- verifies the server chain and parses the CRL on every idempotent reuse;
+- rejects partial or symlinked state;
+- generates into `.vam-authority-new` with a cleanup trap;
+- uses P-384 ECDSA with SHA-384 for both CA and server;
+- gives the server certificate the configured validated identity as CN/SAN,
+  an explicit `serverAuth` EKU, a fixed initial serial, and the configured
+  bounded lifetime;
+- creates the initial CRL through `pki --signcrl`;
+- validates the new chain and CRL before installing protected files into the
+  persistent directories.
+
+The CA and server private keys intentionally remain remote-only and mode 0600.
+They are not passphrase-encrypted because unattended certificate issuance
+would otherwise require persistently placing the decryption secret beside the
+key or repeatedly sending it to an online CA. This is an explicit online-CA
+tradeoff: the remote host and backups are within the authority trust boundary.
+Client keys and PKCS#12 passwords remain local in the native secret store.
+
+#### Activation and rollback
+
+Certificate persistence is activated as a unit:
+
+- generated/seeded persistent paths move from stage to current only after the
+  pre-mutation backup;
+- rendered `.keep` files under a persistent directory are not moved a second
+  time;
+- a previous current path is moved into the instance trash area before the
+  staged identity is installed;
+- the existing deployment rollback restores the whole backed-up instance,
+  including authority, server keys, issued state, and CRL.
+
+The local `certificate_authority_initialized:<instance>` marker is written
+only after backend, listener, client-set, and optional DNS health all pass.
+No-op applies also write it only after confirming current health. The marker
+will be an eligibility hint for device issuance; remote authority validation
+remains authoritative.
+
+### 8B validation
+
+Passing gates:
+
+- 29 focused tests: IKEv2 8, OpenVPN 8, deployment 13;
+- 14 application tests, including:
+  - exact/symlink-safe persistence seeding;
+  - OpenVPN EC Easy-RSA, partial-state, verification, and pinned-image command
+    generation;
+  - IKEv2 P-384/SHA-384, SAN, server EKU, CRL, partial-state, and verification
+    command generation;
+  - persistent-path activation;
+- strict clippy for all affected backend/deployment/application targets with
+  `-D warnings`;
+- formatting and `git diff --check`.
+
+The first IKEv2 test run stopped because its assertion expected an inner
+single-quote representation after the entire script had been quoted as the
+single `sh -c` argument. The assertion was corrected to verify the `--san`
+flag and validated identity separately. The next clippy run stopped on two
+pure helpers returning the large application error type; those helpers now
+return small static diagnostics and convert to `AppError` only at the service
+boundary.
+
+The application proof again used the temporary ring-provider diagnostic; the
+manifest and lockfile are restored to AWS-LC. Docker is unavailable, so the
+exact pinned image builds and Easy-RSA/strongSwan command execution remain
+unverified locally and are not represented as runtime proof.

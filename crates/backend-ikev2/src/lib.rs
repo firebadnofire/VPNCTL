@@ -127,7 +127,16 @@ impl VpnBackend for Ikev2Backend {
             entrypoint: Vec::new(),
             command: Vec::new(),
             sysctls: vec![("net.ipv4.ip_forward", "1")],
-            identity: ServerIdentityStrategy::CertificateAuthority,
+            identity: ServerIdentityStrategy::CertificateAuthority {
+                persistent_paths: &[
+                    "ikev2/private",
+                    "ikev2/x509",
+                    "ikev2/x509ca",
+                    "ikev2/x509crl",
+                    "ikev2/requests",
+                    "ikev2/issued",
+                ],
+            },
             validation: BackendValidation::Ikev2,
             health: BackendHealthProbe::Ikev2,
         })

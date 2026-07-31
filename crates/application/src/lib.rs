@@ -19,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vam_backend::{
     BackendError, BackendHealthProbe, BackendRegistry, BackendRuntimeSpec, BackendValidation,
-    ContainerImage, ContainerMountOwnership, ServerIdentityStrategy, VpnBackend,
+    ContainerImage, ContainerMountOwnership, CredentialAction, CredentialOperation,
+    ServerIdentityStrategy, VpnBackend,
 };
 use vam_backend_amneziawg::AmneziaWgBackend;
 use vam_backend_ikev2::Ikev2Backend;
@@ -977,6 +978,12 @@ fi
                 .finish_deployment(plan.id, DeploymentStatus::Succeeded, None)
                 .await
                 .map_err(storage_error)?;
+            if backend.capabilities().certificate_authority {
+                self.storage
+                    .set_setting(&certificate_authority_setting(instance_id), &true)
+                    .await
+                    .map_err(storage_error)?;
+            }
             return Ok(DeploymentResult {
                 deployment_id: plan.id,
                 status: DeploymentStatus::Succeeded,
@@ -2447,6 +2454,27 @@ install -d {instances} {staging_root} {backups} {trash} {stage}
                 Some("Choose unused listener ports or stop the conflicting host service.".into());
             error
         })?;
+        if let Some(seed_identity) =
+            seed_persistent_identity_command(&state.instance.remote_path(), &stage, &runtime)
+        {
+            self.record_event(
+                plan.id,
+                &mut sequence,
+                "identity",
+                "Copying the existing persistent certificate authority into protected staging.",
+                None,
+                "info",
+            )
+            .await?;
+            self.checked_execute(
+                &host,
+                &trusted,
+                passphrase.as_ref(),
+                &seed_identity,
+                cancellation,
+            )
+            .await?;
+        }
         let directories = rendered_directories(files);
         let mut prepare_dirs = format!("set -eu; install -d {}", shell_quote(&stage));
         for directory in directories {
@@ -2513,6 +2541,36 @@ install -d {instances} {staging_root} {backups} {trash} {stage}
             cancellation,
         )
         .await?;
+        if capabilities.certificate_authority {
+            let credential_plan = backend
+                .plan_credentials(state, None, CredentialAction::InitializeAuthority)
+                .map_err(backend_error)?;
+            let [operation] = credential_plan.operations.as_slice() else {
+                return Err(validation_error(
+                    "Certificate authority initialization must contain exactly one operation.",
+                ));
+            };
+            self.record_event(
+                plan.id,
+                &mut sequence,
+                "identity",
+                "Validating or initializing the staged certificate authority.",
+                None,
+                "info",
+            )
+            .await?;
+            let initialize =
+                certificate_authority_initialization_command(&stage, &runtime, operation)
+                    .map_err(validation_error)?;
+            self.checked_execute(
+                &host,
+                &trusted,
+                passphrase.as_ref(),
+                &initialize,
+                cancellation,
+            )
+            .await?;
+        }
         let server_public = if let Some(identity_command) =
             materialize_server_identity_command(&state.instance.remote_path(), &stage, &runtime)
         {
@@ -2815,6 +2873,12 @@ install -d {instances} {staging_root} {backups} {trash} {stage}
                 .await
                 .map_err(storage_error)?;
         }
+        if capabilities.certificate_authority {
+            self.storage
+                .set_setting(&certificate_authority_setting(state.instance.id), &true)
+                .await
+                .map_err(storage_error)?;
+        }
         let cleanup_stage = format!(
             "docker run --rm --user 0:0 --entrypoint sh -v {root_mount} {image} -c {script}",
             root_mount = shell_quote(&format!("{APP_ROOT}:/vam")),
@@ -2991,6 +3055,243 @@ fn safe_relative_path(path: &str) -> bool {
             .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
+fn certificate_identity_paths(runtime: &BackendRuntimeSpec) -> &'static [&'static str] {
+    match runtime.identity {
+        ServerIdentityStrategy::CertificateAuthority { persistent_paths } => persistent_paths,
+        _ => &[],
+    }
+}
+
+fn path_is_within(path: &str, parent: &str) -> bool {
+    path == parent
+        || path
+            .strip_prefix(parent)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn seed_persistent_identity_command(
+    current: &str,
+    stage: &str,
+    runtime: &BackendRuntimeSpec,
+) -> Option<String> {
+    let paths = certificate_identity_paths(runtime);
+    if paths.is_empty() {
+        return None;
+    }
+    let mut command = String::from("set -eu");
+    for path in paths {
+        debug_assert!(safe_relative_path(path));
+        let source = format!("{current}/{path}");
+        let destination = format!("{stage}/{path}");
+        let parent = Path::new(&destination)
+            .parent()
+            .expect("declared identity paths have a parent")
+            .to_string_lossy();
+        command.push_str(&format!(
+            r#"; if test -e {source} || test -L {source}; then
+  test ! -L {source}
+  if test -d {source}; then
+    if find {source} -type l -print -quit | grep -q .; then
+      echo "persistent identity contains a symbolic link: {label}" >&2
+      exit 1
+    fi
+  else
+    test -f {source}
+  fi
+  test ! -e {destination} && test ! -L {destination}
+  install -d {parent}
+  cp -a -- {source} {destination}
+fi"#,
+            source = shell_quote(&source),
+            destination = shell_quote(&destination),
+            parent = shell_quote(&parent),
+            label = path,
+        ));
+    }
+    Some(command)
+}
+
+fn authority_mount<'a>(
+    stage: &str,
+    runtime: &'a BackendRuntimeSpec,
+) -> Result<(String, &'a str), &'static str> {
+    let first_path = certificate_identity_paths(runtime)
+        .first()
+        .ok_or("The backend has no certificate authority paths.")?;
+    let mount = runtime
+        .mounts
+        .iter()
+        .find(|mount| path_is_within(first_path, mount.host_path) && !mount.read_only)
+        .ok_or("The certificate backend has no writable mount for its persistent authority.")?;
+    Ok((
+        format!("{stage}/{}:{}", mount.host_path, mount.container_path),
+        mount.container_path,
+    ))
+}
+
+fn certificate_authority_initialization_command(
+    stage: &str,
+    runtime: &BackendRuntimeSpec,
+    operation: &CredentialOperation,
+) -> Result<String, &'static str> {
+    let image = shell_quote(runtime_image_reference(runtime));
+    let (mount, root) = authority_mount(stage, runtime)?;
+    let script = match operation {
+        CredentialOperation::InitializeOpenVpnAuthority {
+            ca_common_name,
+            server_common_name,
+            ca_lifetime_days,
+            certificate_lifetime_days,
+            crl_lifetime_days,
+            tls_crypt,
+        } => {
+            let tls_required = if *tls_crypt { "1" } else { "0" };
+            format!(
+                r#"set -eu
+umask 077
+root={root}
+pki="$root/pki"
+tls_key="$root/tls-crypt.key"
+present=0
+required=5
+for file in "$pki/ca.crt" "$pki/private/ca.key" "$pki/issued/{server_common_name}.crt" "$pki/private/{server_common_name}.key" "$pki/crl.pem"; do
+  if test -s "$file"; then present=$((present + 1)); fi
+done
+if test {tls_required} -eq 1; then
+  required=$((required + 1))
+  if test -s "$tls_key"; then present=$((present + 1)); fi
+fi
+if test "$present" -eq "$required"; then
+  test ! -L "$pki"
+  if find "$pki" -type l -print -quit | grep -q .; then
+    echo "OpenVPN authority contains a symbolic link" >&2
+    exit 1
+  fi
+  openssl verify -CAfile "$pki/ca.crt" "$pki/issued/{server_common_name}.crt"
+  exit 0
+fi
+if test "$present" -ne 0 || test -e "$pki" || test -L "$pki"; then
+  echo "OpenVPN authority is partial; refusing to regenerate it" >&2
+  exit 1
+fi
+new="$root/.vam-pki-new"
+test ! -L "$new"
+rm -rf -- "$new"
+cleanup() {{ rm -rf -- "$new"; }}
+trap cleanup EXIT INT TERM HUP
+export EASYRSA=/usr/share/easy-rsa
+export EASYRSA_BATCH=1
+export EASYRSA_PKI="$new"
+export EASYRSA_ALGO=ec
+export EASYRSA_CURVE=prime256v1
+export EASYRSA_DIGEST=sha256
+EASYRSA_REQ_CN={ca_common_name} EASYRSA_CA_EXPIRE={ca_lifetime_days} easyrsa init-pki
+EASYRSA_REQ_CN={ca_common_name} EASYRSA_CA_EXPIRE={ca_lifetime_days} easyrsa build-ca nopass
+EASYRSA_CERT_EXPIRE={certificate_lifetime_days} easyrsa build-server-full {server_common_name} nopass
+EASYRSA_CRL_DAYS={crl_lifetime_days} easyrsa gen-crl
+openssl verify -CAfile "$new/ca.crt" "$new/issued/{server_common_name}.crt"
+mv "$new" "$pki"
+if test {tls_required} -eq 1; then
+  openvpn --genkey secret "$root/.vam-tls-crypt-new"
+  chmod 0600 "$root/.vam-tls-crypt-new"
+  mv "$root/.vam-tls-crypt-new" "$tls_key"
+fi
+chmod 0700 "$pki/private"
+find "$pki/private" -type f -exec chmod 0600 {{}} +
+chmod 0644 "$pki/ca.crt" "$pki/issued/{server_common_name}.crt" "$pki/crl.pem"
+trap - EXIT INT TERM HUP"#,
+                root = shell_quote(root),
+                ca_common_name = shell_quote(ca_common_name),
+                server_common_name = server_common_name,
+                ca_lifetime_days = ca_lifetime_days,
+                certificate_lifetime_days = certificate_lifetime_days,
+                crl_lifetime_days = crl_lifetime_days,
+            )
+        }
+        CredentialOperation::InitializeIkev2Authority {
+            ca_common_name,
+            server_identity,
+            key_algorithm,
+            ca_lifetime_days,
+            certificate_lifetime_days,
+            crl_lifetime_days,
+        } => {
+            let (size, digest) = match key_algorithm {
+                vam_backend::CertificateKeyAlgorithm::EcdsaP256Sha256 => (256, "sha256"),
+                vam_backend::CertificateKeyAlgorithm::EcdsaP384Sha384 => (384, "sha384"),
+            };
+            format!(
+                r#"set -eu
+umask 077
+root={root}
+ca_key="$root/private/vam-ca-key.pem"
+ca_cert="$root/x509ca/vam-ca.pem"
+server_key="$root/private/vam-server-key.pem"
+server_cert="$root/x509/vam-server.pem"
+crl="$root/x509crl/vam-crl.pem"
+present=0
+for file in "$ca_key" "$ca_cert" "$server_key" "$server_cert" "$crl"; do
+  if test -s "$file"; then present=$((present + 1)); fi
+done
+if test "$present" -eq 5; then
+  for directory in private x509 x509ca x509crl; do
+    test ! -L "$root/$directory"
+    if find "$root/$directory" -type l -print -quit | grep -q .; then
+      echo "IKEv2 authority contains a symbolic link" >&2
+      exit 1
+    fi
+  done
+  pki --verify --in "$server_cert" --cacert "$ca_cert"
+  pki --print --type crl --in "$crl" >/dev/null
+  exit 0
+fi
+if test "$present" -ne 0; then
+  echo "IKEv2 authority is partial; refusing to regenerate it" >&2
+  exit 1
+fi
+new="$root/.vam-authority-new"
+test ! -L "$new"
+rm -rf -- "$new"
+install -d -m 0700 "$new/private" "$new/x509" "$new/x509ca" "$new/x509crl"
+cleanup() {{ rm -rf -- "$new"; }}
+trap cleanup EXIT INT TERM HUP
+pki --gen --type ecdsa --size {size} --outform pem > "$new/private/vam-ca-key.pem"
+pki --self --ca --in "$new/private/vam-ca-key.pem" --type ecdsa --dn {ca_dn} --lifetime {ca_lifetime_days} --digest {digest} --outform pem > "$new/x509ca/vam-ca.pem"
+pki --gen --type ecdsa --size {size} --outform pem > "$new/private/vam-server-key.pem"
+pki --issue --in "$new/private/vam-server-key.pem" --type priv --cacert "$new/x509ca/vam-ca.pem" --cakey "$new/private/vam-ca-key.pem" --dn {server_dn} --san {server_identity} --flag serverAuth --serial 01 --lifetime {certificate_lifetime_days} --digest {digest} --outform pem > "$new/x509/vam-server.pem"
+pki --signcrl --cacert "$new/x509ca/vam-ca.pem" --cakey "$new/private/vam-ca-key.pem" --lifetime {crl_lifetime_days} --digest {digest} --outform pem > "$new/x509crl/vam-crl.pem"
+pki --verify --in "$new/x509/vam-server.pem" --cacert "$new/x509ca/vam-ca.pem"
+pki --print --type crl --in "$new/x509crl/vam-crl.pem" >/dev/null
+install -m 0600 "$new/private/vam-ca-key.pem" "$ca_key"
+install -m 0600 "$new/private/vam-server-key.pem" "$server_key"
+install -m 0644 "$new/x509ca/vam-ca.pem" "$ca_cert"
+install -m 0644 "$new/x509/vam-server.pem" "$server_cert"
+install -m 0644 "$new/x509crl/vam-crl.pem" "$crl"
+trap - EXIT INT TERM HUP
+rm -rf -- "$new""#,
+                root = shell_quote(root),
+                size = size,
+                ca_dn = shell_quote(&format!("CN={ca_common_name}")),
+                server_dn = shell_quote(&format!("CN={server_identity}")),
+                server_identity = shell_quote(server_identity),
+                ca_lifetime_days = ca_lifetime_days,
+                certificate_lifetime_days = certificate_lifetime_days,
+                crl_lifetime_days = crl_lifetime_days,
+            )
+        }
+        _ => {
+            return Err(
+                "The backend returned an invalid certificate-authority initialization plan.",
+            );
+        }
+    };
+    Ok(format!(
+        "docker run --rm --user 0:0 --entrypoint /bin/sh -v {mount} {image} -c {script}",
+        mount = shell_quote(&mount),
+        script = shell_quote(&script),
+    ))
+}
+
 fn activation_command(
     current: &str,
     stage: &str,
@@ -3005,12 +3306,39 @@ fn activation_command(
             shell_quote(&format!("{current}/{directory}"))
         ));
     }
+    let persistent_paths = certificate_identity_paths(runtime);
+    for path in persistent_paths {
+        let source = format!("{stage}/{path}");
+        let destination = format!("{current}/{path}");
+        let parent = Path::new(&destination)
+            .parent()
+            .expect("declared identity paths have a parent")
+            .to_string_lossy();
+        let trash = format!(
+            "{APP_ROOT}/trash/identity-{}-{}",
+            Utc::now().format("%Y%m%dT%H%M%SZ"),
+            path.replace('/', "_")
+        );
+        command.push_str(&format!(
+            "; if test -e {source} || test -L {source}; then test ! -L {source}; install -d {parent}; if test -e {destination} || test -L {destination}; then mv {destination} {trash}; fi; mv {source} {destination}; fi",
+            source = shell_quote(&source),
+            parent = shell_quote(&parent),
+            destination = shell_quote(&destination),
+            trash = shell_quote(&trash),
+        ));
+    }
     let changed: Vec<_> = plan
         .operations
         .iter()
         .filter_map(|operation| match operation {
             DeploymentOperation::UploadFile { path, .. }
-            | DeploymentOperation::ReplaceFile { path, .. } => Some(path),
+            | DeploymentOperation::ReplaceFile { path, .. }
+                if !persistent_paths
+                    .iter()
+                    .any(|persistent| path_is_within(path, persistent)) =>
+            {
+                Some(path)
+            }
             _ => None,
         })
         .collect();
@@ -3593,6 +3921,10 @@ fn server_public_key_setting(instance_id: Uuid) -> String {
     format!("wireguard_server_public_key:{instance_id}")
 }
 
+fn certificate_authority_setting(instance_id: Uuid) -> String {
+    format!("certificate_authority_initialized:{instance_id}")
+}
+
 #[cfg(not(test))]
 fn hostlist_cache_setting(source_id: Uuid) -> String {
     format!("dns_hostlist_cache:{source_id}")
@@ -4105,6 +4437,88 @@ mod tests {
             prepare_numeric_mount_ownership_command("/safe/current", &xray_runtime).unwrap();
         assert!(ownership.contains("chown -R 10001:10001 /work"));
         assert!(ownership.contains("'/safe/current/xray-state:/work'"));
+    }
+
+    #[test]
+    fn certificate_authorities_are_staged_idempotently_and_activated_as_persistent_state() {
+        let openvpn = command_state(VpnBackendKind::OpenVpn);
+        let openvpn_backend = OpenVpnBackend;
+        let openvpn_runtime = openvpn_backend
+            .runtime(&openvpn.instance.backend_settings)
+            .unwrap();
+        let seed =
+            seed_persistent_identity_command("/safe/current", "/safe/stage", &openvpn_runtime)
+                .unwrap();
+        assert!(seed.contains("test ! -L '/safe/current/vpn/pki'"));
+        assert!(seed.contains("find '/safe/current/vpn/pki' -type l"));
+        assert!(seed.contains("cp -a -- '/safe/current/vpn/pki' '/safe/stage/vpn/pki'"));
+
+        let credential_plan = openvpn_backend
+            .plan_credentials(&openvpn, None, CredentialAction::InitializeAuthority)
+            .unwrap();
+        let initialize = certificate_authority_initialization_command(
+            "/safe/stage",
+            &openvpn_runtime,
+            &credential_plan.operations[0],
+        )
+        .unwrap();
+        assert!(initialize.contains("vpn-appliance-manager/openvpn:"));
+        assert!(initialize.contains("OpenVPN authority is partial"));
+        assert!(initialize.contains("EASYRSA_ALGO=ec"));
+        assert!(initialize.contains("EASYRSA_CURVE=prime256v1"));
+        assert!(initialize.contains("easyrsa build-ca nopass"));
+        assert!(initialize.contains("openssl verify"));
+        assert!(!initialize.contains("latest"));
+
+        let files = openvpn_backend
+            .render_server(&openvpn, &HashMap::new())
+            .unwrap();
+        let plan = DeploymentPlan {
+            id: Uuid::nil(),
+            instance_id: openvpn.instance.id,
+            operations: files
+                .iter()
+                .map(|file| DeploymentOperation::UploadFile {
+                    path: file.path.clone(),
+                    sensitive: file.sensitive,
+                })
+                .collect(),
+            warnings: Vec::new(),
+            desired_state_hash: "hash".into(),
+        };
+        let activation = activation_command(
+            "/safe/current",
+            "/safe/stage",
+            &files,
+            &plan,
+            &openvpn_runtime,
+        );
+        assert!(activation.contains("mv '/safe/stage/vpn/pki' '/safe/current/vpn/pki'"));
+    }
+
+    #[test]
+    fn ikev2_authority_uses_p384_server_identity_and_crl_validation() {
+        let state = command_state(VpnBackendKind::Ikev2);
+        let backend = Ikev2Backend;
+        let runtime = backend.runtime(&state.instance.backend_settings).unwrap();
+        let plan = backend
+            .plan_credentials(&state, None, CredentialAction::InitializeAuthority)
+            .unwrap();
+        let command = certificate_authority_initialization_command(
+            "/safe/stage",
+            &runtime,
+            &plan.operations[0],
+        )
+        .unwrap();
+        assert!(command.contains("--type ecdsa --size 384"));
+        assert!(command.contains("--digest sha384"));
+        assert!(command.contains("--flag serverAuth"));
+        assert!(command.contains("--san"));
+        assert!(command.contains("vpn.example.test"));
+        assert!(command.contains("pki --signcrl"));
+        assert!(command.contains("pki --verify"));
+        assert!(command.contains("IKEv2 authority is partial"));
+        assert!(!command.contains("--type rsa"));
     }
 
     #[test]

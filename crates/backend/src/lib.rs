@@ -74,7 +74,9 @@ pub enum ServerIdentityStrategy {
         materialized_path: &'static str,
         sentinel: &'static str,
     },
-    CertificateAuthority,
+    CertificateAuthority {
+        persistent_paths: &'static [&'static str],
+    },
     StructuredJson,
 }
 
