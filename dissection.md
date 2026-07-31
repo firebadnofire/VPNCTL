@@ -4775,3 +4775,85 @@ Previous signed commit: `cf1146f feat: add readiness backup and activity views`
 (good EDDSA signature).
 
 Planned signed commit: `feat: add safe backend-aware instance editing`.
+
+### 12E. Componentized desktop shell and instance workspace (2026-07-31)
+
+The desktop root was a 1,432-line component that combined startup orchestration,
+all global screens, every backend form, all dialogs, and presentation helpers.
+It loaded raw instances, global hostlists, selected-instance clients/DNS, remote
+backup enumeration, and deployment-only logs on startup. The navigation still
+called clients “Devices,” and selecting an instance exposed only inline row
+actions rather than a persistent management workspace.
+
+The application shell now starts from the presentation boundary introduced in
+12B/12C: hosts, `InstanceSummaryView` records, the backend catalog, and unified
+local activity. It derives the temporary public `VpnInstance` array from each
+summary only for compatibility with workflows not yet migrated. Client and DNS
+data load when their global screen or instance tab opens; hostlists load on DNS
+entry; remote backups load only on Backups entry. Instance row selection itself
+does not issue SSH, health, readiness, or backup calls. The primary navigation
+and all newly touched visible labels now use Clients terminology while persisted
+`Device` types and commands remain unchanged.
+
+Manage opens a full-content workspace without replacing the navy sidebar. It has
+a breadcrumb, instance name, full backend name beside its compact badge, honest
+operational state, explicit Refresh health and Review deployment actions, and
+Overview, Clients, DNS, Settings, Backups, and Logs tabs. Overview suppresses
+network/DNS facts when descriptor capabilities make them meaningless. Xray's
+DNS tab explains that managed private DNS is unsupported while still showing
+global hostlists. Client, backup, and log renderers are shared by their global
+screens and corresponding workspace tabs. Creating an instance now opens its
+Overview and foregrounds the separate deployment-review action.
+
+Reusable components introduced in `apps/desktop/src/lib/components` include
+backend/state badges, empty state, instance selector, modal heading shell,
+shared client/backup/log content, and the instance workspace. Backend-specific
+creation controls moved into five isolated form components registered by one
+`backendForms` map. Common form state/defaults live in `lib/instance-form.ts`.
+The root no longer contains a repeated five-way backend markup chain for the
+creation dialog. AWG detail remains collapsed; Xray TLS exposes certificate and
+private-key file paths and sends those paths through `xray_tls_import`; PEM
+contents are never read by JavaScript or rendered into the DOM.
+
+The component split intentionally introduces no router, state library, or UI
+framework. Existing native dialog calls, local state, colors, typography,
+density, and plan/apply behavior remain in place. Shared components consume the
+Rust descriptor/summary contracts rather than duplicating badge text or state
+labels. The current raw client action and legacy backup restore paths remain
+visible compatibility surfaces to be replaced by the typed workflows in the
+next functional unit; this unit does not claim that those migrations are done.
+
+Files and subsystems changed:
+
+- `apps/desktop/src/App.svelte`: summary/activity startup, lazy entry loading,
+  Clients navigation, workspace selection, shared renderers, and form registry;
+- `apps/desktop/src/lib/components/*.svelte`: reusable presentation and scoped
+  workspace/content components;
+- `apps/desktop/src/lib/components/forms/*`: one form per backend plus registry;
+- `apps/desktop/src/lib/instance-form.ts`: common wizard state and safe defaults;
+- `apps/desktop/src/styles.css`: badge and workspace styles matching the existing
+  visual system.
+
+Validation for this unit:
+
+- direct Svelte check passed with 0 errors and 0 warnings after the first
+  component pass and again after the backend-form registry;
+- Vitest passed 2/2 existing frontend tests;
+- the production Vite web build passed (129 modules transformed, 115.02 kB
+  JavaScript and 15.00 kB CSS before gzip);
+- `git diff --check` passed;
+- source inspection confirmed startup no longer invokes `list_instances`,
+  `list_dns_hostlists`, `list_backups`, or selected-instance data commands;
+  those remote/applicable datasets are reached only through explicit screen/tab
+  entry functions.
+
+No host inspection, health request, backup enumeration, deployment, or secret
+read was executed during validation. Frontend tools were the already-installed
+local binaries; no dependency or machine changes occurred. Full interaction,
+responsive, focus, and per-backend fixture coverage is reserved for the later
+workflow/accessibility/test units in this plan.
+
+Previous signed commit: `3a5885a feat: add safe backend-aware instance editing`
+(good EDDSA signature).
+
+Planned signed commit: `refactor: componentize desktop management UI`.
