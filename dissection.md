@@ -5112,3 +5112,81 @@ Previous signed commit: `62fdc79 fix: improve desktop responsiveness and accessi
 (good EDDSA signature).
 
 Planned signed commit: `test: add desktop workflow coverage`.
+
+### 12I. Consolidated backend-aware UI validation (2026-07-31)
+
+The completed refactor now has one Rust-owned presentation contract for all five
+backends, presentation-safe instance/health/client/deployment views, one-pass
+host readiness, exact and recoverable backup restore, unified redacted activity,
+safe creation and optimistic settings APIs, a componentized capability-driven
+desktop workspace, responsive/keyboard behavior, and DOM-level regression
+coverage. Persisted `Device` and `devices` naming remains unchanged while all
+ordinary user-facing management surfaces use Client terminology. No render-time
+SSH health, backup, or readiness loop was introduced.
+
+Final Windows prerequisite and packaging gate:
+
+- `.\build-helpers\windows\build.ps1 -SkipToolInstall` passed;
+- Visual Studio C++ tools, Node 24.18.0, WebView2, NASM 3.02, Rust 1.97.1,
+  rustfmt, and Clippy were present;
+- its full workspace verification passed and Tauri produced the NSIS installer
+  at `target/release/bundle/nsis/VPN Appliance Manager_0.1.0_x64-setup.exe`;
+- no missing prerequisite required approval or installation. The helper's
+  existing Corepack step nevertheless printed `Installing pnpm@11.9.0` before
+  confirming the required version and current lockfile. This did not change a
+  source file or install system software, but it is recorded because
+  `-SkipToolInstall` is not a completely passive pnpm-version check.
+
+Final repository gates:
+
+- frontend check: 0 errors and 0 warnings;
+- frontend test: 24/24 tests passed across four files;
+- frontend production build: 134 modules, 131.42 kB JavaScript and 20.14 kB
+  CSS before gzip;
+- Rust format check passed;
+- strict `cargo clippy --workspace --all-targets -- -D warnings` passed;
+- `cargo test --workspace` passed 128 tests with no failures;
+- `cargo build --workspace` passed;
+- root `pnpm verify` passed, repeating formatting, strict Clippy, all Rust tests,
+  Svelte check, all frontend tests, and the frontend build;
+- `git diff --check` passed after every functional unit and before the final
+  documentation commit;
+- manual responsive inspection passed at 1180×760, 900×600, and 800×600 with
+  no document-level horizontal overflow; all global screens were reachable and
+  modal Escape/focus restoration was confirmed.
+
+GNU Make is not installed on this Windows host, so the literal requested
+`make frontend-check`, `make frontend-test`, `make frontend-build`, `make test`,
+and `make verify` invocations were unavailable. Their exact Makefile commands
+were run directly (`pnpm --dir apps/desktop ...`, `cargo test --workspace`,
+root `pnpm verify`, and `cargo build --workspace`). The detection-only Windows
+helper independently ran the same verification chain and a release package,
+providing a second end-to-end result rather than treating command substitution
+as unverified equivalence.
+
+No live SSH server or native credential store was available for destructive
+manual workflows. Those paths were not simulated as remote-runtime proof:
+backend command/render logic, migration, redaction, restore recovery, secret
+transactions, and readiness matrices passed Rust tests; the Svelte command
+boundary and user presentation passed mocked-native integration tests. No push,
+release, host mutation, remote deployment, or remote backup operation occurred.
+
+Signed implementation history, in order:
+
+- `f7c4ded feat: expose backend UI metadata`;
+- `1d7a8b6 feat: add desktop presentation views`;
+- `cf1146f feat: add readiness backup and activity views`;
+- `3a5885a feat: add safe backend-aware instance editing`;
+- `1296493 refactor: componentize desktop management UI`;
+- `f8efa79 feat: deliver backend-aware desktop workflows`;
+- `62fdc79 fix: improve desktop responsiveness and accessibility`;
+- `4fbf7e3 test: add desktop workflow coverage`.
+
+Each preceding commit was created with key
+`7D6EF134D851C8DA0862D97494F31AF374E2EE3C` and reported a Good EDDSA
+signature. No commit was pushed.
+
+Previous signed commit: `4fbf7e3 test: add desktop workflow coverage` (good
+EDDSA signature).
+
+Planned signed commit: `docs: record backend-aware UI implementation`.
