@@ -442,7 +442,8 @@ payload will describe:
   reference, and issued-material state;
 - IKEv2 certificate identity plus protected-PKCS#12 password reference and
   issued-material state;
-- Xray client UUID, email/label metadata, and optional flow metadata.
+- Xray client-UUID secret reference, email/label metadata, and optional flow
+  metadata.
 
 Private keys, PSKs, PKCS#12 passwords, certificate bundles containing private
 keys, and equivalent client credentials remain in native secure storage or
@@ -468,10 +469,10 @@ a routable address.
 - **IKEv2:** certificate-based IKEv2 only, modern proposals, fixed UDP
   500/4500, protected PKCS#12 export, explicit issuance/list/revoke/replace,
   and no L2TP or XAuth branches.
-- **Xray:** generated UUID plus metadata, structured server JSON, preserve
-  server-only Reality private material, reconcile/list/revoke/regenerate
-  clients, export a client configuration, and never perform raw textual JSON
-  replacement.
+- **Xray:** native-stored UUID credential plus public metadata, structured
+  server JSON, preserve server-only Reality private material,
+  reconcile/list/revoke/regenerate clients, export a client configuration, and
+  never perform raw textual JSON replacement.
 
 ### 4.6 Remote deployment and fresh-host bootstrap
 
@@ -672,8 +673,9 @@ without an eager rewrite.
 
 Added tagged device identity payloads for WireGuard, AmneziaWG, OpenVPN,
 IKEv2, and Xray. Each payload exposes its secret references generically for
-snapshot retention. Xray has no secret-store reference because its UUID is
-itself the client credential and will be treated as sensitive export material.
+snapshot retention. The initial Xray implementation stored its UUID inline;
+Unit 11's security audit reclassified that bearer credential and replaced the
+inline field with a native-store reference before completion.
 
 `Device.ipv4_address` is now optional. Existing JSON address strings
 deserialize as `Some(address)`. WireGuard, AWG, OpenVPN, and IKEv2 validation
@@ -2358,7 +2360,7 @@ truth.
 
 Xray devices remain addressless UUID identities with:
 
-- random UUIDv4 client ID;
+- random UUIDv4 client credential stored behind an opaque local reference;
 - bounded validated email/label metadata;
 - optional exact `xtls-rprx-vision` flow.
 
@@ -2666,8 +2668,9 @@ The backend rejects desired state unless:
   both strictly valid;
 - TLS contains both certificate and private-key secret references and no
   stale REALITY metadata;
-- every undeleted device has Xray data, a unique UUID, unique valid email/label,
-  and no tunnel address or managed DNS name;
+- every undeleted device has Xray data, a unique credential reference, unique
+  valid email/label, and no tunnel address or managed DNS name; server rendering
+  additionally requires unique, valid resolved UUID credentials;
 - flow is absent or exactly `xtls-rprx-vision`;
 - Vision flow is used only with raw TCP.
 
@@ -2768,8 +2771,9 @@ The focused gate was intentionally stopped and corrected at each failure:
    scopes were corrected;
 3. two tests failed because a first-12-digits UUID suffix collided for small
    fixture UUIDs and because the URI test confused the model device UUID with
-   its random Xray credential UUID; the suffix now uses the UUID tail and the
-   test reads the actual backend identity;
+   its then-inline Xray credential UUID; the suffix now uses the UUID tail.
+   Unit 11 later moved that credential behind a secret reference and changed
+   the export test to resolve the protected value;
 4. URL parsing correctly returned the percent-encoded fragment, so the test was
    corrected to assert `Work%20Laptop`;
 5. after all nine tests passed, clippy found one mergeable match arm; it was
@@ -3369,7 +3373,8 @@ three independently validated signed checkpoints.
    - OpenVPN: local EC private key and PKCS#10 CSR;
    - IKEv2: local P-384 private key/CSR plus a 64-character random protected
      PKCS#12 password;
-   - Xray: UUID and structured client metadata, with no secret reference.
+   - Xray: UUID credential in native storage plus structured non-secret client
+     metadata and an opaque reference.
 2. Allocate tunnel addresses and managed DNS only when capabilities declare
    those concepts. Xray receives neither a fake tunnel address nor CoreDNS
    record.
@@ -3601,8 +3606,8 @@ The application device factory now dispatches through the instance backend:
 - IKEv2 calls the P-384 generator, creates references for certificate/CA
   retrieval, and stores the private key, CSR, and 64-character PKCS#12
   password;
-- Xray generates a fresh UUID and structured email/flow metadata, with no
-  secret reference.
+- Xray generates a fresh UUID into native storage and persists structured
+  email/flow metadata plus only its opaque secret reference.
 
 Address allocation and managed DNS now follow backend capabilities. Routed
 backends reserve the next safe tunnel address. Xray receives `None` for its
@@ -3905,7 +3910,8 @@ storage `Device`. Its discriminated public identity contains only:
 - AWG2 public key;
 - OpenVPN Common Name and public certificate serial;
 - IKEv2 identity and public certificate serial;
-- Xray UUID, email label, and non-secret flow.
+- Xray email label and non-secret flow; the UUID credential and even its opaque
+  reference are deliberately absent.
 
 It intentionally has no `SecretReference`, private key/PSK, CSR/certificate
 reference, bundle password reference, or mutable `DeviceBackendData`.
@@ -4328,3 +4334,191 @@ delivered default russh/AWS-LC graph. The frontend tools ran directly from the
 installed workspace binaries outside the restricted read sandbox because
 pnpm-linked dependencies under the user profile otherwise raise `EPERM`; no
 packages were installed or changed.
+
+Commit:
+
+- `7b6de0e feat: review host setup from every client`;
+- verified good EDDSA signature from William Jones' configured YubiKey-backed
+  key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+## Unit 11: Definition-of-done audit and current-state documentation
+
+### 11A plan
+
+The closing test inventory maps every requested category to an existing test.
+Three semantics are implemented but not named as directly as the specification:
+WireGuard and AWG settings-change classification, and full-tree rollback of
+backend persistent state. This unit will:
+
+1. add explicit WireGuard/AWG assertions that same settings are live/no-op,
+   same-backend changes require only a service restart, and a backend mismatch
+   is destructive reinstall class;
+2. exercise `restore_backup` with Xray's persistent identity directory and
+   assert that rollback copies the complete instance tree, starts Compose,
+   performs backend health, and preserves the numeric persistent-mount
+   ownership through archive semantics;
+3. replace WireGuard-only README, architecture, remote-format, deployment,
+   security, and VM-testing claims with checkout-specific multi-backend
+   documentation;
+4. run the entire Rust workspace suite and strict workspace Clippy through the
+   same temporary native-crypto diagnostic, restore AWS-LC, then repeat all
+   frontend gates and patch sanity;
+5. record exact environmental limits: Docker/POSIX integration and native
+   Windows/macOS/Linux package builds are not available in this checkout
+   session, and the normal Windows AWS-LC build still requires NASM.
+
+### 11A implementation
+
+The closing audit added direct evidence for behavior that had previously been
+implicit:
+
+- WireGuard and AWG settings classifiers now return `LiveUpdate` for equal
+  same-backend settings, `ServiceRestart` for a same-backend settings change,
+  and `Reinstall` for a cross-backend settings payload. This avoids treating an
+  accidental discriminator mismatch as an ordinary restart.
+- Deployment planning and Apply both compare the current settings with the last
+  successful snapshot. A restart-class change adds an explicit gateway-restart
+  warning. A reinstall-class change adds a destructive warning that tells the
+  operator to review persistent identity impact before Apply.
+- Host inspection and backend health now reject a non-zero remote exit status
+  before parsing otherwise plausible stdout. The structured technical detail
+  includes the numeric status plus redacted stdout and stderr.
+- The full-tree rollback test uses an Xray instance and proves that archive-mode
+  copy restores the complete instance directory before Compose and backend
+  health. The plan expected a separate numeric-ownership normalization call,
+  but the implementation trace showed that `cp -a` preserves Xray's numeric
+  UID/GID ownership and that host-user normalization intentionally does not
+  apply to numeric mounts. The test was corrected to require the two actual
+  operations rather than demand a redundant `chown`.
+
+The security-document reconciliation then exposed a more important modeling
+error: the initial Xray implementation treated the VLESS UUID as public device
+metadata. A VLESS UUID is bearer authentication material, so an inline UUID in
+device JSON violated the repository rule that SQLite holds opaque references
+instead of secret values.
+
+The corrected lifecycle is:
+
+1. Rust generates a UUIDv4 and a separate `SecretReference`.
+2. The UUID value is staged in the native credential store.
+3. `XrayDeviceData` stores only `client_id_ref`, email, and flow.
+4. Device creation/replacement registers the reference transactionally as
+   `xray_client_id`; failed persistence deletes the staged value.
+5. Backend server rendering resolves enabled-device UUIDs inside Rust,
+   validates every value as a UUID, rejects duplicate references and duplicate
+   resolved values, then serializes the protected client list with
+   `serde_json`.
+6. Explicit VLESS export resolves only the selected device's reference.
+7. `DevicePublicIdentity::Xray` and the TypeScript union contain only email and
+   flow. Neither the credential nor its opaque reference crosses Tauri or
+   appears in routine CLI JSON.
+8. Snapshot retention now sees the Xray reference through the same generic
+   `DeviceBackendData::secret_references` path as every other backend.
+
+No legacy-Xray value migration was added. Xray did not exist in the pre-refactor
+schema; it was introduced by this same unreleased multi-backend change.
+Inventing a conversion for an inline UUID would either leave the bearer value
+in SQLite or create a reference with no matching native-store entry. Failing
+old development-only inline records is safer than silently manufacturing a
+broken credential relationship. The real migration guarantee remains the
+specified schema-0001 WireGuard upgrade path.
+
+The current-state security and architecture documents now classify the Xray
+UUID explicitly, describe its local/SQLite/remote locations, and distinguish
+manifest digests from raw secret bytes. Remote manifests contain one-way
+digests; WireGuard/AWG key lines are normalized before hashing, while a changed
+high-entropy Xray UUID or imported TLS value may affect only its digest so
+credential drift remains detectable.
+
+### 11A focused validation
+
+The first focused application run stopped with 28/29 tests passing. The only
+failure was the older identity-generation test asserting that Xray created no
+pending secret. Its expectation was updated to require exactly one reference
+whose staged value parses as a UUID; the complete focused unit was then rerun.
+
+Passing gates:
+
+- 29 application tests;
+- 10 Xray backend tests, including missing, malformed, shared-reference, and
+  duplicate resolved UUID rejection;
+- 9 core tests;
+- strict Clippy for core, application, Xray, WireGuard, and AWG, all targets,
+  with `-D warnings`;
+- formatting and `git diff --check`.
+
+The focused Rust gates used the temporary Ring diagnostic because this Windows
+host lacks NASM for the normal AWS-LC build. The exact manifest line was
+restored, `cargo tree -i aws-lc-rs -e features` restored and confirmed the
+production AWS-LC graph, and neither `Cargo.toml` nor `Cargo.lock` has a
+delivered diff.
+
+Commit:
+
+- `3659281 fix: close multi-backend security gaps`;
+- verified good EDDSA signature from William Jones' configured YubiKey-backed
+  key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### 11B current-state documentation and full validation
+
+The closing documentation pass replaced the former WireGuard-only presentation
+with checkout-specific descriptions of all five backends. The README, trust
+boundaries, remote format, deployment/recovery flow, security matrix, and VM
+acceptance guide now each state:
+
+- server implementation and listener transport/port behavior;
+- minimum container capabilities/devices/sysctls and Docker-socket exclusion;
+- persistent server identity, CA, CRL, or REALITY state;
+- local, remote, transient, and reference-only credential locations;
+- client identity, export, disable/revoke/replace behavior;
+- change-impact, image update, backup, and full-tree rollback behavior;
+- fresh-host package-manager setup and the boundary separating it from normal
+  deployment;
+- backend-appropriate DNS and health semantics;
+- current desktop limitation for Xray TLS/mKCP pending a reviewed native PEM
+  import path.
+
+Relative Markdown links were resolved across eight principal documents,
+including the Amnezia SSH provisioning report. A contradiction search found no
+remaining claim that WireGuard is the only backend, no public TypeScript
+`client_id`, and no statement that the Xray UUID lacks a secret reference.
+`git diff --check` is clean.
+
+Full passing gates:
+
+- `cargo test --workspace`: 117 unit tests across application, five concrete
+  backends, core, deployment, CLI, DNS, protocol, secrets, SSH, and storage,
+  plus all workspace doc tests;
+- `cargo clippy --workspace --all-targets -- -D warnings`;
+- `cargo fmt --all -- --check`;
+- `svelte-check`: 0 errors and 0 warnings;
+- Vitest: 1 file and 2/2 tests;
+- Vite 7.3.6 production build: 113 modules transformed and a complete bundle.
+
+The first Svelte-check shell invocation used a repository-relative executable
+while its working directory was already `apps/desktop`; PowerShell therefore
+tried to load `apps` as a module before Svelte started. The command was corrected
+to `.\node_modules\.bin\svelte-check.cmd`, after which the gate passed. A
+separate documentation-check wrapper initially had an unterminated PowerShell
+search string; removing the unnecessary escaped quote allowed all link,
+contradiction, and patch-sanity checks to run successfully. Neither invocation
+failure changed repository files.
+
+The complete Rust suite used the same temporary Ring-only `russh` diagnostic.
+Afterward the exact production dependency declaration was restored and
+`cargo tree -i aws-lc-rs -e features` confirmed default AWS-LC resolution.
+There is no `Cargo.toml` or `Cargo.lock` diff.
+
+Environment-bounded checks not claimed:
+
+- no live Docker/POSIX backend provisioning, listener, firewall, CA, or
+  rollback integration was run against a Linux VM;
+- no Windows installer, macOS universal package, or Linux package was built;
+- the normal Windows AWS-LC compile remains blocked until NASM is available,
+  and no machine prerequisite was installed without approval;
+- browser visual interaction remains unverified because the in-app browser
+  runtime previously stopped on a Windows sandbox `EPERM` before navigation.
+
+These are environment limitations, not substituted passing evidence. The
+reusable, backend-specific VM acceptance procedure is recorded in
+`docs/testing-vm.md`.
