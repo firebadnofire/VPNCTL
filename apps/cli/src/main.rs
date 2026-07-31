@@ -301,6 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ipv4_subnet: args.subnet,
                         dns_zone: args.zone,
                         routing_mode: None,
+                        xray_tls_import: None,
                     })
                     .await?,
             )?;

@@ -30,7 +30,9 @@ use vam_backend_amneziawg::AmneziaWgBackend;
 use vam_backend_ikev2::Ikev2Backend;
 use vam_backend_openvpn::OpenVpnBackend;
 use vam_backend_wireguard::WireGuardBackend;
-use vam_backend_xray::{REALITY_PUBLIC_KEY_PATH, REALITY_SHORT_ID_PATH, XrayBackend};
+use vam_backend_xray::{
+    REALITY_PUBLIC_KEY_PATH, REALITY_SHORT_ID_PATH, XrayBackend, validate_tls_material,
+};
 use vam_core::{
     AmneziaWgDeviceData, AmneziaWgSettings, BackendSettings, DEFAULT_DNS_ZONE, DEFAULT_KEEPALIVE,
     DEFAULT_SUBNET, DesiredState, Device, DeviceBackendData, DnsConfig, DnsRecord, DnsRecordType,
@@ -126,6 +128,42 @@ pub struct CreateInstanceInput {
     pub dns_zone: String,
     #[serde(default)]
     pub routing_mode: Option<RoutingMode>,
+    #[serde(default)]
+    pub xray_tls_import: Option<XrayTlsImportInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct XrayTlsImportInput {
+    pub certificate_path: PathBuf,
+    pub private_key_path: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UpdateInstanceInput {
+    pub id: Uuid,
+    pub display_name: String,
+    pub endpoint_host: String,
+    pub endpoint_port: u16,
+    pub ipv4_subnet: String,
+    pub dns_zone: String,
+    pub routing_mode: RoutingMode,
+    pub persistent_keepalive: u16,
+    pub backend_settings: BackendSettingsInput,
+    pub expected_current_state_hash: String,
+    #[serde(default)]
+    pub xray_tls_import: Option<XrayTlsImportInput>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstanceUpdatePreview {
+    pub instance_id: Uuid,
+    pub current_state_hash: String,
+    pub impact: DeploymentImpactView,
+    pub affected_client_count: usize,
+    pub requires_client_reexport: bool,
+    pub client_effect: String,
+    pub server_identity_effect: String,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -473,6 +511,7 @@ pub struct PresentationFact {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InstanceDetailView {
     pub summary: InstanceSummaryView,
+    pub current_state_hash: String,
     pub host_display_name: String,
     pub configured_image: String,
     pub drift: DriftState,
@@ -671,6 +710,94 @@ fn pending_text_secret(reference: SecretReference, value: &Zeroizing<String>) ->
     }
 }
 
+async fn prepare_xray_tls_secrets(
+    settings: &mut BackendSettings,
+    import: Option<&XrayTlsImportInput>,
+    previous: Option<&BackendSettings>,
+) -> Result<Vec<PendingSecret>, AppError> {
+    let BackendSettings::Xray(settings) = settings else {
+        if import.is_some() {
+            return Err(validation_error(
+                "TLS certificate files are accepted only for Xray instances.",
+            ));
+        }
+        return Ok(Vec::new());
+    };
+    if settings.security == XraySecurity::Reality {
+        if import.is_some() {
+            return Err(validation_error(
+                "Xray REALITY does not use imported TLS certificate files.",
+            ));
+        }
+        settings.tls_certificate_ref = None;
+        settings.tls_private_key_ref = None;
+        return Ok(Vec::new());
+    }
+    let Some(import) = import else {
+        if let Some(BackendSettings::Xray(previous)) = previous {
+            settings
+                .tls_certificate_ref
+                .clone_from(&previous.tls_certificate_ref);
+            settings
+                .tls_private_key_ref
+                .clone_from(&previous.tls_private_key_ref);
+        }
+        if settings.tls_certificate_ref.is_none() || settings.tls_private_key_ref.is_none() {
+            return Err(validation_error(
+                "Xray TLS requires both a certificate file and a private-key file.",
+            ));
+        }
+        return Ok(Vec::new());
+    };
+    let certificate = read_tls_file(&import.certificate_path, "certificate").await?;
+    let private_key = read_tls_file(&import.private_key_path, "private key").await?;
+    validate_tls_material(certificate.as_str(), private_key.as_str()).map_err(backend_error)?;
+    let certificate_ref = SecretReference(Uuid::new_v4());
+    let private_key_ref = SecretReference(Uuid::new_v4());
+    settings.tls_certificate_ref = Some(certificate_ref.clone());
+    settings.tls_private_key_ref = Some(private_key_ref.clone());
+    Ok(vec![
+        pending_text_secret(certificate_ref, &certificate),
+        pending_text_secret(private_key_ref, &private_key),
+    ])
+}
+
+async fn read_tls_file(path: &Path, label: &str) -> Result<Zeroizing<String>, AppError> {
+    const MAX_TLS_FILE_BYTES: u64 = 1024 * 1024;
+    let metadata = tokio::fs::metadata(path).await.map_err(|error| AppError {
+        code: "tls_import_failed".into(),
+        message: format!("The selected Xray TLS {label} file could not be read."),
+        scope: None,
+        remote_state_changed: false,
+        rollback_succeeded: None,
+        remediation: Some("Choose a readable PEM file and try again.".into()),
+        technical_detail: Some(error.to_string()),
+    })?;
+    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_TLS_FILE_BYTES {
+        return Err(validation_error(&format!(
+            "The Xray TLS {label} must be a non-empty file no larger than 1 MiB."
+        )));
+    }
+    let value = tokio::fs::read_to_string(path)
+        .await
+        .map_err(|error| AppError {
+            code: "tls_import_failed".into(),
+            message: format!("The selected Xray TLS {label} file could not be read."),
+            scope: None,
+            remote_state_changed: false,
+            rollback_succeeded: None,
+            remediation: Some("Choose a readable PEM file and try again.".into()),
+            technical_detail: Some(error.to_string()),
+        })?;
+    Ok(Zeroizing::new(value))
+}
+
+fn instance_state_hash(instance: &VpnInstance) -> String {
+    let encoded = serde_json::to_vec(instance)
+        .expect("VpnInstance contains only values supported by the JSON serializer");
+    format!("{:x}", Sha256::digest(encoded))
+}
+
 fn generate_device_identity(
     instance: &VpnInstance,
     display_name: &str,
@@ -855,6 +982,23 @@ fn device_secret_registrations(device: &Device) -> Vec<(Uuid, String)> {
         DeviceBackendData::Xray(data) => {
             vec![(data.client_id_ref.0, "xray_client_id".to_owned())]
         }
+    }
+}
+
+fn instance_secret_registrations(instance: &VpnInstance) -> Vec<(Uuid, String)> {
+    match &instance.backend_settings {
+        BackendSettings::Xray(settings) => settings
+            .tls_certificate_ref
+            .iter()
+            .map(|reference| (reference.0, "xray_tls_certificate".to_owned()))
+            .chain(
+                settings
+                    .tls_private_key_ref
+                    .iter()
+                    .map(|reference| (reference.0, "xray_tls_private_key".to_owned())),
+            )
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1393,7 +1537,7 @@ fi
             .await
             .map_err(storage_error)?;
         let endpoint_host = input.endpoint_host.trim().to_owned();
-        let backend_settings = match input.backend_settings {
+        let mut backend_settings = match input.backend_settings {
             Some(settings) if settings.kind() == input.backend => settings.into_backend_settings(),
             Some(_) => {
                 return Err(validation_error(
@@ -1402,6 +1546,9 @@ fi
             }
             None => BackendSettings::defaults_for(input.backend, &endpoint_host),
         };
+        let pending_secrets =
+            prepare_xray_tls_secrets(&mut backend_settings, input.xray_tls_import.as_ref(), None)
+                .await?;
         let subnet: Ipv4Net = input
             .ipv4_subnet
             .parse()
@@ -1461,14 +1608,27 @@ fi
         instances.push(instance.clone());
         validate_host_instances(&instances)
             .map_err(|error| validation_error(&error.to_string()))?;
-        self.storage
-            .save_instance(&instance)
-            .await
-            .map_err(storage_error)?;
+        if pending_secrets.is_empty() {
+            self.storage
+                .save_instance(&instance)
+                .await
+                .map_err(storage_error)?;
+        } else {
+            self.store_pending_secrets(&pending_secrets).await?;
+            let registrations = instance_secret_registrations(&instance);
+            if let Err(error) = self
+                .storage
+                .save_instance_with_replacement_secrets(&instance, &registrations)
+                .await
+            {
+                self.delete_pending_secrets(&pending_secrets).await;
+                return Err(storage_error(error));
+            }
+        }
         Ok(instance)
     }
 
-    pub async fn update_instance(
+    async fn save_validated_instance(
         &self,
         mut instance: VpnInstance,
     ) -> Result<VpnInstance, AppError> {
@@ -1488,6 +1648,139 @@ fi
             .await
             .map_err(storage_error)?;
         Ok(instance)
+    }
+
+    pub async fn preview_instance_update(
+        &self,
+        input: UpdateInstanceInput,
+    ) -> Result<InstanceUpdatePreview, AppError> {
+        let current = self
+            .storage
+            .get_instance(input.id)
+            .await
+            .map_err(storage_error)?;
+        if let Some(error) = instance_state_hash_error(&current, &input.expected_current_state_hash)
+        {
+            return Err(error);
+        }
+        let (candidate, _pending_secrets) = self
+            .build_instance_update_candidate(&current, &input)
+            .await?;
+        let client_count = self
+            .storage
+            .list_devices(current.id)
+            .await
+            .map_err(storage_error)?
+            .len();
+        Ok(instance_update_preview(&current, &candidate, client_count))
+    }
+
+    pub async fn update_instance_view(
+        &self,
+        input: UpdateInstanceInput,
+    ) -> Result<InstanceView, AppError> {
+        let lock = self.instance_lock(input.id).await;
+        let _guard = lock.lock().await;
+        let current = self
+            .storage
+            .get_instance(input.id)
+            .await
+            .map_err(storage_error)?;
+        if let Some(error) = instance_state_hash_error(&current, &input.expected_current_state_hash)
+        {
+            return Err(error);
+        }
+        let (mut candidate, pending_secrets) = self
+            .build_instance_update_candidate(&current, &input)
+            .await?;
+        candidate.updated_at = Utc::now();
+        let secret_references_changed = current.backend_settings.secret_references()
+            != candidate.backend_settings.secret_references();
+        if pending_secrets.is_empty() && !secret_references_changed {
+            candidate = self.save_validated_instance(candidate).await?;
+        } else {
+            self.store_pending_secrets(&pending_secrets).await?;
+            let registrations = instance_secret_registrations(&candidate);
+            if let Err(error) = self
+                .storage
+                .save_instance_with_replacement_secrets(&candidate, &registrations)
+                .await
+            {
+                self.delete_pending_secrets(&pending_secrets).await;
+                return Err(storage_error(error));
+            }
+        }
+        self.record_activity_event(
+            "info",
+            "instance_settings_updated",
+            "Instance settings updated",
+            "Saved local desired settings. Remote services were not changed.",
+            Some(&candidate),
+            None,
+        )
+        .await?;
+        Ok(InstanceView::from(&candidate))
+    }
+
+    async fn build_instance_update_candidate(
+        &self,
+        current: &VpnInstance,
+        input: &UpdateInstanceInput,
+    ) -> Result<(VpnInstance, Vec<PendingSecret>), AppError> {
+        if input.backend_settings.kind() != current.backend {
+            return Err(validation_error(
+                "The instance backend cannot be changed from Settings.",
+            ));
+        }
+        let subnet: Ipv4Net = input
+            .ipv4_subnet
+            .parse()
+            .map_err(|_| validation_error("The IPv4 subnet is invalid."))?;
+        let gateway = first_usable(subnet).map_err(|error| validation_error(&error.to_string()))?;
+        let mut backend_settings = input.backend_settings.clone().into_backend_settings();
+        let pending_secrets = prepare_xray_tls_secrets(
+            &mut backend_settings,
+            input.xray_tls_import.as_ref(),
+            Some(&current.backend_settings),
+        )
+        .await?;
+        let mut candidate = current.clone();
+        candidate.display_name = input.display_name.trim().to_owned();
+        candidate.endpoint.host = input.endpoint_host.trim().to_owned();
+        candidate.endpoint.port = input.endpoint_port;
+        candidate.network.ipv4_subnet = subnet;
+        candidate.network.gateway_ipv4 = gateway;
+        candidate.dns.zone = input
+            .dns_zone
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        if candidate.dns.zone != current.dns.zone {
+            candidate.dns.soa_serial =
+                next_soa_serial(current.dns.soa_serial, Utc::now().date_naive())
+                    .map_err(|error| validation_error(&error.to_string()))?;
+        }
+        candidate.routing_mode = input.routing_mode;
+        candidate.persistent_keepalive = input.persistent_keepalive;
+        candidate.backend_settings = backend_settings;
+        validate_instance(&candidate).map_err(|error| validation_error(&error.to_string()))?;
+        let mut state = self.desired_state(current.id).await?;
+        state.instance.clone_from(&candidate);
+        self.backends
+            .get(candidate.backend)
+            .map_err(backend_error)?
+            .validate(&state)
+            .map_err(backend_error)?;
+        let mut instances = self
+            .storage
+            .list_instances(Some(current.host_id))
+            .await
+            .map_err(storage_error)?;
+        instances.retain(|instance| instance.id != current.id);
+        instances.push(candidate.clone());
+        validate_host_instances(&instances)
+            .map_err(|error| validation_error(&error.to_string()))?;
+        Ok((candidate, pending_secrets))
     }
 
     pub async fn list_instances(
@@ -1562,6 +1855,7 @@ fi
             DriftState::NotChecked
         };
         Ok(InstanceDetailView {
+            current_state_hash: instance_state_hash(&instance),
             facts: instance_presentation_facts(&instance),
             summary,
             host_display_name: host.display_name,
@@ -2198,6 +2492,12 @@ fi
             stored.push(secret.reference.clone());
         }
         Ok(())
+    }
+
+    async fn delete_pending_secrets(&self, secrets: &[PendingSecret]) {
+        for secret in secrets {
+            let _ = self.secrets.delete(&secret.reference).await;
+        }
     }
 
     async fn delete_device_secrets(&self, device: &Device) {
@@ -6789,6 +7089,101 @@ fn client_action_view(
     }
 }
 
+fn instance_state_hash_error(instance: &VpnInstance, expected: &str) -> Option<AppError> {
+    let current = instance_state_hash(instance);
+    if current == expected {
+        return None;
+    }
+    Some(AppError {
+        code: "stale_instance_state".into(),
+        message: "The instance changed after this settings form was opened.".into(),
+        scope: Some(instance.id.to_string()),
+        remote_state_changed: false,
+        rollback_succeeded: None,
+        remediation: Some(
+            "Reload the instance settings, review the changes, and try again.".into(),
+        ),
+        technical_detail: None,
+    })
+}
+
+fn instance_update_preview(
+    current: &VpnInstance,
+    candidate: &VpnInstance,
+    client_count: usize,
+) -> InstanceUpdatePreview {
+    let backend = match (&current.backend_settings, &candidate.backend_settings) {
+        (BackendSettings::WireGuard(_), BackendSettings::WireGuard(_)) => WireGuardBackend
+            .classify_settings_change(&current.backend_settings, &candidate.backend_settings),
+        (BackendSettings::AmneziaWg(_), BackendSettings::AmneziaWg(_)) => AmneziaWgBackend
+            .classify_settings_change(&current.backend_settings, &candidate.backend_settings),
+        (BackendSettings::OpenVpn(_), BackendSettings::OpenVpn(_)) => OpenVpnBackend
+            .classify_settings_change(&current.backend_settings, &candidate.backend_settings),
+        (BackendSettings::Ikev2(_), BackendSettings::Ikev2(_)) => Ikev2Backend
+            .classify_settings_change(&current.backend_settings, &candidate.backend_settings),
+        (BackendSettings::Xray(_), BackendSettings::Xray(_)) => XrayBackend
+            .classify_settings_change(&current.backend_settings, &candidate.backend_settings),
+        _ => unreachable!("candidate construction preserves the backend"),
+    };
+    let network_changed = current.network != candidate.network;
+    let listener_changed = current.listeners() != candidate.listeners();
+    let endpoint_changed = current.endpoint != candidate.endpoint;
+    let dns_changed = current.dns.zone != candidate.dns.zone;
+    let routing_changed = current.routing_mode != candidate.routing_mode
+        || current.persistent_keepalive != candidate.persistent_keepalive;
+    let settings_changed = current.backend_settings != candidate.backend_settings;
+    let impact = if network_changed || settings_changed && backend == ChangeImpact::Reinstall {
+        DeploymentImpactView::Reinstall
+    } else if listener_changed
+        || routing_changed
+        || settings_changed && backend == ChangeImpact::ServiceRestart
+    {
+        DeploymentImpactView::ServiceRestart
+    } else if dns_changed {
+        DeploymentImpactView::DnsReload
+    } else if endpoint_changed || settings_changed {
+        DeploymentImpactView::LiveReload
+    } else {
+        DeploymentImpactView::NoChanges
+    };
+    let requires_client_reexport = network_changed || endpoint_changed || listener_changed;
+    let mut warnings = Vec::new();
+    if impact == DeploymentImpactView::Reinstall {
+        warnings.push(
+            "This change is reinstall-class. Review the deployment preview and backup behavior before applying it remotely."
+                .into(),
+        );
+    }
+    if requires_client_reexport && client_count > 0 {
+        warnings.push(format!(
+            "{client_count} client profile(s) must be exported again after deployment."
+        ));
+    }
+    InstanceUpdatePreview {
+        instance_id: current.id,
+        current_state_hash: instance_state_hash(current),
+        impact,
+        affected_client_count: if requires_client_reexport {
+            client_count
+        } else {
+            0
+        },
+        requires_client_reexport,
+        client_effect: if requires_client_reexport {
+            "Client profiles must be re-exported after the reviewed deployment.".into()
+        } else {
+            "Existing client profiles remain valid.".into()
+        },
+        server_identity_effect: if impact == DeploymentImpactView::Reinstall {
+            "The deployment must protect persistent server identity with a pre-change backup."
+                .into()
+        } else {
+            "Persistent server identity is unchanged.".into()
+        },
+        warnings,
+    }
+}
+
 fn deployment_preview_view(plan: DeploymentPlan, client_count: usize) -> DeploymentPreviewView {
     let reinstall = plan
         .warnings
@@ -8573,10 +8968,177 @@ mod tests {
                 ipv4_subnet: DEFAULT_SUBNET.into(),
                 dns_zone: DEFAULT_DNS_ZONE.into(),
                 routing_mode: None,
+                xray_tls_import: None,
             })
             .await
             .unwrap();
         assert_eq!(service.list_instances(None).await.unwrap(), vec![instance]);
+    }
+
+    #[tokio::test]
+    async fn safe_instance_update_rejects_stale_and_backend_mutation() {
+        let storage = Storage::in_memory().await.unwrap();
+        let service = ApplicationService::with_transport(
+            storage,
+            Arc::new(MemorySecretStore::default()),
+            Arc::new(RusshTransport::default()),
+        );
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "192.0.2.1".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let instance = service
+            .create_instance(CreateInstanceInput {
+                host_id: host.id,
+                display_name: "private".into(),
+                endpoint_host: "vpn.example.test".into(),
+                backend: VpnBackendKind::WireGuard,
+                backend_settings: None,
+                endpoint_port: Some(DEFAULT_PORT),
+                ipv4_subnet: DEFAULT_SUBNET.into(),
+                dns_zone: DEFAULT_DNS_ZONE.into(),
+                routing_mode: None,
+                xray_tls_import: None,
+            })
+            .await
+            .unwrap();
+        let hash = instance_state_hash(&instance);
+        service
+            .create_device(CreateDeviceInput {
+                instance_id: instance.id,
+                user_id: None,
+                display_name: "laptop".into(),
+                preshared_key: true,
+                create_dns_record: false,
+                dns_name: None,
+            })
+            .await
+            .unwrap();
+        let base = UpdateInstanceInput {
+            id: instance.id,
+            display_name: "private renamed".into(),
+            endpoint_host: instance.endpoint.host.clone(),
+            endpoint_port: instance.endpoint.port,
+            ipv4_subnet: instance.network.ipv4_subnet.to_string(),
+            dns_zone: instance.dns.zone.clone(),
+            routing_mode: instance.routing_mode,
+            persistent_keepalive: instance.persistent_keepalive,
+            backend_settings: BackendSettingsInput::from(&instance.backend_settings),
+            expected_current_state_hash: hash,
+            xray_tls_import: None,
+        };
+        let preview = service.preview_instance_update(base.clone()).await.unwrap();
+        assert_eq!(preview.impact, DeploymentImpactView::NoChanges);
+        assert!(!preview.requires_client_reexport);
+        let mut endpoint_change = base.clone();
+        endpoint_change.endpoint_host = "new-vpn.example.test".into();
+        let preview = service
+            .preview_instance_update(endpoint_change)
+            .await
+            .unwrap();
+        assert_eq!(preview.impact, DeploymentImpactView::LiveReload);
+        assert!(preview.requires_client_reexport);
+        assert_eq!(preview.affected_client_count, 1);
+
+        let mut wrong_backend = base.clone();
+        wrong_backend.backend_settings = BackendSettingsInput::OpenVpn(OpenVpnSettings::default());
+        let error = service
+            .preview_instance_update(wrong_backend)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "validation");
+        assert!(error.message.contains("backend cannot be changed"));
+
+        service.update_instance_view(base.clone()).await.unwrap();
+        let error = service.update_instance_view(base).await.unwrap_err();
+        assert_eq!(error.code, "stale_instance_state");
+        let saved = service.storage.get_instance(instance.id).await.unwrap();
+        assert_eq!(saved.host_id, host.id);
+        assert_eq!(saved.backend, VpnBackendKind::WireGuard);
+    }
+
+    #[tokio::test]
+    async fn xray_tls_import_stays_behind_the_application_boundary() {
+        let storage = Storage::in_memory().await.unwrap();
+        let secrets = Arc::new(MemorySecretStore::default());
+        let service = ApplicationService::with_transport(
+            storage,
+            secrets.clone(),
+            Arc::new(RusshTransport::default()),
+        );
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "192.0.2.1".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let directory = std::env::temp_dir().join(format!("vam-xray-tls-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.unwrap();
+        let certificate_path = directory.join("certificate.pem");
+        let private_key_path = directory.join("private-key.pem");
+        tokio::fs::write(
+            &certificate_path,
+            "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n",
+        )
+        .await
+        .unwrap();
+        tokio::fs::write(
+            &private_key_path,
+            "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----\n",
+        )
+        .await
+        .unwrap();
+        let instance = service
+            .create_instance(CreateInstanceInput {
+                host_id: host.id,
+                display_name: "xray tls".into(),
+                endpoint_host: "vpn.example.test".into(),
+                backend: VpnBackendKind::Xray,
+                backend_settings: Some(BackendSettingsInput::Xray(PublicXraySettings {
+                    security: XraySecurity::Tls,
+                    transport: XrayTransport::Xhttp,
+                    server_name: "vpn.example.test".into(),
+                    fingerprint: "chrome".into(),
+                    xhttp_path: "/tunnel".into(),
+                    reality_public_key: None,
+                    reality_short_id: None,
+                })),
+                endpoint_port: Some(443),
+                ipv4_subnet: "10.91.0.0/24".into(),
+                dns_zone: "xray.internal".into(),
+                routing_mode: Some(RoutingMode::SplitTunnel),
+                xray_tls_import: Some(XrayTlsImportInput {
+                    certificate_path: certificate_path.clone(),
+                    private_key_path: private_key_path.clone(),
+                }),
+            })
+            .await
+            .unwrap();
+        let BackendSettings::Xray(settings) = &instance.backend_settings else {
+            panic!("expected Xray settings");
+        };
+        let certificate_ref = settings.tls_certificate_ref.as_ref().unwrap();
+        let private_key_ref = settings.tls_private_key_ref.as_ref().unwrap();
+        assert!(secrets.get(certificate_ref).await.is_ok());
+        assert!(secrets.get(private_key_ref).await.is_ok());
+        let public_json = serde_json::to_string(&InstanceView::from(&instance)).unwrap();
+        assert!(!public_json.contains("tls_certificate_ref"));
+        assert!(!public_json.contains("tls_private_key_ref"));
+        assert!(!public_json.contains("BEGIN CERTIFICATE"));
+        assert!(!public_json.contains(directory.to_string_lossy().as_ref()));
+        tokio::fs::remove_dir_all(&directory).await.unwrap();
     }
 
     #[tokio::test]
@@ -8676,6 +9238,7 @@ mod tests {
                     ipv4_subnet: format!("10.64.{index}.0/24"),
                     dns_zone: format!("backend-{index}.internal"),
                     routing_mode: None,
+                    xray_tls_import: None,
                 })
                 .await
                 .unwrap();
@@ -8720,6 +9283,7 @@ mod tests {
                 ipv4_subnet: "10.65.0.0/24".into(),
                 dns_zone: "mismatch.internal".into(),
                 routing_mode: None,
+                xray_tls_import: None,
             })
             .await
             .unwrap_err();
@@ -8757,6 +9321,7 @@ mod tests {
                 ipv4_subnet: DEFAULT_SUBNET.into(),
                 dns_zone: "test.internal".into(),
                 routing_mode: None,
+                xray_tls_import: None,
             })
             .await
             .unwrap();
@@ -8984,6 +9549,7 @@ mod tests {
                 ipv4_subnet: DEFAULT_SUBNET.into(),
                 dns_zone: DEFAULT_DNS_ZONE.into(),
                 routing_mode: None,
+                xray_tls_import: None,
             })
             .await
             .unwrap();
@@ -9026,6 +9592,7 @@ mod tests {
                 ipv4_subnet: DEFAULT_SUBNET.into(),
                 dns_zone: "test.internal".into(),
                 routing_mode: None,
+                xray_tls_import: None,
             })
             .await
             .unwrap();
@@ -9098,6 +9665,7 @@ mod tests {
                 ipv4_subnet: DEFAULT_SUBNET.into(),
                 dns_zone: DEFAULT_DNS_ZONE.into(),
                 routing_mode: None,
+                xray_tls_import: None,
             })
             .await
             .unwrap();
@@ -9478,6 +10046,7 @@ mod tests {
                 ipv4_subnet: DEFAULT_SUBNET.into(),
                 dns_zone: DEFAULT_DNS_ZONE.into(),
                 routing_mode: None,
+                xray_tls_import: None,
             })
             .await
             .unwrap();
@@ -9523,6 +10092,7 @@ mod tests {
                 ipv4_subnet: DEFAULT_SUBNET.into(),
                 dns_zone: DEFAULT_DNS_ZONE.into(),
                 routing_mode: None,
+                xray_tls_import: None,
             })
             .await
             .unwrap();

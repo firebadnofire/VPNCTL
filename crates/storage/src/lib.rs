@@ -3,7 +3,7 @@ use std::{collections::HashSet, path::Path, str::FromStr};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlx::{
-    Row, SqlitePool,
+    Row, Sqlite, SqlitePool, Transaction,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 use thiserror::Error;
@@ -308,50 +308,36 @@ impl Storage {
 
     pub async fn save_instance(&self, instance: &VpnInstance) -> Result<(), StorageError> {
         let mut transaction = self.pool.begin().await?;
+        save_instance_in_transaction(&mut transaction, instance).await?;
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn save_instance_with_replacement_secrets(
+        &self,
+        instance: &VpnInstance,
+        secret_references: &[(Uuid, String)],
+    ) -> Result<(), StorageError> {
+        let mut transaction = self.pool.begin().await?;
+        save_instance_in_transaction(&mut transaction, instance).await?;
         sqlx::query(
-            "INSERT INTO vpn_instances
-             (id, host_id, display_name, backend, endpoint_port, ipv4_subnet, dns_zone,
-              model_json, created_at, updated_at, deleted_at, instance_schema_version,
-              backend_settings_json)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(id) DO UPDATE SET host_id=excluded.host_id,
-              display_name=excluded.display_name, backend=excluded.backend,
-              endpoint_port=excluded.endpoint_port, ipv4_subnet=excluded.ipv4_subnet,
-              dns_zone=excluded.dns_zone, model_json=excluded.model_json,
-              updated_at=excluded.updated_at, deleted_at=excluded.deleted_at,
-              instance_schema_version=excluded.instance_schema_version,
-              backend_settings_json=excluded.backend_settings_json",
+            "UPDATE secret_references SET pending_delete_at=?
+             WHERE owner_id=? AND pending_delete_at IS NULL",
         )
+        .bind(Utc::now().to_rfc3339())
         .bind(instance.id.to_string())
-        .bind(instance.host_id.to_string())
-        .bind(&instance.display_name)
-        .bind(instance.backend.as_str())
-        .bind(i64::from(instance.endpoint.port))
-        .bind(instance.network.ipv4_subnet.to_string())
-        .bind(&instance.dns.zone)
-        .bind(serde_json::to_string(instance)?)
-        .bind(instance.created_at.to_rfc3339())
-        .bind(instance.updated_at.to_rfc3339())
-        .bind(instance.deleted_at.map(|value| value.to_rfc3339()))
-        .bind(i64::from(CURRENT_INSTANCE_SCHEMA_VERSION))
-        .bind(serde_json::to_string(&instance.backend_settings)?)
         .execute(&mut *transaction)
         .await?;
-        sqlx::query("DELETE FROM instance_listeners WHERE instance_id = ?")
-            .bind(instance.id.to_string())
-            .execute(&mut *transaction)
-            .await?;
-        for listener in instance.listeners() {
+        for (reference, purpose) in secret_references {
             sqlx::query(
-                "INSERT INTO instance_listeners
-                 (instance_id, host_id, port, transport, active)
-                 VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO secret_references
+                 (id, purpose, owner_id, created_at, pending_delete_at)
+                 VALUES (?, ?, ?, ?, NULL)",
             )
+            .bind(reference.to_string())
+            .bind(purpose)
             .bind(instance.id.to_string())
-            .bind(instance.host_id.to_string())
-            .bind(i64::from(listener.port))
-            .bind(listener.protocol.as_str())
-            .bind(instance.deleted_at.is_none())
+            .bind(Utc::now().to_rfc3339())
             .execute(&mut *transaction)
             .await?;
         }
@@ -1311,6 +1297,60 @@ impl Storage {
     }
 }
 
+async fn save_instance_in_transaction(
+    transaction: &mut Transaction<'_, Sqlite>,
+    instance: &VpnInstance,
+) -> Result<(), StorageError> {
+    sqlx::query(
+        "INSERT INTO vpn_instances
+         (id, host_id, display_name, backend, endpoint_port, ipv4_subnet, dns_zone,
+          model_json, created_at, updated_at, deleted_at, instance_schema_version,
+          backend_settings_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET host_id=excluded.host_id,
+          display_name=excluded.display_name, backend=excluded.backend,
+          endpoint_port=excluded.endpoint_port, ipv4_subnet=excluded.ipv4_subnet,
+          dns_zone=excluded.dns_zone, model_json=excluded.model_json,
+          updated_at=excluded.updated_at, deleted_at=excluded.deleted_at,
+          instance_schema_version=excluded.instance_schema_version,
+          backend_settings_json=excluded.backend_settings_json",
+    )
+    .bind(instance.id.to_string())
+    .bind(instance.host_id.to_string())
+    .bind(&instance.display_name)
+    .bind(instance.backend.as_str())
+    .bind(i64::from(instance.endpoint.port))
+    .bind(instance.network.ipv4_subnet.to_string())
+    .bind(&instance.dns.zone)
+    .bind(serde_json::to_string(instance)?)
+    .bind(instance.created_at.to_rfc3339())
+    .bind(instance.updated_at.to_rfc3339())
+    .bind(instance.deleted_at.map(|value| value.to_rfc3339()))
+    .bind(i64::from(CURRENT_INSTANCE_SCHEMA_VERSION))
+    .bind(serde_json::to_string(&instance.backend_settings)?)
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query("DELETE FROM instance_listeners WHERE instance_id = ?")
+        .bind(instance.id.to_string())
+        .execute(&mut **transaction)
+        .await?;
+    for listener in instance.listeners() {
+        sqlx::query(
+            "INSERT INTO instance_listeners
+             (instance_id, host_id, port, transport, active)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(instance.id.to_string())
+        .bind(instance.host_id.to_string())
+        .bind(i64::from(listener.port))
+        .bind(listener.protocol.as_str())
+        .bind(instance.deleted_at.is_none())
+        .execute(&mut **transaction)
+        .await?;
+    }
+    Ok(())
+}
+
 fn json_rows<T>(rows: Vec<sqlx::sqlite::SqliteRow>) -> Result<Vec<T>, StorageError>
 where
     T: serde::de::DeserializeOwned,
@@ -2170,5 +2210,58 @@ mod tests {
         let mut expected = vec![certificate_ref.0, private_key_ref.0];
         expected.sort();
         assert_eq!(deletable, expected);
+    }
+
+    #[tokio::test]
+    async fn instance_and_replacement_secret_references_commit_together() {
+        let storage = Storage::in_memory().await.unwrap();
+        let host = host();
+        storage.save_host(&host).await.unwrap();
+        let old_certificate = SecretReference(Uuid::new_v4());
+        let old_private_key = SecretReference(Uuid::new_v4());
+        let mut instance = instance(host.id, Uuid::new_v4(), 443);
+        instance.backend = VpnBackendKind::Xray;
+        instance.backend_settings = BackendSettings::Xray(XraySettings {
+            tls_certificate_ref: Some(old_certificate.clone()),
+            tls_private_key_ref: Some(old_private_key.clone()),
+            ..XraySettings::default()
+        });
+        storage.save_instance(&instance).await.unwrap();
+        for (reference, purpose) in [
+            (&old_certificate, "xray_tls_certificate"),
+            (&old_private_key, "xray_tls_private_key"),
+        ] {
+            storage
+                .register_secret_reference(reference.0, purpose, instance.id)
+                .await
+                .unwrap();
+        }
+        let new_certificate = SecretReference(Uuid::new_v4());
+        let new_private_key = SecretReference(Uuid::new_v4());
+        instance.backend_settings = BackendSettings::Xray(XraySettings {
+            tls_certificate_ref: Some(new_certificate.clone()),
+            tls_private_key_ref: Some(new_private_key.clone()),
+            ..XraySettings::default()
+        });
+        storage
+            .save_instance_with_replacement_secrets(
+                &instance,
+                &[
+                    (new_certificate.0, "xray_tls_certificate".into()),
+                    (new_private_key.0, "xray_tls_private_key".into()),
+                ],
+            )
+            .await
+            .unwrap();
+        let saved = storage.get_instance(instance.id).await.unwrap();
+        assert_eq!(saved.backend_settings, instance.backend_settings);
+        let mut retired = storage
+            .deletable_secret_references(instance.id, 10)
+            .await
+            .unwrap();
+        retired.sort();
+        let mut expected = vec![old_certificate.0, old_private_key.0];
+        expected.sort();
+        assert_eq!(retired, expected);
     }
 }

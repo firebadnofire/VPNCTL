@@ -6,8 +6,8 @@ use vam_application::{
     ActivityFilter, ApplicationService, BackendOptionView, BackupRestorePreview, BackupView,
     ClientView, CreateDeviceInput, CreateDnsHostlistInput, CreateDnsRecordInput, CreateHostInput,
     CreateInstanceInput, DeploymentPreviewView, DeviceView, DnsHostlist, HostInspectionView,
-    InstanceDetailView, InstanceHealthView, InstanceSummaryView, InstanceView, LogEventView,
-    UpdateDeviceInput,
+    InstanceDetailView, InstanceHealthView, InstanceSummaryView, InstanceUpdatePreview,
+    InstanceView, LogEventView, UpdateDeviceInput, UpdateInstanceInput,
 };
 use vam_core::{DnsRecord, DockerHost, User};
 use vam_protocol::{
@@ -123,6 +123,22 @@ async fn create_instance(
     input: CreateInstanceInput,
 ) -> Result<InstanceView, AppError> {
     state.0.create_instance_view(input).await
+}
+
+#[tauri::command]
+async fn preview_instance_update(
+    state: State<'_, AppState>,
+    input: UpdateInstanceInput,
+) -> Result<InstanceUpdatePreview, AppError> {
+    state.0.preview_instance_update(input).await
+}
+
+#[tauri::command]
+async fn update_instance(
+    state: State<'_, AppState>,
+    input: UpdateInstanceInput,
+) -> Result<InstanceView, AppError> {
+    state.0.update_instance_view(input).await
 }
 
 #[tauri::command]
@@ -526,6 +542,8 @@ pub fn run() {
             plan_host_provisioning,
             apply_host_provisioning,
             create_instance,
+            preview_instance_update,
+            update_instance,
             list_instances,
             list_instance_summaries,
             instance_detail,

@@ -743,6 +743,15 @@ fn validate_private_key_pem(value: &str) -> Result<(), BackendError> {
     Ok(())
 }
 
+/// Validates Xray TLS material before the application places it in secure storage.
+///
+/// The values are intentionally accepted by reference and are never included in an
+/// error so callers can safely surface validation failures across a UI boundary.
+pub fn validate_tls_material(certificate: &str, private_key: &str) -> Result<(), BackendError> {
+    validate_certificate_pem(certificate)?;
+    validate_private_key_pem(private_key)
+}
+
 fn render_server_json(
     state: &DesiredState,
     settings: &XraySettings,
@@ -1533,5 +1542,20 @@ mod tests {
             ),
             ChangeImpact::Reinstall
         );
+    }
+
+    #[test]
+    fn tls_import_validation_accepts_pem_boundaries_and_rejects_keyless_input() {
+        let certificate = "-----BEGIN CERTIFICATE-----\nfixture\n-----END CERTIFICATE-----\n";
+        let private_key = "-----BEGIN PRIVATE KEY-----\nfixture\n-----END PRIVATE KEY-----\n";
+        assert!(validate_tls_material(certificate, private_key).is_ok());
+        assert!(matches!(
+            validate_tls_material(certificate, "not a private key"),
+            Err(BackendError::InvalidKeyMaterial(VpnBackendKind::Xray))
+        ));
+        assert!(matches!(
+            validate_tls_material("not a certificate", private_key),
+            Err(BackendError::InvalidKeyMaterial(VpnBackendKind::Xray))
+        ));
     }
 }

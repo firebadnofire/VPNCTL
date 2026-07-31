@@ -224,11 +224,44 @@ export interface PresentationFact {
 
 export interface InstanceDetail {
   summary: InstanceSummary;
+  current_state_hash: string;
   host_display_name: string;
   configured_image: string;
   drift: DriftState;
   last_backup_name?: string | null;
   facts: PresentationFact[];
+}
+
+export interface XrayTlsImportInput {
+  certificate_path: string;
+  private_key_path: string;
+}
+
+export interface CreateInstanceInput {
+  host_id: UUID;
+  display_name: string;
+  endpoint_host: string;
+  backend: VpnBackendKind;
+  backend_settings?: BackendSettings | null;
+  endpoint_port?: number | null;
+  ipv4_subnet: string;
+  dns_zone: string;
+  routing_mode?: "full_tunnel" | "split_tunnel" | null;
+  xray_tls_import?: XrayTlsImportInput | null;
+}
+
+export interface UpdateInstanceInput {
+  id: UUID;
+  display_name: string;
+  endpoint_host: string;
+  endpoint_port: number;
+  ipv4_subnet: string;
+  dns_zone: string;
+  routing_mode: "full_tunnel" | "split_tunnel";
+  persistent_keepalive: number;
+  backend_settings: BackendSettings;
+  expected_current_state_hash: string;
+  xray_tls_import?: XrayTlsImportInput | null;
 }
 
 export interface User {
@@ -542,4 +575,15 @@ export interface DeploymentPreview {
   drift: DriftState;
   warnings: string[];
   desired_state_hash: string;
+}
+
+export interface InstanceUpdatePreview {
+  instance_id: UUID;
+  current_state_hash: string;
+  impact: DeploymentImpact;
+  affected_client_count: number;
+  requires_client_reexport: boolean;
+  client_effect: string;
+  server_identity_effect: string;
+  warnings: string[];
 }

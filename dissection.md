@@ -4686,3 +4686,92 @@ Previous signed commit: `1d7a8b6 feat: add desktop presentation views` (good
 EDDSA signature).
 
 Planned signed commit: `feat: add readiness backup and activity views`.
+
+### 12D. Safe backend-aware instance creation and editing (2026-07-31)
+
+The original creation command accepted public backend settings but had no
+Rust-owned route for importing Xray TLS material. The only update helper accepted
+an entire persisted `VpnInstance`, which would have allowed a future caller to
+change the backend, host assignment, IDs, timestamps, or secret references. It
+also had no optimistic-concurrency check or non-mutating consequence preview.
+
+Creation now accepts an optional `XrayTlsImportInput` containing certificate and
+private-key file paths. Rust reads bounded (maximum 1 MiB), UTF-8 PEM files,
+validates both using the Xray backend, generates new opaque secret references,
+and places the contents in the native secret store. Only those references enter
+the internal `XraySettings`; `InstanceView`, `InstanceDetailView`, update
+previews, and TypeScript public settings omit the references, paths, and PEM
+contents. REALITY rejects supplied TLS files, TLS requires both files, and
+non-Xray backends reject the import field. A failed secure-store write removes
+any values written earlier in the same attempt; a subsequent database failure
+also removes the newly written values.
+
+Storage now has one shared transactional instance writer. TLS creation or
+replacement commits the instance JSON, normalized listener rows, retirement of
+the previous instance-owned secret references, and registration of the new
+references in one SQLite transaction. Moving from Xray TLS to REALITY retires
+the obsolete TLS references even though no new secret is written. Retired values
+remain subject to the existing deployment-snapshot retention policy rather than
+being deleted while a retained rollback might still need them.
+
+The public update boundary is `UpdateInstanceInput`. It contains the instance ID
+and editable desired-state fields, but deliberately has no host ID, backend kind,
+persisted timestamps, or secret-reference fields. `preview_instance_update`
+loads current state, verifies the caller's current-state SHA-256, validates the
+candidate through core, backend, desired-state, and host-listener rules, and
+returns typed impact, client re-export consequences, affected-client count, and
+warnings without persisting or contacting the host. `update_instance` repeats
+the hash and validation under the per-instance lock, then changes local desired
+state only. Remote deployment remains a separate plan/apply workflow. The
+current hash is returned with `InstanceDetailView` so Settings can make the
+optimistic check explicit.
+
+Compatibility is preserved: persisted `VpnInstance`, `Device`, and database
+names are unchanged; existing creation payloads deserialize because the TLS
+import is optional; the CLI explicitly supplies no import; and all five backend
+default creation fixtures continue to pass. Name-only edits have no deployment
+impact. Endpoint/listener/network changes report profile re-export impact, DNS
+changes report DNS reload, backend settings use each backend's own change
+classifier, and reinstall-class updates carry an identity/backup warning.
+
+Files and subsystems changed:
+
+- `crates/backend-xray/src/lib.rs`: public, redaction-safe TLS material validator;
+- `crates/storage/src/lib.rs`: atomic instance/listener/secret-reference update;
+- `crates/application/src/lib.rs`: safe inputs, TLS import lifecycle, optimistic
+  update preview/save, typed impact, redaction, and focused tests;
+- `apps/desktop/src-tauri/src/lib.rs`: preview and update Tauri commands;
+- `apps/desktop/src/lib/types.ts`: exact public TypeScript contracts;
+- `apps/cli/src/main.rs`: explicit compatibility default for TLS import.
+
+Validation for this unit:
+
+- `cargo test -p vam-backend-xray -p vam-storage -p vam-application` passed:
+  11 Xray, 14 storage, and 37 application tests;
+- focused tests covered PEM acceptance/rejection, transactional reference
+  replacement, TLS public-view redaction, backend immutability, stale-update
+  rejection, name-only impact, and endpoint client re-export impact;
+- the existing five-backend creation matrix and WireGuard workflows remained
+  green;
+- `cargo clippy -p vam-backend-xray -p vam-storage -p vam-application -p
+  vpn-appliance-manager --all-targets -- -D warnings` passed;
+- `cargo fmt --all -- --check` and `git diff --check` passed;
+- Svelte check passed with 0 errors and 0 warnings;
+- Vitest passed 2/2 frontend tests.
+
+The first compile command named the desktop package incorrectly as
+`vpn-appliance-manager-desktop`; Cargo stopped before compilation and reported
+the package did not exist. The command was corrected to the manifest's actual
+package name, `vpn-appliance-manager`, and passed. A later strict Clippy run
+stopped on six new style/helper-shape warnings; the helpers were simplified and
+the identical impact branches consolidated, after which strict Clippy passed.
+No live host, credential store, or remote service was contacted. Tests used
+ephemeral UUID-named files under the operating-system temporary directory and
+removed them. Rust validation used the existing portable NASM 3.02 by changing
+only the command process PATH. Frontend validation used the already-installed
+local binaries; no package installation occurred.
+
+Previous signed commit: `cf1146f feat: add readiness backup and activity views`
+(good EDDSA signature).
+
+Planned signed commit: `feat: add safe backend-aware instance editing`.
