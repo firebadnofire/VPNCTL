@@ -195,7 +195,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::Info => {
             println!("VPN Appliance Manager developer harness");
             println!("database: {}", cli.database.display());
-            println!("WireGuard image: {}", vam_deployment::WIREGUARD_IMAGE);
+            println!(
+                "WireGuard image: {}",
+                vam_backend_wireguard::WIREGUARD_IMAGE
+            );
+            println!(
+                "AmneziaWG image: {}",
+                vam_backend_amneziawg::AMNEZIAWG_IMAGE
+            );
+            println!(
+                "OpenVPN image: {}",
+                vam_backend_openvpn::OPENVPN_LOCAL_IMAGE
+            );
+            println!("IKEv2 image: {}", vam_backend_ikev2::IKEV2_LOCAL_IMAGE);
+            println!("Xray image: {}", vam_backend_xray::XRAY_LOCAL_IMAGE);
             println!("CoreDNS image: {}", vam_deployment::COREDNS_IMAGE);
         }
         Command::HostAdd(args) => {

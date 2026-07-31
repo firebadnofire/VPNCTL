@@ -2807,4 +2807,222 @@ Still unvalidated:
 
 Commit:
 
+- `5835023 feat: add secure Xray VLESS backend`;
+- signed with the configured EDDSA signing key
+  `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+## Implementation Unit 6: backend-driven deployment rendering
+
+### Plan
+
+This unit is deliberately limited to the shared rendered deployment and its
+plan. It does not yet execute backend-specific SSH validation, health, or
+credential operations.
+
+1. Make `vam-deployment` consume the selected backend's already-validated
+   `BackendRuntimeSpec` and `BackendCapabilities`. Extend that runtime contract
+   with explicit non-secret environment values and argv-style entrypoint and
+   command fields so the renderer does not identify a protocol from its image
+   name. WireGuard retains its required LinuxServer environment, AmneziaWG
+   explicitly invokes its rendered startup script, and locally built images
+   retain their Dockerfile entrypoints.
+2. Render `compose.yaml` from that contract:
+   - pulled images use their exact declared reference;
+   - locally built images use their exact declared tag and Dockerfile directory;
+   - published ports pair desired host listeners with declared container
+     listeners and preserve TCP/UDP;
+   - capabilities, devices, sysctls, and bind mounts are emitted only when
+     requested by the selected backend;
+   - CoreDNS is emitted only for backends with managed DNS.
+3. Remove Watchtower and its Docker socket mount. Updates must be explicit,
+   reviewable apply operations; no container may autonomously replace a pinned
+   runtime.
+4. Replace the mutable WireGuard/CoreDNS `latest` references:
+   - WireGuard is pinned to the upstream LinuxServer release
+     `1.0.20250521-r1-ls109`;
+   - CoreDNS is pinned to `1.13.1`.
+   The locally built OpenVPN, IKEv2, and Xray images and the AmneziaWG image
+   were already version/digest pinned by their backend units.
+5. Render DNS files and DNS health/reload operations only when the backend
+   advertises managed DNS.
+6. Generate a server key only for `WireGuardLike` identity strategies. CA and
+   structured-identity initialization will be handled by their typed SSH
+   operation units.
+7. Treat changes under any declared backend mount as gateway configuration
+   changes. A fresh or structural deployment will explicitly pull a pinned
+   image or build the local image, then recreate the compose project; a
+   backend-only file update can restart the gateway.
+8. Register all five backends in the application service and supply the
+   selected backend runtime/capabilities to shared rendering.
+9. Add deterministic unit coverage for WireGuard, AmneziaWG, OpenVPN, IKEv2,
+   and Xray compose shapes, including the negative security invariants: no
+   `latest`, no Watchtower, no Docker socket, no DNS service for Xray, and no
+   undeclared privilege/device.
+10. Validate the focused crates first. Stop and diagnose every failure before
+    the full workspace gate and signed commit.
+
+### Expected boundaries and security properties
+
+- `vam-deployment` remains backend-agnostic: it renders a typed runtime rather
+  than matching protocol names.
+- Runtime declarations remain owned and tested by each backend crate.
+- Entrypoints and commands are structured argument lists, not shell strings.
+- Host paths must remain safe relative rendered paths. Compose rendering must
+  reject a listener-count mismatch instead of silently dropping or inventing
+  a published port.
+- The compose project receives the minimum declared Linux capabilities and
+  devices. Xray therefore receives neither `NET_ADMIN` nor `/dev/net/tun`.
+- The Docker control socket is never mounted into a managed service.
+- This source-only unit cannot prove Docker Compose acceptance or image
+  availability because Docker is not installed in the current Windows
+  environment. Those limitations will remain explicit in validation.
+
+### Implementation
+
+#### Runtime contract and pinned images
+
+`BackendRuntimeSpec` now carries three additional declarative process fields:
+
+- an ordered non-secret environment mapping;
+- an argv-style entrypoint override;
+- an argv-style command override.
+
+No shell source is accepted through those fields. The Compose renderer quotes
+each YAML scalar. The selected backends use them as follows:
+
+- WireGuard declares only `PUID=0`, `PGID=0`, `TZ=UTC`, and
+  `LOG_CONFS=false`;
+- AmneziaWG declares `/etc/amneziawg/start-awg.sh` as its entrypoint;
+- OpenVPN, IKEv2, and Xray retain the entrypoints baked into their locally
+  rendered Dockerfiles.
+
+The WireGuard runtime changed from mutable
+`ghcr.io/linuxserver/wireguard:latest` to
+`lscr.io/linuxserver/wireguard:1.0.20250521-r1-ls109`. CoreDNS changed from
+`docker.io/coredns/coredns:latest` to
+`docker.io/coredns/coredns:1.13.1`. The upstream LinuxServer repository listed
+the former as its current explicit release during this unit; the current
+CoreDNS Helm source referenced 1.13.1. These are version pins rather than
+multi-architecture manifest digests and should be refreshed deliberately with
+release review.
+
+#### Generic Compose rendering
+
+`vam-deployment` now receives the selected runtime and capability set from the
+application rather than owning a WireGuard image/layout.
+
+For each runtime it renders:
+
+- a pulled image reference, or a local image tag plus a safe relative build
+  context and Dockerfile;
+- the exact backend-declared capability and device lists;
+- declared environment, entrypoint, command, and sysctls;
+- desired host listeners paired by index with backend container listeners,
+  retaining TCP/UDP;
+- exact backend bind mounts and read-only flags.
+
+The listener host ports remain in mode-0600 `.env` as
+`VAM_LISTENER_<index>_PORT`. The Compose file no longer assumes a single
+WireGuard UDP port. A host/container listener-count mismatch or protocol
+mismatch is a hard rendering error. Absolute, empty, dot-component, and parent
+component backend host/build paths are rejected.
+
+CoreDNS and all DNS files are rendered only when `managed_dns` is true. Xray
+therefore receives only `compose.yaml`, `.env`, `instance.json`, and its
+backend-rendered files. WireGuard, AmneziaWG, OpenVPN, and IKEv2 retain the
+CoreDNS sidecar and deterministic DNS artifacts.
+
+Watchtower was deleted from rendered Compose. There are no update labels and no
+Docker socket mount. The old executor's explicit pre-pull step was narrowed to
+the pinned WireGuard and CoreDNS images; generic pull/build execution remains
+the next integration unit.
+
+#### Backend-aware deployment plans
+
+The planner now receives the runtime and capabilities. It:
+
+- creates a server-key operation only for `WireGuardLike` identities;
+- distinguishes pulled from locally built images with explicit
+  `ComposePull` and `ComposeBuild` operations;
+- treats Compose/Dockerfile changes as structural;
+- treats changes under any declared backend mount as gateway changes;
+- reloads DNS only for a managed-DNS backend and DNS-only change;
+- emits DNS health only for a managed-DNS backend;
+- avoids a container action for metadata-only file changes.
+
+This makes a fresh Xray plan build its local image, omit server-key generation,
+and omit DNS health. CA and structured identity/credential work is still not
+performed in this unit.
+
+#### Application and developer CLI
+
+`ApplicationService` now registers all five concrete backend implementations.
+Rendering, planning, applying, and rollback planning ask the selected backend
+for its validated runtime and capabilities before calling the shared planner.
+
+The developer CLI no longer reads a WireGuard constant through the deployment
+crate. Its `info` output reports each backend's own pulled/local image identity
+plus the shared CoreDNS pin.
+
+Important boundary: the remote `DeploymentExecutor`, health parser, firewall
+commands, and device lifecycle are still WireGuard-specific at this commit.
+The new backends are registered for model/render/plan work, but this unit does
+not claim that their plans can yet be safely executed. The next units replace
+those SSH assumptions before the CLI/UI can offer non-WireGuard apply.
+
+### Validation ledger
+
+The runtime-field change first passed a focused `cargo check` across the shared
+backend crate and all five concrete backend crates.
+
+The deployment renderer then passed 13 unit tests covering:
+
+- deterministic WireGuard Compose;
+- version-pin/no-`latest` invariants;
+- no Watchtower or Docker socket;
+- AmneziaWG image, TUN device, listener, and entrypoint;
+- OpenVPN local build and TUN device;
+- IKEv2 fixed 500/4500 UDP listeners without a TUN device;
+- Xray local build with no DNS, `NET_ADMIN`, TUN device, Watchtower, or Docker
+  socket;
+- managed/unmanaged DNS file sets;
+- listener-count rejection;
+- DNS-only plan behavior and drift warning;
+- Xray build plan without server-key or DNS health;
+- stable redacted sensitive-file hashing.
+
+The application passed its 10 unit tests after all backends were registered,
+including the existing strict-host-key, redacted planning, credential refresh,
+DNS, firewall, activation, and stop behavior tests.
+
+Strict focused clippy initially stopped on `format_collect` in listener
+environment rendering. The implementation was changed to append directly with
+`writeln!`; the complete focused gate was rerun and passed:
+
+- `cargo test -p vam-deployment -p vam-application`: 23 tests;
+- strict clippy for both crates and all targets with `-D warnings`;
+- formatting check;
+- `git diff --check`.
+
+The first full-workspace run found the stale developer CLI constant and then
+exhausted the Windows volume while creating the desktop archive. The CLI was
+corrected. After explicit approval, `cargo clean` removed 74,160 generated
+files (38.2 GiB) under this repository's `target` directory only.
+
+The clean full-workspace retry could not rebuild `aws-lc-sys` because NASM is
+not installed. A process-local `AWS_LC_SYS_NO_ASM=1` fallback was attempted,
+but that fallback also requires CMake, which is not installed. No prerequisite
+was installed. Therefore:
+
+- the focused source/test/clippy proof above is valid from before the cache
+  cleanup;
+- the clean full workspace is blocked by missing NASM (native path) or missing
+  CMake (no-assembly fallback);
+- Docker Compose/image/runtime validation remains unavailable because Docker
+  is not installed;
+- native desktop/full-workspace validation must be rerun after the user elects
+  to install or provide the documented prerequisites.
+
+Commit:
+
 - pending staged-patch inspection and signed commit.

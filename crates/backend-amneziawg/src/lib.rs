@@ -91,6 +91,9 @@ impl VpnBackend for AmneziaWgBackend {
                 container_path: "/etc/amneziawg",
                 read_only: false,
             }],
+            environment: Vec::new(),
+            entrypoint: vec!["/etc/amneziawg/start-awg.sh"],
+            command: Vec::new(),
             sysctls: vec![
                 ("net.ipv4.ip_forward", "1"),
                 ("net.ipv4.conf.all.src_valid_mark", "1"),

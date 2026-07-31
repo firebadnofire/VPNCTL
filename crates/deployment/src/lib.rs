@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -7,13 +10,15 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use vam_core::DesiredState;
+use vam_backend::{
+    BackendCapabilities, BackendRuntimeSpec, ContainerCapability, ContainerDevice, ContainerImage,
+    ServerIdentityStrategy,
+};
+use vam_core::{DesiredState, VpnInstance};
 use vam_dns::{DnsError, render_blocklist_hosts, render_corefile, render_zone};
 use vam_protocol::{AppError, DeploymentOperation, DeploymentPlan, DeploymentResult, RenderedFile};
 
-pub const WIREGUARD_IMAGE: &str = "ghcr.io/linuxserver/wireguard:latest";
-pub const COREDNS_IMAGE: &str = "docker.io/coredns/coredns:latest";
-pub const WATCHTOWER_IMAGE: &str = "docker.io/containrrr/watchtower:latest";
+pub const COREDNS_IMAGE: &str = "docker.io/coredns/coredns:1.13.1";
 
 #[derive(Debug, Error)]
 pub enum DeploymentError {
@@ -23,6 +28,18 @@ pub enum DeploymentError {
     Serialization(#[from] serde_json::Error),
     #[error("rendered path is unsafe")]
     UnsafePath,
+    #[error(
+        "backend declares {container} container listener(s), but desired state declares {host} host listener(s)"
+    )]
+    ListenerCountMismatch { host: usize, container: usize },
+    #[error("host listener {index} uses {host}, but its container listener uses {container}")]
+    ListenerProtocolMismatch {
+        index: usize,
+        host: vam_core::TransportProtocol,
+        container: vam_core::TransportProtocol,
+    },
+    #[error("backend runtime path is unsafe: {0}")]
+    UnsafeRuntimePath(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -36,10 +53,17 @@ pub struct RemoteManifest {
 }
 
 pub trait DeploymentPlanner: Send + Sync {
-    fn render(&self, state: &DesiredState) -> Result<Vec<RenderedFile>, DeploymentError>;
+    fn render(
+        &self,
+        state: &DesiredState,
+        runtime: &BackendRuntimeSpec,
+        capabilities: BackendCapabilities,
+    ) -> Result<Vec<RenderedFile>, DeploymentError>;
     fn calculate(
         &self,
         state: &DesiredState,
+        runtime: &BackendRuntimeSpec,
+        capabilities: BackendCapabilities,
         files: &[RenderedFile],
         remote: Option<&RemoteManifest>,
     ) -> Result<DeploymentPlan, DeploymentError>;
@@ -49,17 +73,24 @@ pub trait DeploymentPlanner: Send + Sync {
 pub struct DefaultDeploymentPlanner;
 
 impl DeploymentPlanner for DefaultDeploymentPlanner {
-    fn render(&self, state: &DesiredState) -> Result<Vec<RenderedFile>, DeploymentError> {
-        render_shared_files(state)
+    fn render(
+        &self,
+        state: &DesiredState,
+        runtime: &BackendRuntimeSpec,
+        capabilities: BackendCapabilities,
+    ) -> Result<Vec<RenderedFile>, DeploymentError> {
+        render_shared_files(state, runtime, capabilities)
     }
 
     fn calculate(
         &self,
         state: &DesiredState,
+        runtime: &BackendRuntimeSpec,
+        capabilities: BackendCapabilities,
         files: &[RenderedFile],
         remote: Option<&RemoteManifest>,
     ) -> Result<DeploymentPlan, DeploymentError> {
-        plan(state, files, remote)
+        plan(state, runtime, capabilities, files, remote)
     }
 }
 
@@ -74,106 +105,265 @@ pub trait DeploymentExecutor: Send + Sync {
     ) -> Result<DeploymentResult, AppError>;
 }
 
-pub fn render_shared_files(state: &DesiredState) -> Result<Vec<RenderedFile>, DeploymentError> {
+pub fn render_shared_files(
+    state: &DesiredState,
+    runtime: &BackendRuntimeSpec,
+    capabilities: BackendCapabilities,
+) -> Result<Vec<RenderedFile>, DeploymentError> {
     let instance = &state.instance;
-    let compose = render_compose(state);
-    let corefile = render_corefile(&instance.dns.zone)?;
-    let zone = render_zone(
-        &instance.dns.zone,
-        instance.network.gateway_ipv4,
-        instance.dns.soa_serial,
-        &state.dns_records,
-    )?;
+    let compose = render_compose(state, runtime, capabilities)?;
     let instance_json = serde_json::to_string_pretty(instance)?;
-    Ok(vec![
+    let mut files = vec![
         file("compose.yaml", compose, 0o644, false)?,
-        file(
-            ".env",
-            format!("WIREGUARD_PORT={}\n", instance.endpoint.port),
-            0o600,
-            false,
-        )?,
+        file(".env", render_listener_environment(instance), 0o600, false)?,
         file("instance.json", format!("{instance_json}\n"), 0o600, false)?,
-        file("dns/Corefile", corefile, 0o644, false)?,
-        file(
-            "dns/hosts/blocklist.hosts",
-            render_blocklist_hosts(&state.dns_blocklist_domains),
-            0o644,
-            false,
-        )?,
-        file(
-            &format!("dns/zones/db.{}", instance.dns.zone),
-            zone,
-            0o644,
-            false,
-        )?,
-    ])
+    ];
+    if capabilities.managed_dns {
+        let corefile = render_corefile(&instance.dns.zone)?;
+        let zone = render_zone(
+            &instance.dns.zone,
+            instance.network.gateway_ipv4,
+            instance.dns.soa_serial,
+            &state.dns_records,
+        )?;
+        files.extend([
+            file("dns/Corefile", corefile, 0o644, false)?,
+            file(
+                "dns/hosts/blocklist.hosts",
+                render_blocklist_hosts(&state.dns_blocklist_domains),
+                0o644,
+                false,
+            )?,
+            file(
+                &format!("dns/zones/db.{}", instance.dns.zone),
+                zone,
+                0o644,
+                false,
+            )?,
+        ]);
+    }
+    Ok(files)
 }
 
-#[must_use]
-pub fn render_compose(state: &DesiredState) -> String {
-    let scope = state.instance.id;
-    format!(
-        r#"name: {}
+pub fn render_compose(
+    state: &DesiredState,
+    runtime: &BackendRuntimeSpec,
+    capabilities: BackendCapabilities,
+) -> Result<String, DeploymentError> {
+    let host_listeners = state.instance.listeners();
+    if host_listeners.len() != runtime.container_listeners.len() {
+        return Err(DeploymentError::ListenerCountMismatch {
+            host: host_listeners.len(),
+            container: runtime.container_listeners.len(),
+        });
+    }
+    for mount in &runtime.mounts {
+        ensure_safe_relative_path(mount.host_path)?;
+        if !mount.container_path.starts_with('/') {
+            return Err(DeploymentError::UnsafeRuntimePath(
+                mount.container_path.into(),
+            ));
+        }
+    }
+
+    let mut output = format!(
+        r#"name: "{}"
 services:
   gateway:
-    image: {}
+    image: "{}"
     restart: unless-stopped
-    labels:
-      com.centurylinklabs.watchtower.enable: "true"
-      com.centurylinklabs.watchtower.scope: "{scope}"
-    cap_add:
-      - NET_ADMIN
-    environment:
-      PUID: "0"
-      PGID: "0"
-      TZ: UTC
-      LOG_CONFS: "false"
-    sysctls:
-      net.ipv4.ip_forward: "1"
-      net.ipv4.conf.all.src_valid_mark: "1"
-    ports:
-      - "${{WIREGUARD_PORT}}:51820/udp"
-    volumes:
-      - ./vpn:/config/wg_confs
-      - ./state:/var/lib/vpn-appliance-manager
-  dns:
-    image: {}
+"#,
+        yaml_escape(&state.instance.compose_project()),
+        yaml_escape(runtime_image(runtime.image)),
+    );
+    if let ContainerImage::Build {
+        dockerfile_path, ..
+    } = runtime.image
+    {
+        ensure_safe_relative_path(dockerfile_path)?;
+        let (context, dockerfile) = dockerfile_path
+            .rsplit_once('/')
+            .ok_or_else(|| DeploymentError::UnsafeRuntimePath(dockerfile_path.into()))?;
+        writeln!(
+            output,
+            "    build:\n      context: \"./{}\"\n      dockerfile: \"{}\"",
+            yaml_escape(context),
+            yaml_escape(dockerfile)
+        )
+        .expect("writing to a String cannot fail");
+    }
+    render_runtime_sequence(
+        &mut output,
+        "cap_add",
+        runtime
+            .capabilities
+            .iter()
+            .map(|capability| match capability {
+                ContainerCapability::NetAdmin => "NET_ADMIN",
+            }),
+    );
+    render_runtime_sequence(
+        &mut output,
+        "devices",
+        runtime.devices.iter().map(|device| match device {
+            ContainerDevice::Tun => "/dev/net/tun:/dev/net/tun",
+        }),
+    );
+    render_runtime_mapping(
+        &mut output,
+        "environment",
+        runtime.environment.iter().copied(),
+    );
+    render_runtime_inline_sequence(&mut output, "entrypoint", &runtime.entrypoint);
+    render_runtime_inline_sequence(&mut output, "command", &runtime.command);
+    render_runtime_mapping(&mut output, "sysctls", runtime.sysctls.iter().copied());
+
+    if !host_listeners.is_empty() {
+        output.push_str("    ports:\n");
+        for (index, (host, container)) in host_listeners
+            .iter()
+            .zip(&runtime.container_listeners)
+            .enumerate()
+        {
+            if host.protocol != container.protocol {
+                return Err(DeploymentError::ListenerProtocolMismatch {
+                    index,
+                    host: host.protocol,
+                    container: container.protocol,
+                });
+            }
+            writeln!(
+                output,
+                "      - \"${{VAM_LISTENER_{index}_PORT}}:{}/{}\"",
+                container.port, container.protocol
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    if !runtime.mounts.is_empty() {
+        output.push_str("    volumes:\n");
+        for mount in &runtime.mounts {
+            let read_only = if mount.read_only { ":ro" } else { "" };
+            writeln!(
+                output,
+                "      - \"./{}:{}{}\"",
+                yaml_escape(mount.host_path),
+                yaml_escape(mount.container_path),
+                read_only
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    if capabilities.managed_dns {
+        write!(
+            output,
+            r#"  dns:
+    image: "{COREDNS_IMAGE}"
     restart: unless-stopped
-    labels:
-      com.centurylinklabs.watchtower.enable: "true"
-      com.centurylinklabs.watchtower.scope: "{scope}"
     network_mode: service:gateway
     depends_on:
       - gateway
     volumes:
-      - ./dns/Corefile:/etc/coredns/Corefile:ro
-      - ./dns/zones:/etc/coredns/zones:ro
-      - ./dns/hosts:/etc/coredns/hosts:ro
+      - "./dns/Corefile:/etc/coredns/Corefile:ro"
+      - "./dns/zones:/etc/coredns/zones:ro"
+      - "./dns/hosts:/etc/coredns/hosts:ro"
     command:
-      - -conf
-      - /etc/coredns/Corefile
-  watchtower:
-    image: {}
-    restart: unless-stopped
-    labels:
-      com.centurylinklabs.watchtower.enable: "true"
-      com.centurylinklabs.watchtower.scope: "{scope}"
-    environment:
-      DOCKER_API_VERSION: "1.40"
-      WATCHTOWER_LABEL_ENABLE: "true"
-      WATCHTOWER_SCOPE: "{scope}"
-      WATCHTOWER_CLEANUP: "true"
-      WATCHTOWER_SCHEDULE: "0 0 4 * * *"
-      WATCHTOWER_NO_STARTUP_MESSAGE: "true"
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-"#,
-        state.instance.compose_project(),
-        WIREGUARD_IMAGE,
-        COREDNS_IMAGE,
-        WATCHTOWER_IMAGE,
-    )
+      - "-conf"
+      - "/etc/coredns/Corefile"
+"#
+        )
+        .expect("writing to a String cannot fail");
+    }
+    Ok(output)
+}
+
+fn runtime_image(image: ContainerImage) -> &'static str {
+    match image {
+        ContainerImage::Pull(reference) => reference,
+        ContainerImage::Build { tag, .. } => tag,
+    }
+}
+
+fn render_listener_environment(instance: &VpnInstance) -> String {
+    instance
+        .listeners()
+        .iter()
+        .enumerate()
+        .fold(String::new(), |mut output, (index, listener)| {
+            writeln!(output, "VAM_LISTENER_{index}_PORT={}", listener.port)
+                .expect("writing to a String cannot fail");
+            output
+        })
+}
+
+fn render_runtime_sequence<'a>(
+    output: &mut String,
+    name: &str,
+    values: impl Iterator<Item = &'a str>,
+) {
+    let values: Vec<_> = values.collect();
+    if values.is_empty() {
+        return;
+    }
+    writeln!(output, "    {name}:").expect("writing to a String cannot fail");
+    for value in values {
+        writeln!(output, "      - \"{}\"", yaml_escape(value))
+            .expect("writing to a String cannot fail");
+    }
+}
+
+fn render_runtime_inline_sequence(output: &mut String, name: &str, values: &[&str]) {
+    if values.is_empty() {
+        return;
+    }
+    let values = values
+        .iter()
+        .map(|value| format!("\"{}\"", yaml_escape(value)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    writeln!(output, "    {name}: [{values}]").expect("writing to a String cannot fail");
+}
+
+fn render_runtime_mapping<'a>(
+    output: &mut String,
+    name: &str,
+    values: impl Iterator<Item = (&'a str, &'a str)>,
+) {
+    let values: Vec<_> = values.collect();
+    if values.is_empty() {
+        return;
+    }
+    writeln!(output, "    {name}:").expect("writing to a String cannot fail");
+    for (key, value) in values {
+        writeln!(
+            output,
+            "      \"{}\": \"{}\"",
+            yaml_escape(key),
+            yaml_escape(value)
+        )
+        .expect("writing to a String cannot fail");
+    }
+}
+
+fn yaml_escape(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
+fn ensure_safe_relative_path(path: &str) -> Result<(), DeploymentError> {
+    if path.starts_with('/')
+        || path.is_empty()
+        || path
+            .split('/')
+            .any(|part| part == ".." || part == "." || part.is_empty())
+    {
+        return Err(DeploymentError::UnsafeRuntimePath(path.into()));
+    }
+    Ok(())
 }
 
 pub fn build_manifest(files: &[RenderedFile]) -> RemoteManifest {
@@ -192,6 +382,8 @@ pub fn build_manifest(files: &[RenderedFile]) -> RemoteManifest {
 
 pub fn plan(
     state: &DesiredState,
+    runtime: &BackendRuntimeSpec,
+    capabilities: BackendCapabilities,
     desired_files: &[RenderedFile],
     remote: Option<&RemoteManifest>,
 ) -> Result<DeploymentPlan, DeploymentError> {
@@ -203,7 +395,12 @@ pub fn plan(
         operations.push(DeploymentOperation::CreateDirectory {
             path: state.instance.remote_path(),
         });
-        operations.push(DeploymentOperation::GenerateServerKey);
+        if matches!(
+            runtime.identity,
+            ServerIdentityStrategy::WireGuardLike { .. }
+        ) {
+            operations.push(DeploymentOperation::GenerateServerKey);
+        }
     }
     for file in desired_files {
         if file.path == "state.json" {
@@ -256,35 +453,64 @@ pub fn plan(
                 _ => None,
             })
             .collect();
-        let dns_only = !changed_paths.is_empty()
+        let metadata_only = !changed_paths.is_empty()
+            && changed_paths
+                .iter()
+                .all(|path| *path == "instance.json" || *path == "state.json");
+        let dns_only = capabilities.managed_dns
+            && !changed_paths.is_empty()
             && changed_paths.iter().all(|path| {
                 path.starts_with("dns/") || *path == "instance.json" || *path == "state.json"
             });
-        let wireguard_changed = changed_paths.iter().any(|path| path.starts_with("vpn/"));
+        let backend_changed = changed_paths.iter().any(|path| {
+            runtime.mounts.iter().any(|mount| {
+                *path == mount.host_path
+                    || path
+                        .strip_prefix(mount.host_path)
+                        .is_some_and(|suffix| suffix.starts_with('/'))
+            })
+        });
+        let dockerfile_changed = match runtime.image {
+            ContainerImage::Build {
+                dockerfile_path, ..
+            } => changed_paths.contains(&dockerfile_path),
+            ContainerImage::Pull(_) => false,
+        };
+        let structural_change =
+            remote.is_none() || changed_paths.contains(&"compose.yaml") || dockerfile_changed;
         operations.extend([
             DeploymentOperation::ValidateConfiguration,
             DeploymentOperation::CreateBackup {
                 name: format!("{}-{plan_id}", Utc::now().format("%Y-%m-%dT%H-%M-%SZ")),
             },
         ]);
-        if dns_only {
+        if structural_change {
+            operations.push(match runtime.image {
+                ContainerImage::Pull(_) => DeploymentOperation::ComposePull,
+                ContainerImage::Build { .. } => DeploymentOperation::ComposeBuild,
+            });
+            operations.push(DeploymentOperation::ComposeUp);
+        } else if dns_only {
             operations.push(DeploymentOperation::ReloadDns);
-        } else if wireguard_changed && remote.is_some() {
+        } else if backend_changed {
             operations.push(DeploymentOperation::ComposeRestart {
                 service: "gateway".into(),
             });
-        } else {
-            operations.push(DeploymentOperation::ComposePull);
+        } else if !metadata_only {
+            operations.push(match runtime.image {
+                ContainerImage::Pull(_) => DeploymentOperation::ComposePull,
+                ContainerImage::Build { .. } => DeploymentOperation::ComposeBuild,
+            });
             operations.push(DeploymentOperation::ComposeUp);
         }
-        operations.extend([
-            DeploymentOperation::HealthCheck {
-                service: "gateway".into(),
-            },
-            DeploymentOperation::HealthCheck {
+        operations.push(DeploymentOperation::HealthCheck {
+            service: "gateway".into(),
+        });
+        if capabilities.managed_dns {
+            operations.push(DeploymentOperation::HealthCheck {
                 service: "dns".into(),
-            },
-        ]);
+            });
+        }
     }
     let desired_state_hash = hex_hash(&serde_json::to_vec(state)?);
     Ok(DeploymentPlan {
@@ -357,23 +583,34 @@ fn hex_hash(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use vam_backend::VpnBackend;
+    use vam_backend_amneziawg::AmneziaWgBackend;
+    use vam_backend_ikev2::Ikev2Backend;
+    use vam_backend_openvpn::OpenVpnBackend;
+    use vam_backend_wireguard::{WIREGUARD_IMAGE, WireGuardBackend};
+    use vam_backend_xray::XrayBackend;
     use vam_core::{
         BackendSettings, DEFAULT_KEEPALIVE, Device, DnsConfig, EndpointConfig, NetworkConfig,
         RoutingMode, VpnBackendKind, VpnInstance,
     };
 
     fn state() -> DesiredState {
+        state_for(VpnBackendKind::WireGuard)
+    }
+
+    fn state_for(kind: VpnBackendKind) -> DesiredState {
         let subnet = "10.64.0.0/24".parse().unwrap();
+        let endpoint_host = "vpn.example.test";
         DesiredState {
             instance: VpnInstance {
                 id: Uuid::nil(),
                 host_id: Uuid::from_u128(1),
                 display_name: "Test VPN".into(),
-                backend: VpnBackendKind::WireGuard,
-                backend_settings: BackendSettings::default(),
+                backend: kind,
+                backend_settings: BackendSettings::defaults_for(kind, endpoint_host),
                 endpoint: EndpointConfig {
-                    host: "vpn.example.test".into(),
-                    port: 51_820,
+                    host: endpoint_host.into(),
+                    port: kind.default_port(),
                 },
                 network: NetworkConfig {
                     ipv4_subnet: subnet,
@@ -398,6 +635,17 @@ mod tests {
         }
     }
 
+    fn runtime_for<B: VpnBackend>(backend: &B, state: &DesiredState) -> BackendRuntimeSpec {
+        backend
+            .runtime(&state.instance.backend_settings)
+            .expect("backend runtime")
+    }
+
+    fn compose_for<B: VpnBackend>(backend: &B, state: &DesiredState) -> String {
+        render_compose(state, &runtime_for(backend, state), backend.capabilities())
+            .expect("compose")
+    }
+
     #[test]
     fn quotes_hostile_shell_arguments() {
         assert_eq!(shell_quote("a'b;$(bad)"), "'a'\"'\"'b;$(bad)'");
@@ -405,42 +653,92 @@ mod tests {
     }
 
     #[test]
-    fn managed_images_use_watchtower_update_channels() {
-        assert!(WIREGUARD_IMAGE.ends_with(":latest"));
-        assert!(COREDNS_IMAGE.ends_with(":latest"));
-        assert!(WATCHTOWER_IMAGE.ends_with(":latest"));
-        assert!(!WIREGUARD_IMAGE.contains("@sha256:"));
-        assert!(!COREDNS_IMAGE.contains("@sha256:"));
-        assert!(!WATCHTOWER_IMAGE.contains("@sha256:"));
+    fn shared_images_are_version_pinned() {
+        assert!(!WIREGUARD_IMAGE.ends_with(":latest"));
+        assert!(!COREDNS_IMAGE.ends_with(":latest"));
+        assert!(WIREGUARD_IMAGE.contains("1.0.20250521-r1-ls109"));
+        assert!(COREDNS_IMAGE.ends_with(":1.13.1"));
     }
 
     #[test]
-    fn compose_is_deterministic_and_does_not_generate_peers() {
+    fn wireguard_compose_is_deterministic_and_least_privilege() {
         let state = state();
-        let first = render_compose(&state);
-        let second = render_compose(&state);
+        let first = compose_for(&WireGuardBackend, &state);
+        let second = compose_for(&WireGuardBackend, &state);
         assert_eq!(first, second);
         assert!(first.contains(WIREGUARD_IMAGE));
         assert!(first.contains(COREDNS_IMAGE));
-        assert!(first.contains(WATCHTOWER_IMAGE));
         assert!(first.contains("network_mode: service:gateway"));
-        assert!(first.contains("./dns/hosts:/etc/coredns/hosts:ro"));
-        assert!(first.contains("LOG_CONFS: \"false\""));
-        assert!(first.contains("WATCHTOWER_LABEL_ENABLE: \"true\""));
-        assert!(first.contains("DOCKER_API_VERSION: \"1.40\""));
-        assert!(first.contains("WATCHTOWER_CLEANUP: \"true\""));
-        assert!(first.contains("WATCHTOWER_SCHEDULE: \"0 0 4 * * *\""));
-        assert!(!first.contains("WATCHTOWER_ROLLING_RESTART"));
-        assert!(first.contains(
-            "com.centurylinklabs.watchtower.scope: \"00000000-0000-0000-0000-000000000000\""
-        ));
+        assert!(first.contains("\"./dns/hosts:/etc/coredns/hosts:ro\""));
+        assert!(first.contains("\"LOG_CONFS\": \"false\""));
+        assert!(first.contains("\"${VAM_LISTENER_0_PORT}:51820/udp\""));
+        assert!(first.contains("NET_ADMIN"));
+        assert!(!first.contains("/dev/net/tun"));
         assert!(!first.contains("PEERS:"));
         assert!(!first.contains("SERVERURL:"));
+        assert!(!first.contains("watchtower"));
+        assert!(!first.contains("/var/run/docker.sock"));
+        assert!(!first.contains(":latest"));
+    }
+
+    #[test]
+    fn amneziawg_compose_uses_pinned_image_tun_and_explicit_entrypoint() {
+        let state = state_for(VpnBackendKind::AmneziaWg);
+        let compose = compose_for(&AmneziaWgBackend, &state);
+        assert!(compose.contains("amneziavpn/amneziawg-go:2.0.0@sha256:"));
+        assert!(compose.contains("\"${VAM_LISTENER_0_PORT}:55424/udp\""));
+        assert!(compose.contains("\"/dev/net/tun:/dev/net/tun\""));
+        assert!(compose.contains("entrypoint: [\"/etc/amneziawg/start-awg.sh\"]"));
+        assert!(compose.contains("NET_ADMIN"));
+        assert!(compose.contains("  dns:"));
+    }
+
+    #[test]
+    fn openvpn_compose_builds_the_pinned_local_image() {
+        let state = state_for(VpnBackendKind::OpenVpn);
+        let compose = compose_for(&OpenVpnBackend, &state);
+        assert!(compose.contains("vpn-appliance-manager/openvpn:alpine3.23.5"));
+        assert!(compose.contains("context: \"./vpn\""));
+        assert!(compose.contains("dockerfile: \"Dockerfile\""));
+        assert!(compose.contains("\"${VAM_LISTENER_0_PORT}:1194/udp\""));
+        assert!(compose.contains("\"/dev/net/tun:/dev/net/tun\""));
+        assert!(compose.contains("NET_ADMIN"));
+    }
+
+    #[test]
+    fn ikev2_compose_publishes_both_fixed_udp_listeners_without_tun_device() {
+        let state = state_for(VpnBackendKind::Ikev2);
+        let compose = compose_for(&Ikev2Backend, &state);
+        assert!(compose.contains("context: \"./ikev2\""));
+        assert!(compose.contains("\"${VAM_LISTENER_0_PORT}:500/udp\""));
+        assert!(compose.contains("\"${VAM_LISTENER_1_PORT}:4500/udp\""));
+        assert!(compose.contains("NET_ADMIN"));
+        assert!(!compose.contains("/dev/net/tun"));
+    }
+
+    #[test]
+    fn xray_compose_has_no_dns_network_privilege_or_docker_socket() {
+        let state = state_for(VpnBackendKind::Xray);
+        let compose = compose_for(&XrayBackend, &state);
+        assert!(compose.contains("context: \"./xray\""));
+        assert!(compose.contains("\"${VAM_LISTENER_0_PORT}:8443/tcp\""));
+        assert!(!compose.contains("  dns:"));
+        assert!(!compose.contains("NET_ADMIN"));
+        assert!(!compose.contains("/dev/net/tun"));
+        assert!(!compose.contains("/var/run/docker.sock"));
+        assert!(!compose.contains("watchtower"));
     }
 
     #[test]
     fn shared_files_include_coredns_hosts_blocklist() {
-        let files = render_shared_files(&state()).unwrap();
+        let state = state();
+        let backend = WireGuardBackend;
+        let files = render_shared_files(
+            &state,
+            &runtime_for(&backend, &state),
+            backend.capabilities(),
+        )
+        .unwrap();
         let hosts = files
             .iter()
             .find(|file| file.path == "dns/hosts/blocklist.hosts")
@@ -457,6 +755,42 @@ mod tests {
                 .contents
                 .contains("hosts /etc/coredns/hosts/blocklist.hosts")
         );
+    }
+
+    #[test]
+    fn unmanaged_dns_backend_omits_all_dns_files() {
+        let state = state_for(VpnBackendKind::Xray);
+        let backend = XrayBackend;
+        let files = render_shared_files(
+            &state,
+            &runtime_for(&backend, &state),
+            backend.capabilities(),
+        )
+        .unwrap();
+        assert!(files.iter().all(|file| !file.path.starts_with("dns/")));
+        assert_eq!(
+            files
+                .iter()
+                .find(|file| file.path == ".env")
+                .expect("listener environment")
+                .contents,
+            "VAM_LISTENER_0_PORT=443\n"
+        );
+    }
+
+    #[test]
+    fn listener_mismatch_is_rejected() {
+        let state = state_for(VpnBackendKind::Ikev2);
+        let backend = Ikev2Backend;
+        let mut runtime = runtime_for(&backend, &state);
+        runtime.container_listeners.pop();
+        assert!(matches!(
+            render_compose(&state, &runtime, backend.capabilities()),
+            Err(DeploymentError::ListenerCountMismatch {
+                host: 2,
+                container: 1
+            })
+        ));
     }
 
     #[test]
@@ -483,7 +817,15 @@ mod tests {
         remote
             .drifted_files
             .push("dns/zones/db.vpn.internal".into());
-        let plan = plan(&state, &files, Some(&remote)).unwrap();
+        let backend = WireGuardBackend;
+        let plan = plan(
+            &state,
+            &runtime_for(&backend, &state),
+            backend.capabilities(),
+            &files,
+            Some(&remote),
+        )
+        .unwrap();
         assert!(plan.operations.iter().any(|operation| {
             matches!(
                 operation,
@@ -504,6 +846,33 @@ mod tests {
             )
         }));
         assert_eq!(plan.warnings.len(), 1);
+    }
+
+    #[test]
+    fn new_xray_plan_builds_without_server_key_or_dns_health() {
+        let state = state_for(VpnBackendKind::Xray);
+        let backend = XrayBackend;
+        let runtime = runtime_for(&backend, &state);
+        let files =
+            render_shared_files(&state, &runtime, backend.capabilities()).expect("shared files");
+        let plan = plan(&state, &runtime, backend.capabilities(), &files, None).expect("plan");
+        assert!(
+            plan.operations
+                .iter()
+                .any(|operation| matches!(operation, DeploymentOperation::ComposeBuild))
+        );
+        assert!(
+            !plan
+                .operations
+                .iter()
+                .any(|operation| { matches!(operation, DeploymentOperation::GenerateServerKey) })
+        );
+        assert!(!plan.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                DeploymentOperation::HealthCheck { service } if service == "dns"
+            )
+        }));
     }
 
     #[test]

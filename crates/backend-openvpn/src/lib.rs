@@ -118,6 +118,9 @@ impl VpnBackend for OpenVpnBackend {
                 container_path: "/etc/openvpn",
                 read_only: false,
             }],
+            environment: Vec::new(),
+            entrypoint: Vec::new(),
+            command: Vec::new(),
             sysctls: vec![("net.ipv4.ip_forward", "1")],
             identity: ServerIdentityStrategy::CertificateAuthority,
             validation: BackendValidation::OpenVpn {

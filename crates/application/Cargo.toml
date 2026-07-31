@@ -17,7 +17,11 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
+vam-backend-amneziawg = { path = "../backend-amneziawg" }
+vam-backend-ikev2 = { path = "../backend-ikev2" }
+vam-backend-openvpn = { path = "../backend-openvpn" }
 vam-backend-wireguard = { path = "../backend-wireguard" }
+vam-backend-xray = { path = "../backend-xray" }
 vam-backend = { path = "../backend" }
 vam-core = { path = "../core" }
 vam-deployment = { path = "../deployment" }

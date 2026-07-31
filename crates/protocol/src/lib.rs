@@ -149,6 +149,7 @@ pub enum DeploymentOperation {
     ValidateConfiguration,
     CreateBackup { name: String },
     ComposePull,
+    ComposeBuild,
     ComposeUp,
     ComposeRestart { service: String },
     ReloadDns,

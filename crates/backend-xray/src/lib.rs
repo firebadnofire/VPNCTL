@@ -240,6 +240,9 @@ impl VpnBackend for XrayBackend {
                     read_only: false,
                 },
             ],
+            environment: Vec::new(),
+            entrypoint: Vec::new(),
+            command: Vec::new(),
             sysctls: Vec::new(),
             identity: ServerIdentityStrategy::StructuredJson,
             validation: BackendValidation::Xray {

@@ -17,7 +17,11 @@ use tokio::{sync::Mutex, time::sleep};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vam_backend::{BackendError, BackendRegistry, VpnBackend};
-use vam_backend_wireguard::WireGuardBackend;
+use vam_backend_amneziawg::AmneziaWgBackend;
+use vam_backend_ikev2::Ikev2Backend;
+use vam_backend_openvpn::OpenVpnBackend;
+use vam_backend_wireguard::{WIREGUARD_IMAGE, WireGuardBackend};
+use vam_backend_xray::XrayBackend;
 use vam_core::{
     BackendSettings, DEFAULT_DNS_ZONE, DEFAULT_KEEPALIVE, DEFAULT_PORT, DEFAULT_SUBNET,
     DesiredState, Device, DeviceBackendData, DnsConfig, DnsRecord, DnsRecordType, DockerHost,
@@ -26,8 +30,8 @@ use vam_core::{
     validate_host_instances, validate_instance,
 };
 use vam_deployment::{
-    COREDNS_IMAGE, DeploymentExecutor, DeploymentPlanner, RemoteManifest, WATCHTOWER_IMAGE,
-    WIREGUARD_IMAGE, build_manifest, shell_quote,
+    COREDNS_IMAGE, DeploymentExecutor, DeploymentPlanner, RemoteManifest, build_manifest,
+    shell_quote,
 };
 #[cfg(not(test))]
 use vam_dns::parse_hostslist_domains;
@@ -174,12 +178,18 @@ impl ApplicationService {
         secrets: Arc<dyn SecretStore>,
         transport: Arc<dyn SshTransport>,
     ) -> Self {
-        let wireguard: Arc<dyn VpnBackend> = Arc::new(WireGuardBackend);
+        let backends: [Arc<dyn VpnBackend>; 5] = [
+            Arc::new(WireGuardBackend),
+            Arc::new(AmneziaWgBackend),
+            Arc::new(OpenVpnBackend),
+            Arc::new(Ikev2Backend),
+            Arc::new(XrayBackend),
+        ];
         Self {
             storage,
             secrets,
             transport,
-            backends: Arc::new(BackendRegistry::new([wireguard])),
+            backends: Arc::new(BackendRegistry::new(backends)),
             instance_locks: Arc::default(),
             cancellations: Arc::default(),
         }
@@ -872,8 +882,21 @@ fi
         let state = self.desired_state(instance_id).await?;
         let files = self.render_state(&state).await?;
         let remote = self.remote_manifest(&state.instance).await?;
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
+        let runtime = backend
+            .runtime(&state.instance.backend_settings)
+            .map_err(backend_error)?;
         vam_deployment::DefaultDeploymentPlanner
-            .calculate(&state, &files, remote.as_ref())
+            .calculate(
+                &state,
+                &runtime,
+                backend.capabilities(),
+                &files,
+                remote.as_ref(),
+            )
             .map_err(deployment_error)
     }
 
@@ -887,8 +910,21 @@ fi
         let state = self.desired_state(instance_id).await?;
         let files = self.render_state(&state).await?;
         let remote = self.remote_manifest(&state.instance).await?;
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
+        let runtime = backend
+            .runtime(&state.instance.backend_settings)
+            .map_err(backend_error)?;
         let plan = vam_deployment::DefaultDeploymentPlanner
-            .calculate(&state, &files, remote.as_ref())
+            .calculate(
+                &state,
+                &runtime,
+                backend.capabilities(),
+                &files,
+                remote.as_ref(),
+            )
             .map_err(deployment_error)?;
         if plan.desired_state_hash != expected_state_hash {
             return Err(AppError {
@@ -1321,8 +1357,21 @@ docker compose restart gateway
         state.instance.updated_at = Utc::now();
         let files = self.render_state(&state).await?;
         let remote = self.remote_manifest(&state.instance).await?;
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
+        let runtime = backend
+            .runtime(&state.instance.backend_settings)
+            .map_err(backend_error)?;
         let plan = vam_deployment::DefaultDeploymentPlanner
-            .calculate(&state, &files, remote.as_ref())
+            .calculate(
+                &state,
+                &runtime,
+                backend.capabilities(),
+                &files,
+                remote.as_ref(),
+            )
             .map_err(deployment_error)?;
         self.storage
             .record_deployment(&plan, &state, DeploymentStatus::Planned)
@@ -1610,8 +1659,11 @@ docker compose restart gateway
             .get(render_state.instance.backend)
             .map_err(backend_error)?;
         backend.validate(&render_state).map_err(backend_error)?;
+        let runtime = backend
+            .runtime(&render_state.instance.backend_settings)
+            .map_err(backend_error)?;
         let mut files = vam_deployment::DefaultDeploymentPlanner
-            .render(&render_state)
+            .render(&render_state, &runtime, backend.capabilities())
             .map_err(deployment_error)?;
         files.extend(
             backend
@@ -2292,16 +2344,15 @@ fi
             plan.id,
             &mut sequence,
             "images",
-            "Pulling the WireGuard, CoreDNS, and Watchtower update-channel images.",
+            "Pulling the pinned WireGuard and CoreDNS images.",
             None,
             "info",
         )
         .await?;
         let pull = format!(
-            "set -eu; docker pull {}; docker pull {}; docker pull {}",
+            "set -eu; docker pull {}; docker pull {}",
             shell_quote(WIREGUARD_IMAGE),
             shell_quote(COREDNS_IMAGE),
-            shell_quote(WATCHTOWER_IMAGE),
         );
         self.checked_execute(&host, &trusted, passphrase.as_ref(), &pull, cancellation)
             .await?;

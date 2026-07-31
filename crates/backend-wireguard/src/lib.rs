@@ -15,7 +15,7 @@ use wireguard_conf::{PresharedKey, PrivateKey, PublicKey};
 use zeroize::Zeroizing;
 
 pub const SERVER_PRIVATE_KEY_SENTINEL: &str = "__VAM_SERVER_PRIVATE_KEY__";
-pub const WIREGUARD_IMAGE: &str = "ghcr.io/linuxserver/wireguard:latest";
+pub const WIREGUARD_IMAGE: &str = "lscr.io/linuxserver/wireguard:1.0.20250521-r1-ls109";
 
 #[derive(Debug, Default)]
 pub struct WireGuardBackend;
@@ -69,6 +69,14 @@ impl VpnBackend for WireGuardBackend {
                 container_path: "/config/wg_confs",
                 read_only: false,
             }],
+            environment: vec![
+                ("PUID", "0"),
+                ("PGID", "0"),
+                ("TZ", "UTC"),
+                ("LOG_CONFS", "false"),
+            ],
+            entrypoint: Vec::new(),
+            command: Vec::new(),
             sysctls: vec![
                 ("net.ipv4.ip_forward", "1"),
                 ("net.ipv4.conf.all.src_valid_mark", "1"),

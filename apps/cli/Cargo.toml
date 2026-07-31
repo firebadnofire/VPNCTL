@@ -17,6 +17,11 @@ tokio.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 vam-application = { path = "../../crates/application" }
+vam-backend-amneziawg = { path = "../../crates/backend-amneziawg" }
+vam-backend-ikev2 = { path = "../../crates/backend-ikev2" }
+vam-backend-openvpn = { path = "../../crates/backend-openvpn" }
+vam-backend-wireguard = { path = "../../crates/backend-wireguard" }
+vam-backend-xray = { path = "../../crates/backend-xray" }
 vam-core = { path = "../../crates/core" }
 vam-deployment = { path = "../../crates/deployment" }
 vam-secrets = { path = "../../crates/secrets" }
