@@ -357,9 +357,28 @@ export interface HostInspection {
   docker_privileged_accessible: boolean;
   docker_group_member: boolean;
   wireguard_kernel_available: boolean;
+  tun_device_available: boolean;
+  firewall: {
+    implementation?: string | null;
+    active?: boolean | null;
+    manageable: boolean;
+  };
   application_root_writable: boolean;
   sudo_bootstrap_available: boolean;
   warnings: string[];
+}
+
+export interface HostInspectionView {
+  inspection: HostInspection;
+  ssh_trust: string;
+  connectivity: string;
+  docker_ready: boolean;
+  backend_readiness: Array<{
+    backend: VpnBackendKind;
+    display_name: string;
+    status: "ready" | "ready_with_fallback" | "needs_setup" | "unsupported";
+    details: string[];
+  }>;
 }
 
 export type HostProvisioningOperation = {
@@ -436,6 +455,37 @@ export interface BackupInfo {
   deployment_id?: UUID;
 }
 
+export type BackupReason =
+  | "manual"
+  | "pre_deploy"
+  | "pre_upgrade"
+  | "pre_reinstall"
+  | "credential_change"
+  | "legacy_unknown";
+
+export interface BackupView {
+  instance_id: UUID;
+  instance_name: string;
+  backend: VpnBackendKind;
+  backend_name: string;
+  name: string;
+  created_at: string;
+  deployment_id?: UUID | null;
+  reason: BackupReason;
+  protects_identity: boolean;
+  restore_warning: string;
+}
+
+export interface BackupRestorePreview {
+  instance_id: UUID;
+  backup_name: string;
+  reason: BackupReason;
+  affected_clients: number;
+  identity_impact: string;
+  creates_safety_backup: boolean;
+  expected_state_hash: string;
+}
+
 export interface DeploymentProgress {
   deployment_id: UUID;
   sequence: number;
@@ -443,6 +493,29 @@ export interface DeploymentProgress {
   phase: string;
   message: string;
   technical_detail?: string;
+}
+
+export interface ActivityFilter {
+  host_id?: UUID | null;
+  instance_id?: UUID | null;
+  backend?: VpnBackendKind | null;
+  operation?: string | null;
+  severity?: string | null;
+}
+
+export interface LogEvent {
+  id: UUID;
+  sequence: number;
+  timestamp: string;
+  severity: string;
+  operation: string;
+  title: string;
+  message: string;
+  technical_detail?: string | null;
+  host_id?: UUID | null;
+  instance_id?: UUID | null;
+  backend?: VpnBackendKind | null;
+  deployment_id?: UUID | null;
 }
 
 export type DeploymentImpact =

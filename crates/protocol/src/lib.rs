@@ -143,9 +143,20 @@ pub struct HostInspection {
     #[serde(default)]
     pub docker_group_member: bool,
     pub wireguard_kernel_available: bool,
+    #[serde(default)]
+    pub tun_device_available: bool,
+    #[serde(default)]
+    pub firewall: FirewallInspection,
     pub application_root_writable: bool,
     pub sudo_bootstrap_available: bool,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct FirewallInspection {
+    pub implementation: Option<String>,
+    pub active: Option<bool>,
+    pub manageable: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

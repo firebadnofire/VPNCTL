@@ -52,6 +52,32 @@ pub struct StoredDeployment {
     pub plan: DeploymentPlan,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupRecord {
+    pub instance_id: Uuid,
+    pub name: String,
+    pub backend: String,
+    pub reason: String,
+    pub protects_identity: bool,
+    pub deployment_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActivityRecord {
+    pub id: Uuid,
+    pub timestamp: DateTime<Utc>,
+    pub severity: String,
+    pub operation: String,
+    pub title: String,
+    pub message: String,
+    pub technical_detail: Option<String>,
+    pub host_id: Option<Uuid>,
+    pub instance_id: Option<Uuid>,
+    pub backend: Option<String>,
+    pub deployment_id: Option<Uuid>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Storage {
     pool: SqlitePool,
@@ -796,6 +822,102 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn save_backup_record(&self, record: &BackupRecord) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO backup_records
+             (instance_id, name, backend, reason, protects_identity, deployment_id, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(instance_id, name) DO UPDATE SET
+               backend=excluded.backend, reason=excluded.reason,
+               protects_identity=excluded.protects_identity,
+               deployment_id=excluded.deployment_id, created_at=excluded.created_at",
+        )
+        .bind(record.instance_id.to_string())
+        .bind(&record.name)
+        .bind(&record.backend)
+        .bind(&record.reason)
+        .bind(record.protects_identity)
+        .bind(record.deployment_id.map(|id| id.to_string()))
+        .bind(record.created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_backup_records(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<Vec<BackupRecord>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT instance_id, name, backend, reason, protects_identity,
+                    deployment_id, created_at
+             FROM backup_records WHERE instance_id = ? ORDER BY created_at DESC",
+        )
+        .bind(instance_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(backup_record).collect()
+    }
+
+    pub async fn record_activity(&self, record: &ActivityRecord) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO activity_events
+             (id, timestamp, severity, operation, title, message, technical_detail,
+              host_id, instance_id, backend, deployment_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(record.id.to_string())
+        .bind(record.timestamp.to_rfc3339())
+        .bind(&record.severity)
+        .bind(&record.operation)
+        .bind(&record.title)
+        .bind(&record.message)
+        .bind(&record.technical_detail)
+        .bind(record.host_id.map(|id| id.to_string()))
+        .bind(record.instance_id.map(|id| id.to_string()))
+        .bind(&record.backend)
+        .bind(record.deployment_id.map(|id| id.to_string()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn list_activity(
+        &self,
+        host_id: Option<Uuid>,
+        instance_id: Option<Uuid>,
+        backend: Option<&str>,
+        operation: Option<&str>,
+        severity: Option<&str>,
+    ) -> Result<Vec<ActivityRecord>, StorageError> {
+        let host_id = host_id.map(|id| id.to_string());
+        let instance_id = instance_id.map(|id| id.to_string());
+        let rows = sqlx::query(
+            "SELECT id, timestamp, severity, operation, title, message, technical_detail,
+                    host_id, instance_id, backend, deployment_id
+             FROM activity_events
+             WHERE (? IS NULL OR host_id = ?)
+               AND (? IS NULL OR instance_id = ?)
+               AND (? IS NULL OR backend = ?)
+               AND (? IS NULL OR operation = ?)
+               AND (? IS NULL OR severity = ?)
+             ORDER BY timestamp DESC LIMIT 500",
+        )
+        .bind(&host_id)
+        .bind(&host_id)
+        .bind(&instance_id)
+        .bind(&instance_id)
+        .bind(backend)
+        .bind(backend)
+        .bind(operation)
+        .bind(operation)
+        .bind(severity)
+        .bind(severity)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(activity_record).collect()
+    }
+
     pub async fn record_deployment_event(
         &self,
         event: &DeploymentProgress,
@@ -1245,6 +1367,38 @@ fn deployment_summary(row: &sqlx::sqlite::SqliteRow) -> Result<DeploymentSummary
     })
 }
 
+fn backup_record(row: sqlx::sqlite::SqliteRow) -> Result<BackupRecord, StorageError> {
+    let deployment_id: Option<&str> = row.get("deployment_id");
+    Ok(BackupRecord {
+        instance_id: parse_uuid(row.get("instance_id"))?,
+        name: row.get("name"),
+        backend: row.get("backend"),
+        reason: row.get("reason"),
+        protects_identity: row.get("protects_identity"),
+        deployment_id: deployment_id.map(parse_uuid).transpose()?,
+        created_at: parse_datetime(row.get("created_at"))?,
+    })
+}
+
+fn activity_record(row: sqlx::sqlite::SqliteRow) -> Result<ActivityRecord, StorageError> {
+    let host_id: Option<&str> = row.get("host_id");
+    let instance_id: Option<&str> = row.get("instance_id");
+    let deployment_id: Option<&str> = row.get("deployment_id");
+    Ok(ActivityRecord {
+        id: parse_uuid(row.get("id"))?,
+        timestamp: parse_datetime(row.get("timestamp"))?,
+        severity: row.get("severity"),
+        operation: row.get("operation"),
+        title: row.get("title"),
+        message: row.get("message"),
+        technical_detail: row.get("technical_detail"),
+        host_id: host_id.map(parse_uuid).transpose()?,
+        instance_id: instance_id.map(parse_uuid).transpose()?,
+        backend: row.get("backend"),
+        deployment_id: deployment_id.map(parse_uuid).transpose()?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1275,6 +1429,64 @@ mod tests {
         };
         storage.save_host(&host).await.unwrap();
         assert_eq!(storage.get_host(host.id).await.unwrap(), host);
+    }
+
+    #[tokio::test]
+    async fn activity_and_backup_metadata_round_trip_with_filters() {
+        let storage = Storage::in_memory().await.unwrap();
+        let host = host();
+        storage.save_host(&host).await.unwrap();
+        let instance = instance(host.id, Uuid::new_v4(), 51_820);
+        storage.save_instance(&instance).await.unwrap();
+        let backup = BackupRecord {
+            instance_id: instance.id,
+            name: "manual-snapshot".into(),
+            backend: "wireguard".into(),
+            reason: "manual".into(),
+            protects_identity: true,
+            deployment_id: None,
+            created_at: Utc::now(),
+        };
+        storage.save_backup_record(&backup).await.unwrap();
+        assert_eq!(
+            storage.list_backup_records(instance.id).await.unwrap(),
+            vec![backup]
+        );
+
+        let activity = ActivityRecord {
+            id: Uuid::new_v4(),
+            timestamp: Utc::now(),
+            severity: "info".into(),
+            operation: "client_created".into(),
+            title: "WireGuard client added".into(),
+            message: "Laptop was added.".into(),
+            technical_detail: None,
+            host_id: Some(host.id),
+            instance_id: Some(instance.id),
+            backend: Some("wireguard".into()),
+            deployment_id: None,
+        };
+        storage.record_activity(&activity).await.unwrap();
+        assert_eq!(
+            storage
+                .list_activity(
+                    Some(host.id),
+                    Some(instance.id),
+                    Some("wireguard"),
+                    Some("client_created"),
+                    Some("info")
+                )
+                .await
+                .unwrap(),
+            vec![activity]
+        );
+        assert!(
+            storage
+                .list_activity(None, None, Some("xray"), None, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1564,6 +1776,12 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        sqlx::raw_sql(include_str!(
+            "../migrations/0003_desktop_activity_and_backups.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let storage = Storage { pool };
         let restored = storage.get_instance(legacy.id).await.unwrap();
@@ -1577,6 +1795,15 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(listener, (51_820, "udp".into(), true));
+        let activity_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM activity_events")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        let backup_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM backup_records")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!((activity_count, backup_count), (0, 0));
     }
 
     #[tokio::test]

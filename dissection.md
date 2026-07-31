@@ -4625,3 +4625,64 @@ host, Docker appliance, or secret store was contacted. Previous signed commit:
 `f7c4ded feat: expose backend UI metadata` (good EDDSA signature).
 
 Planned signed commit: `feat: add desktop presentation views`.
+
+### 12C. Generic host readiness, backup provenance, and activity history
+
+Host inspection formerly collected firewall facts but discarded them and had no
+TUN result; the public card therefore had to interpret a WireGuard-only kernel
+boolean. The single existing SSH inspection now also reports `/dev/net/tun` and
+retains UFW/Firewalld implementation, activity, and management authority. Rust
+evaluates every registered backend's declared requirements from that one result.
+The resulting view separates trusted SSH, successful connectivity, Docker
+readiness, and per-backend Ready, Ready with fallback, Needs setup, or
+Unsupported states. No per-backend SSH command or render-time probe was added.
+
+Migration `0003_desktop_activity_and_backups.sql` adds two append-compatible
+tables without rewriting instances, devices, deployments, or their JSON:
+
+- `backup_records` stores backend, reason, deployment association, timestamp,
+  and whether a snapshot protects identity state;
+- `activity_events` stores redacted, filterable operational history with host,
+  instance, backend, operation, severity, and optional deployment context.
+
+Manual, pre-deploy, reinstall-class, pre-upgrade, and certificate-credential
+backups now receive provenance when created. Legacy remote backup directories
+remain visible and are conservatively classified from their existing names.
+Image update creates a full pre-upgrade snapshot before changing images.
+
+Backup restore now reviews and targets the exact selected backup name. Names are
+strictly constrained to a safe single path component, the preview is guarded by
+an expected-state hash, and Apply creates a fresh pre-restore snapshot. A failed
+target restore invokes the same full-tree restore/health path against that safety
+snapshot and reports whether recovery succeeded. The UI-facing warning states
+that server identity and client state are rewound and newer profiles may fail.
+
+The new activity query combines typed activity records with historical
+deployment progress and accepts host, instance, backend, operation, and severity
+filters. Deployment phases receive readable titles, while technical details
+remain separately expandable. Successful host inspections, client lifecycle
+operations, exports, start/stop/health operations, backups, and restores now
+write sanitized activity records. Existing deployment events remain the source
+for deployment history, so no historical event migration is required.
+
+Validation for this unit:
+
+- all 35 application tests and all 13 storage tests passed, including existing
+  full-tree restore/health coverage;
+- focused readiness tests covered kernel fallback, TUN absence, ready AWG, and
+  unsupported architecture;
+- storage tests covered backup/activity round trips and all server-side filters;
+- the legacy 0001 WireGuard fixture was migrated through 0002 and 0003 without
+  instance/listener loss and with empty new history tables;
+- unsafe backup path components and activity severity/title mapping were tested;
+- strict Clippy passed for protocol, storage, and application with all targets
+  and `-D warnings` after replacing one large-error helper with a pure predicate;
+- the Tauri manifest check, Rust formatting, and `git diff --check` passed;
+- Svelte check passed with 0 errors and 0 warnings; Vitest passed 2/2 tests.
+
+No live host was inspected and no restore was executed against an appliance in
+this unit. Validation used the existing portable NASM in the process PATH.
+Previous signed commit: `1d7a8b6 feat: add desktop presentation views` (good
+EDDSA signature).
+
+Planned signed commit: `feat: add readiness backup and activity views`.

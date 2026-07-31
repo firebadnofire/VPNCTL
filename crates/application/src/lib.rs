@@ -51,15 +51,15 @@ use vam_dns::parse_hostslist_domains;
 use vam_dns::{next_soa_serial, validate_records};
 use vam_protocol::{
     AppError, BackupInfo, ClientArtifact, DeploymentOperation, DeploymentPlan, DeploymentProgress,
-    DeploymentResult, DeploymentStatus, DeploymentSummary, HostInspection, HostKeyInfo,
-    HostKeyProbe, HostKeyState, HostProvisioningOperation, HostProvisioningPlan, InstanceHealth,
-    PackageManager, RenderedFile, redact,
+    DeploymentResult, DeploymentStatus, DeploymentSummary, FirewallInspection, HostInspection,
+    HostKeyInfo, HostKeyProbe, HostKeyState, HostProvisioningOperation, HostProvisioningPlan,
+    InstanceHealth, PackageManager, RenderedFile, redact,
 };
 use vam_secrets::{SecretStore, SecretStoreError};
 #[cfg(test)]
 use vam_ssh::DownloadRequest;
 use vam_ssh::{CommandResult, RusshTransport, SshError, SshTransport, UploadRequest};
-use vam_storage::{Storage, StorageError};
+use vam_storage::{ActivityRecord, BackupRecord, Storage, StorageError};
 use zeroize::Zeroizing;
 
 const APP_ROOT: &str = "/opt/vpn-appliance-manager";
@@ -562,6 +562,93 @@ pub struct DeploymentPreviewView {
     pub desired_state_hash: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendReadinessStatus {
+    Ready,
+    ReadyWithFallback,
+    NeedsSetup,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendReadinessView {
+    pub backend: VpnBackendKind,
+    pub display_name: String,
+    pub status: BackendReadinessStatus,
+    pub details: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostInspectionView {
+    pub inspection: HostInspection,
+    pub ssh_trust: String,
+    pub connectivity: String,
+    pub docker_ready: bool,
+    pub backend_readiness: Vec<BackendReadinessView>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupReasonView {
+    Manual,
+    PreDeploy,
+    PreUpgrade,
+    PreReinstall,
+    CredentialChange,
+    LegacyUnknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupView {
+    pub instance_id: Uuid,
+    pub instance_name: String,
+    pub backend: VpnBackendKind,
+    pub backend_name: String,
+    pub name: String,
+    pub created_at: DateTime<Utc>,
+    pub deployment_id: Option<Uuid>,
+    pub reason: BackupReasonView,
+    pub protects_identity: bool,
+    pub restore_warning: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupRestorePreview {
+    pub instance_id: Uuid,
+    pub backup_name: String,
+    pub reason: BackupReasonView,
+    pub affected_clients: usize,
+    pub identity_impact: String,
+    pub creates_safety_backup: bool,
+    pub expected_state_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ActivityFilter {
+    pub host_id: Option<Uuid>,
+    pub instance_id: Option<Uuid>,
+    pub backend: Option<VpnBackendKind>,
+    pub operation: Option<String>,
+    pub severity: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LogEventView {
+    pub id: Uuid,
+    pub sequence: u64,
+    pub timestamp: DateTime<Utc>,
+    pub severity: String,
+    pub operation: String,
+    pub title: String,
+    pub message: String,
+    pub technical_detail: Option<String>,
+    pub host_id: Option<Uuid>,
+    pub instance_id: Option<Uuid>,
+    pub backend: Option<VpnBackendKind>,
+    pub deployment_id: Option<Uuid>,
+}
+
 struct PendingSecret {
     reference: SecretReference,
     value: Zeroizing<Vec<u8>>,
@@ -1025,6 +1112,8 @@ else
 fi
 test -e /sys/module/wireguard || command -v wg >/dev/null 2>&1
 printf 'wireguard=%s\n' "$?"
+test -c /dev/net/tun
+printf 'tun_device=%s\n' "$?"
 test -w /opt || test -w /opt/vpn-appliance-manager
 printf 'root_writable=%s\n' "$?"
 sudo -n true >/dev/null 2>&1
@@ -1123,6 +1212,35 @@ fi
                     .into(),
             );
         }
+        let firewall = if !matches!(
+            values.get("ufw").map(String::as_str),
+            Some("missing") | None
+        ) {
+            FirewallInspection {
+                implementation: Some("UFW".into()),
+                active: match values.get("ufw").map(String::as_str) {
+                    Some("active") => Some(true),
+                    Some("inactive") => Some(false),
+                    _ => None,
+                },
+                manageable: sudo_available,
+            }
+        } else if !matches!(
+            values.get("firewalld").map(String::as_str),
+            Some("missing") | None
+        ) {
+            FirewallInspection {
+                implementation: Some("Firewalld".into()),
+                active: match values.get("firewalld").map(String::as_str) {
+                    Some("active") => Some(true),
+                    Some("inactive") => Some(false),
+                    _ => None,
+                },
+                manageable: sudo_available,
+            }
+        } else {
+            FirewallInspection::default()
+        };
         Ok(HostInspection {
             operating_system,
             architecture: values.get("architecture").cloned().unwrap_or_default(),
@@ -1141,12 +1259,58 @@ fi
                 .get("docker_group_member")
                 .is_some_and(|value| value == "0"),
             wireguard_kernel_available: values.get("wireguard").is_some_and(|value| value == "0"),
+            tun_device_available: values.get("tun_device").is_some_and(|value| value == "0"),
+            firewall,
             application_root_writable: values
                 .get("root_writable")
                 .is_some_and(|value| value == "0"),
             sudo_bootstrap_available: sudo_available,
             warnings,
         })
+    }
+
+    pub async fn inspect_host_view(&self, host_id: Uuid) -> Result<HostInspectionView, AppError> {
+        let inspection = self.inspect_host(host_id).await?;
+        let docker_ready = host_deployment_prerequisites_ready(&inspection);
+        let backend_readiness = [
+            VpnBackendKind::WireGuard,
+            VpnBackendKind::AmneziaWg,
+            VpnBackendKind::OpenVpn,
+            VpnBackendKind::Ikev2,
+            VpnBackendKind::Xray,
+        ]
+        .into_iter()
+        .filter_map(|backend| {
+            self.backends
+                .presentation(backend)
+                .map(|presentation| evaluate_backend_readiness(backend, &presentation, &inspection))
+        })
+        .collect();
+        let view = HostInspectionView {
+            inspection,
+            ssh_trust: "trusted".into(),
+            connectivity: "reachable".into(),
+            docker_ready,
+            backend_readiness,
+        };
+        self.storage
+            .record_activity(&ActivityRecord {
+                id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                severity: "info".into(),
+                operation: "host_inspected".into(),
+                title: "Host readiness inspected".into(),
+                message: "SSH connectivity, Docker, and backend requirements were inspected."
+                    .into(),
+                technical_detail: None,
+                host_id: Some(host_id),
+                instance_id: None,
+                backend: None,
+                deployment_id: None,
+            })
+            .await
+            .map_err(storage_error)?;
+        Ok(view)
     }
 
     pub async fn plan_host_provisioning(
@@ -1753,7 +1917,16 @@ fi
             }
             return Err(error);
         }
-        self.bump_soa(device.instance_id).await
+        self.bump_soa(device.instance_id).await?;
+        self.record_activity_event(
+            "warning",
+            "client_removed",
+            &format!("{} client removed", state.instance.backend.display_name()),
+            &format!("Removed client {}.", device.display_name),
+            Some(&state.instance),
+            None,
+        )
+        .await
     }
 
     pub async fn replace_device_identity(&self, id: Uuid) -> Result<Device, AppError> {
@@ -1867,6 +2040,20 @@ fi
         input: CreateDeviceInput,
     ) -> Result<DeviceView, AppError> {
         let device = self.create_device(input).await?;
+        let instance = self
+            .storage
+            .get_instance(device.instance_id)
+            .await
+            .map_err(storage_error)?;
+        self.record_activity_event(
+            "info",
+            "client_created",
+            &format!("{} client added", instance.backend.display_name()),
+            &format!("Added client {}.", device.display_name),
+            Some(&instance),
+            None,
+        )
+        .await?;
         Ok(DeviceView::from(&device))
     }
 
@@ -1882,6 +2069,7 @@ fi
             .get_device(input.id)
             .await
             .map_err(storage_error)?;
+        let was_enabled = device.enabled;
         let instance = self
             .storage
             .get_instance(device.instance_id)
@@ -1903,6 +2091,29 @@ fi
         };
         device.enabled = input.enabled;
         let device = self.update_device(device).await?;
+        let operation = match (
+            was_enabled,
+            device.enabled,
+            backend.capabilities().certificate_authority,
+        ) {
+            (true, false, true) => "certificate_revoked",
+            (true, false, false) => "client_disabled",
+            (false, true, false) => "client_enabled",
+            _ => "client_updated",
+        };
+        self.record_activity_event(
+            if operation == "certificate_revoked" {
+                "warning"
+            } else {
+                "info"
+            },
+            operation,
+            &format!("{} client updated", instance.backend.display_name()),
+            &format!("Updated client {}.", device.display_name),
+            Some(&instance),
+            None,
+        )
+        .await?;
         Ok(DeviceView::from(&device))
     }
 
@@ -1951,6 +2162,23 @@ fi
 
     pub async fn replace_device_identity_view(&self, id: Uuid) -> Result<DeviceView, AppError> {
         let device = self.replace_device_identity(id).await?;
+        let instance = self
+            .storage
+            .get_instance(device.instance_id)
+            .await
+            .map_err(storage_error)?;
+        self.record_activity_event(
+            "warning",
+            "client_identity_replaced",
+            &format!(
+                "{} client identity replaced",
+                instance.backend.display_name()
+            ),
+            &format!("Replaced the identity for client {}.", device.display_name),
+            Some(&instance),
+            None,
+        )
+        .await?;
         Ok(DeviceView::from(&device))
     }
 
@@ -2131,6 +2359,18 @@ fi
             &cancellation,
         )
         .await?;
+        self.storage
+            .save_backup_record(&BackupRecord {
+                instance_id: state.instance.id,
+                name: backup_name.clone(),
+                backend: state.instance.backend.as_str().into(),
+                reason: "credential_change".into(),
+                protects_identity: true,
+                deployment_id: None,
+                created_at: Utc::now(),
+            })
+            .await
+            .map_err(storage_error)?;
 
         let mut outcome = CredentialExecutionOutcome::default();
         let operation_result = async {
@@ -2665,6 +2905,20 @@ fi
         instance_id: Uuid,
     ) -> Result<InstanceHealthView, AppError> {
         let health = self.start_instance(instance_id).await?;
+        let instance = self
+            .storage
+            .get_instance(instance_id)
+            .await
+            .map_err(storage_error)?;
+        self.record_activity_event(
+            "info",
+            "instance_started",
+            "Instance started",
+            &format!("Started {}.", instance.display_name),
+            Some(&instance),
+            None,
+        )
+        .await?;
         self.instance_health_view(instance_id, &health).await
     }
 
@@ -2677,16 +2931,46 @@ fi
         instance_id: Uuid,
     ) -> Result<InstanceHealthView, AppError> {
         let health = self.stop_instance(instance_id).await?;
+        let instance = self
+            .storage
+            .get_instance(instance_id)
+            .await
+            .map_err(storage_error)?;
+        self.record_activity_event(
+            "info",
+            "instance_stopped",
+            "Instance stopped",
+            &format!("Stopped {}.", instance.display_name),
+            Some(&instance),
+            None,
+        )
+        .await?;
         self.instance_health_view(instance_id, &health).await
     }
 
     pub async fn update_images(&self, instance_id: Uuid) -> Result<InstanceHealth, AppError> {
+        self.create_backup_with_reason(instance_id, "pre_upgrade", "upgrade")
+            .await?;
         self.compose_operation(instance_id, "refresh_images", true)
             .await
     }
 
     pub async fn health_view(&self, instance_id: Uuid) -> Result<InstanceHealthView, AppError> {
         let health = self.health(instance_id).await?;
+        let instance = self
+            .storage
+            .get_instance(instance_id)
+            .await
+            .map_err(storage_error)?;
+        self.record_activity_event(
+            "info",
+            "health_checked",
+            "Instance health checked",
+            &format!("Checked health for {}.", instance.display_name),
+            Some(&instance),
+            None,
+        )
+        .await?;
         self.instance_health_view(instance_id, &health).await
     }
 
@@ -2783,6 +3067,16 @@ fi
     }
 
     pub async fn create_backup(&self, instance_id: Uuid) -> Result<BackupInfo, AppError> {
+        self.create_backup_with_reason(instance_id, "manual", "manual")
+            .await
+    }
+
+    async fn create_backup_with_reason(
+        &self,
+        instance_id: Uuid,
+        reason: &str,
+        name_label: &str,
+    ) -> Result<BackupInfo, AppError> {
         let instance = self
             .storage
             .get_instance(instance_id)
@@ -2800,7 +3094,7 @@ fi
             })?;
         let (host, trusted, passphrase) = self.trusted_host(instance.host_id).await?;
         let name = format!(
-            "{}-manual-{}",
+            "{}-{name_label}-{}",
             Utc::now().format("%Y-%m-%dT%H-%M-%SZ"),
             deployment.summary.id
         );
@@ -2819,9 +3113,35 @@ fi
             &CancellationToken::new(),
         )
         .await?;
+        let created_at = Utc::now();
+        self.storage
+            .save_backup_record(&BackupRecord {
+                instance_id,
+                name: name.clone(),
+                backend: instance.backend.as_str().into(),
+                reason: reason.into(),
+                protects_identity: true,
+                deployment_id: Some(deployment.summary.id),
+                created_at,
+            })
+            .await
+            .map_err(storage_error)?;
+        self.record_activity_event(
+            "info",
+            "backup_created",
+            if reason == "pre_upgrade" {
+                "Pre-upgrade backup created"
+            } else {
+                "Manual backup created"
+            },
+            &format!("Created backup {name}."),
+            Some(&instance),
+            Some(deployment.summary.id),
+        )
+        .await?;
         Ok(BackupInfo {
             name,
-            created_at: Utc::now(),
+            created_at,
             deployment_id: Some(deployment.summary.id),
         })
     }
@@ -3033,6 +3353,158 @@ fi
         Ok(backups)
     }
 
+    pub async fn list_backup_views(&self, instance_id: Uuid) -> Result<Vec<BackupView>, AppError> {
+        let instance = self
+            .storage
+            .get_instance(instance_id)
+            .await
+            .map_err(storage_error)?;
+        let metadata = self
+            .storage
+            .list_backup_records(instance_id)
+            .await
+            .map_err(storage_error)?
+            .into_iter()
+            .map(|record| (record.name.clone(), record))
+            .collect::<HashMap<_, _>>();
+        Ok(self
+            .list_backups(instance_id)
+            .await?
+            .into_iter()
+            .map(|backup| {
+                let record = metadata.get(&backup.name);
+                let reason = record.map_or_else(
+                    || infer_backup_reason(&backup.name),
+                    |record| parse_backup_reason(&record.reason),
+                );
+                BackupView {
+                    instance_id,
+                    instance_name: instance.display_name.clone(),
+                    backend: instance.backend,
+                    backend_name: instance.backend.display_name().into(),
+                    name: backup.name,
+                    created_at: record.map_or(backup.created_at, |record| record.created_at),
+                    deployment_id: record
+                        .and_then(|record| record.deployment_id)
+                        .or(backup.deployment_id),
+                    reason,
+                    protects_identity: record.is_none_or(|record| record.protects_identity),
+                    restore_warning: "Restoring this complete instance snapshot rewinds server identity and client state. Profiles created or replaced after the backup may stop working."
+                        .into(),
+                }
+            })
+            .collect())
+    }
+
+    pub async fn preview_backup_restore(
+        &self,
+        instance_id: Uuid,
+        backup_name: &str,
+    ) -> Result<BackupRestorePreview, AppError> {
+        if !valid_backup_name(backup_name) {
+            return Err(validation_error("The backup name is invalid or unsafe."));
+        }
+        let backup = self
+            .list_backup_views(instance_id)
+            .await?
+            .into_iter()
+            .find(|backup| backup.name == backup_name)
+            .ok_or_else(|| validation_error("The selected backup no longer exists."))?;
+        let affected_clients = self
+            .storage
+            .list_devices(instance_id)
+            .await
+            .map_err(storage_error)?
+            .len();
+        let expected_state_hash = format!(
+            "{:x}",
+            Sha256::digest(format!(
+                "{instance_id}|{}|{}|{}",
+                backup.name,
+                backup.created_at.to_rfc3339(),
+                affected_clients
+            ))
+        );
+        Ok(BackupRestorePreview {
+            instance_id,
+            backup_name: backup.name,
+            reason: backup.reason,
+            affected_clients,
+            identity_impact: backup.restore_warning,
+            creates_safety_backup: true,
+            expected_state_hash,
+        })
+    }
+
+    pub async fn restore_backup_by_name(
+        &self,
+        instance_id: Uuid,
+        backup_name: &str,
+        expected_state_hash: &str,
+    ) -> Result<InstanceHealthView, AppError> {
+        let preview = self
+            .preview_backup_restore(instance_id, backup_name)
+            .await?;
+        if preview.expected_state_hash != expected_state_hash {
+            return Err(AppError {
+                code: "backup_restore_preview_stale".into(),
+                message: "The backup restore preview is stale.".into(),
+                scope: Some(instance_id.to_string()),
+                remote_state_changed: false,
+                rollback_succeeded: None,
+                remediation: Some("Review the selected backup again before restoring it.".into()),
+                technical_detail: None,
+            });
+        }
+        let state = self.desired_state(instance_id).await?;
+        let safety = self
+            .create_backup_with_reason(instance_id, "manual", "pre-restore")
+            .await?;
+        let (host, trusted, passphrase) = self.trusted_host(state.instance.host_id).await?;
+        let cancellation = CancellationToken::new();
+        let target_path = backup_path(instance_id, backup_name);
+        let health = match self
+            .restore_backup(
+                &state,
+                &host,
+                &trusted,
+                passphrase.as_ref(),
+                Some(&target_path),
+                &cancellation,
+            )
+            .await
+        {
+            Ok(health) => health,
+            Err(mut error) => {
+                let safety_path = backup_path(instance_id, &safety.name);
+                error.rollback_succeeded = Some(
+                    self.restore_backup(
+                        &state,
+                        &host,
+                        &trusted,
+                        passphrase.as_ref(),
+                        Some(&safety_path),
+                        &cancellation,
+                    )
+                    .await
+                    .is_ok(),
+                );
+                error.remote_state_changed = true;
+                return Err(error);
+            }
+        };
+        self.record_activity_event(
+            "warning",
+            "backup_restored",
+            "Instance backup restored",
+            &format!("Restored backup {backup_name}."),
+            Some(&state.instance),
+            None,
+        )
+        .await?;
+        self.instance_health_view(instance_id, &health).await
+    }
+
     pub async fn rollback(&self, deployment_id: Uuid) -> Result<DeploymentResult, AppError> {
         let snapshot = self
             .storage
@@ -3179,6 +3651,16 @@ fi
         device_id: Uuid,
         destination: &Path,
     ) -> Result<PathBuf, AppError> {
+        let device = self
+            .storage
+            .get_device(device_id)
+            .await
+            .map_err(storage_error)?;
+        let instance = self
+            .storage
+            .get_instance(device.instance_id)
+            .await
+            .map_err(storage_error)?;
         let artifact = self.client_configuration(device_id).await?;
         let destination = if destination.is_dir() {
             destination.join(&artifact.suggested_filename)
@@ -3186,6 +3668,18 @@ fi
             destination.to_owned()
         };
         write_private_file(&destination, artifact.contents.as_bytes()).await?;
+        self.record_activity_event(
+            "info",
+            "client_exported",
+            &format!("{} client exported", instance.backend.display_name()),
+            &format!(
+                "Exported client {} to a private local file.",
+                device.display_name
+            ),
+            Some(&instance),
+            None,
+        )
+        .await?;
         Ok(destination)
     }
 
@@ -3205,6 +3699,93 @@ fi
     ) -> Result<Vec<DeploymentProgress>, AppError> {
         self.storage
             .list_deployment_events(instance_id)
+            .await
+            .map_err(storage_error)
+    }
+
+    pub async fn activity_logs(
+        &self,
+        filter: ActivityFilter,
+    ) -> Result<Vec<LogEventView>, AppError> {
+        let mut events = self
+            .storage
+            .list_activity(
+                filter.host_id,
+                filter.instance_id,
+                filter.backend.map(VpnBackendKind::as_str),
+                filter.operation.as_deref(),
+                filter.severity.as_deref(),
+            )
+            .await
+            .map_err(storage_error)?
+            .into_iter()
+            .map(activity_record_view)
+            .collect::<Vec<_>>();
+        if filter.operation.is_none() || filter.operation.as_deref() == Some("deployment") {
+            for event in self.logs(filter.instance_id).await? {
+                let deployment = self
+                    .storage
+                    .get_deployment(event.deployment_id)
+                    .await
+                    .map_err(storage_error)?;
+                let instance = &deployment.desired_state.instance;
+                if filter
+                    .host_id
+                    .is_some_and(|host_id| host_id != instance.host_id)
+                    || filter
+                        .backend
+                        .is_some_and(|backend| backend != instance.backend)
+                    || filter
+                        .severity
+                        .as_deref()
+                        .is_some_and(|severity| severity != deployment_event_severity(&event))
+                {
+                    continue;
+                }
+                events.push(LogEventView {
+                    id: event.deployment_id,
+                    sequence: event.sequence,
+                    timestamp: event.timestamp,
+                    severity: deployment_event_severity(&event).into(),
+                    operation: "deployment".into(),
+                    title: readable_deployment_phase(&event.phase),
+                    message: event.message,
+                    technical_detail: event.technical_detail,
+                    host_id: Some(instance.host_id),
+                    instance_id: Some(instance.id),
+                    backend: Some(instance.backend),
+                    deployment_id: Some(event.deployment_id),
+                });
+            }
+        }
+        events.sort_by_key(|event| std::cmp::Reverse(event.timestamp));
+        events.truncate(500);
+        Ok(events)
+    }
+
+    async fn record_activity_event(
+        &self,
+        severity: &str,
+        operation: &str,
+        title: &str,
+        message: &str,
+        instance: Option<&VpnInstance>,
+        deployment_id: Option<Uuid>,
+    ) -> Result<(), AppError> {
+        self.storage
+            .record_activity(&ActivityRecord {
+                id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                severity: severity.into(),
+                operation: operation.into(),
+                title: title.into(),
+                message: redact(message, &[]),
+                technical_detail: None,
+                host_id: instance.map(|instance| instance.host_id),
+                instance_id: instance.map(|instance| instance.id),
+                backend: instance.map(|instance| instance.backend.as_str().into()),
+                deployment_id,
+            })
             .await
             .map_err(storage_error)
     }
@@ -4299,6 +4880,27 @@ install -d {instances} {staging_root} {backups} {trash} {stage}
             cancellation,
         )
         .await?;
+        let backup_reason = if plan
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("Destructive reinstall-class"))
+        {
+            "pre_reinstall"
+        } else {
+            "pre_deploy"
+        };
+        self.storage
+            .save_backup_record(&BackupRecord {
+                instance_id: state.instance.id,
+                name: backup_name.clone(),
+                backend: state.instance.backend.as_str().into(),
+                reason: backup_reason.into(),
+                protects_identity: true,
+                deployment_id: Some(plan.id),
+                created_at: Utc::now(),
+            })
+            .await
+            .map_err(storage_error)?;
         self.record_event(
             plan.id,
             &mut sequence,
@@ -6307,6 +6909,108 @@ fn deployment_operation_view(operation: &DeploymentOperation) -> DeploymentOpera
     }
 }
 
+fn activity_record_view(record: ActivityRecord) -> LogEventView {
+    LogEventView {
+        id: record.id,
+        sequence: 0,
+        timestamp: record.timestamp,
+        severity: record.severity,
+        operation: record.operation,
+        title: record.title,
+        message: record.message,
+        technical_detail: record.technical_detail,
+        host_id: record.host_id,
+        instance_id: record.instance_id,
+        backend: record.backend.as_deref().and_then(parse_backend_name),
+        deployment_id: record.deployment_id,
+    }
+}
+
+fn parse_backend_name(value: &str) -> Option<VpnBackendKind> {
+    match value {
+        "wireguard" => Some(VpnBackendKind::WireGuard),
+        "amnezia_wg" => Some(VpnBackendKind::AmneziaWg),
+        "openvpn" => Some(VpnBackendKind::OpenVpn),
+        "ikev2" => Some(VpnBackendKind::Ikev2),
+        "xray" => Some(VpnBackendKind::Xray),
+        _ => None,
+    }
+}
+
+fn deployment_event_severity(event: &DeploymentProgress) -> &'static str {
+    let phase = event.phase.to_ascii_lowercase();
+    let message = event.message.to_ascii_lowercase();
+    if phase.contains("fail") || message.contains("fail") || message.contains("error") {
+        "error"
+    } else if phase.contains("rollback") || message.contains("warning") {
+        "warning"
+    } else {
+        "info"
+    }
+}
+
+fn readable_deployment_phase(phase: &str) -> String {
+    match phase {
+        "backup" => "Pre-change backup created".into(),
+        "upload" => "Configuration uploaded".into(),
+        "validate" => "Configuration validated".into(),
+        "activate" => "Backend configuration activated".into(),
+        "health" => "Backend health verified".into(),
+        "rollback" => "Deployment rollback".into(),
+        other => other
+            .split(['_', '-'])
+            .filter(|part| !part.is_empty())
+            .enumerate()
+            .fold(String::new(), |mut label, (index, part)| {
+                if index > 0 {
+                    label.push(' ');
+                }
+                if index == 0 {
+                    let mut chars = part.chars();
+                    if let Some(first) = chars.next() {
+                        label.extend(first.to_uppercase());
+                        label.extend(chars);
+                    }
+                } else {
+                    label.push_str(part);
+                }
+                label
+            }),
+    }
+}
+
+fn parse_backup_reason(value: &str) -> BackupReasonView {
+    match value {
+        "manual" => BackupReasonView::Manual,
+        "pre_deploy" => BackupReasonView::PreDeploy,
+        "pre_upgrade" => BackupReasonView::PreUpgrade,
+        "pre_reinstall" => BackupReasonView::PreReinstall,
+        "credential_change" => BackupReasonView::CredentialChange,
+        _ => BackupReasonView::LegacyUnknown,
+    }
+}
+
+fn infer_backup_reason(name: &str) -> BackupReasonView {
+    if name.contains("-manual-") {
+        BackupReasonView::Manual
+    } else if name.contains("-credential-") {
+        BackupReasonView::CredentialChange
+    } else if name.contains("-upgrade-") {
+        BackupReasonView::PreUpgrade
+    } else {
+        BackupReasonView::PreDeploy
+    }
+}
+
+fn valid_backup_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 160
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+}
+
 fn health_is_healthy(health: &InstanceHealth) -> bool {
     health.compose_project_exists
         && health.gateway_running
@@ -6485,6 +7189,82 @@ fn host_deployment_prerequisites_ready(inspection: &HostInspection) -> bool {
             .as_deref()
             .and_then(version_major)
             .is_some_and(|major| major >= 2)
+}
+
+fn evaluate_backend_readiness(
+    backend: VpnBackendKind,
+    presentation: &BackendPresentation,
+    inspection: &HostInspection,
+) -> BackendReadinessView {
+    let architecture_supported = matches!(
+        inspection.architecture.as_str(),
+        "x86_64" | "amd64" | "aarch64" | "arm64"
+    );
+    let compose_ready = inspection
+        .compose_version
+        .as_deref()
+        .and_then(version_major)
+        .is_some_and(|major| major >= 2);
+    let mut details = Vec::new();
+    let mut unsupported = false;
+    let mut needs_setup = false;
+    let mut fallback = false;
+    for requirement in presentation.host_requirements {
+        match requirement {
+            BackendHostRequirement::Linux if inspection.operating_system != "Linux" => {
+                unsupported = true;
+                details.push("Linux is required.".into());
+            }
+            BackendHostRequirement::SupportedArchitecture if !architecture_supported => {
+                unsupported = true;
+                details.push(format!(
+                    "Architecture {} is not supported.",
+                    inspection.architecture
+                ));
+            }
+            BackendHostRequirement::DockerEngine if !inspection.docker_installed => {
+                needs_setup = true;
+                details.push("Docker Engine is not installed.".into());
+            }
+            BackendHostRequirement::ComposeV2 if !compose_ready => {
+                needs_setup = true;
+                details.push("Docker Compose v2 is not available.".into());
+            }
+            BackendHostRequirement::DockerAccess if !inspection.docker_accessible => {
+                needs_setup = true;
+                details.push("The SSH user cannot access Docker.".into());
+            }
+            BackendHostRequirement::TunDevice if !inspection.tun_device_available => {
+                needs_setup = true;
+                details.push("/dev/net/tun is unavailable.".into());
+            }
+            BackendHostRequirement::WireGuardKernelOrUserspace
+                if !inspection.wireguard_kernel_available =>
+            {
+                fallback = true;
+                details.push("The kernel module is unavailable; use userspace fallback.".into());
+            }
+            _ => {}
+        }
+    }
+    let status = if unsupported {
+        BackendReadinessStatus::Unsupported
+    } else if needs_setup {
+        BackendReadinessStatus::NeedsSetup
+    } else if fallback {
+        BackendReadinessStatus::ReadyWithFallback
+    } else {
+        BackendReadinessStatus::Ready
+    };
+    if details.is_empty() {
+        details.push("All declared backend requirements are satisfied.".into());
+    }
+    BackendReadinessView {
+        backend,
+        display_name: backend.display_name().into(),
+        status,
+        details,
+    }
 }
 
 fn host_provisioning_script(
@@ -7066,6 +7846,8 @@ mod tests {
             docker_privileged_accessible: false,
             docker_group_member: false,
             wireguard_kernel_available: false,
+            tun_device_available: false,
+            firewall: FirewallInspection::default(),
             application_root_writable: false,
             sudo_bootstrap_available: false,
             warnings: vec![],
@@ -7296,6 +8078,72 @@ mod tests {
         assert!(first.operations.is_empty());
         assert_eq!(first.expected_state_hash, second.expected_state_hash);
         assert_eq!(first.expected_state_hash.len(), 64);
+    }
+
+    #[test]
+    fn backend_readiness_is_derived_from_one_generic_inspection() {
+        let mut inspection = host_inspection(Some(PackageManager::Apt));
+        inspection.docker_installed = true;
+        inspection.docker_accessible = true;
+        inspection.compose_version = Some("2.40.0".into());
+        inspection.tun_device_available = true;
+        let wireguard = evaluate_backend_readiness(
+            VpnBackendKind::WireGuard,
+            &WireGuardBackend.presentation(),
+            &inspection,
+        );
+        assert_eq!(wireguard.status, BackendReadinessStatus::ReadyWithFallback);
+        let awg = evaluate_backend_readiness(
+            VpnBackendKind::AmneziaWg,
+            &AmneziaWgBackend.presentation(),
+            &inspection,
+        );
+        assert_eq!(awg.status, BackendReadinessStatus::Ready);
+
+        inspection.tun_device_available = false;
+        let awg = evaluate_backend_readiness(
+            VpnBackendKind::AmneziaWg,
+            &AmneziaWgBackend.presentation(),
+            &inspection,
+        );
+        assert_eq!(awg.status, BackendReadinessStatus::NeedsSetup);
+        assert!(
+            awg.details
+                .iter()
+                .any(|detail| detail.contains("/dev/net/tun"))
+        );
+
+        inspection.architecture = "riscv64".into();
+        let xray = evaluate_backend_readiness(
+            VpnBackendKind::Xray,
+            &XrayBackend.presentation(),
+            &inspection,
+        );
+        assert_eq!(xray.status, BackendReadinessStatus::Unsupported);
+    }
+
+    #[test]
+    fn backup_names_and_activity_labels_are_safe_and_readable() {
+        assert!(valid_backup_name("2026-07-31T09-00-00Z-manual-safe"));
+        assert!(!valid_backup_name("../escape"));
+        assert!(!valid_backup_name("name/child"));
+        assert_eq!(
+            infer_backup_reason("2026-07-31T09-00-00Z-credential-id"),
+            BackupReasonView::CredentialChange
+        );
+        assert_eq!(
+            readable_deployment_phase("certificate_revoked"),
+            "Certificate revoked"
+        );
+        let event = DeploymentProgress {
+            deployment_id: Uuid::nil(),
+            sequence: 1,
+            timestamp: Utc::now(),
+            phase: "rollback".into(),
+            message: "Rollback warning".into(),
+            technical_detail: None,
+        };
+        assert_eq!(deployment_event_severity(&event), "warning");
     }
 
     #[test]

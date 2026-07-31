@@ -3,9 +3,10 @@ use std::{path::PathBuf, sync::Arc};
 use tauri::{Manager, State};
 use uuid::Uuid;
 use vam_application::{
-    ApplicationService, BackendOptionView, ClientView, CreateDeviceInput, CreateDnsHostlistInput,
-    CreateDnsRecordInput, CreateHostInput, CreateInstanceInput, DeploymentPreviewView, DeviceView,
-    DnsHostlist, InstanceDetailView, InstanceHealthView, InstanceSummaryView, InstanceView,
+    ActivityFilter, ApplicationService, BackendOptionView, BackupRestorePreview, BackupView,
+    ClientView, CreateDeviceInput, CreateDnsHostlistInput, CreateDnsRecordInput, CreateHostInput,
+    CreateInstanceInput, DeploymentPreviewView, DeviceView, DnsHostlist, HostInspectionView,
+    InstanceDetailView, InstanceHealthView, InstanceSummaryView, InstanceView, LogEventView,
     UpdateDeviceInput,
 };
 use vam_core::{DnsRecord, DockerHost, User};
@@ -86,6 +87,14 @@ async fn inspect_host(
     host_id: Uuid,
 ) -> Result<HostInspection, AppError> {
     state.0.inspect_host(host_id).await
+}
+
+#[tauri::command]
+async fn inspect_host_view(
+    state: State<'_, AppState>,
+    host_id: Uuid,
+) -> Result<HostInspectionView, AppError> {
+    state.0.inspect_host_view(host_id).await
 }
 
 #[tauri::command]
@@ -387,6 +396,39 @@ async fn list_backups(
 }
 
 #[tauri::command]
+async fn list_backup_views(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+) -> Result<Vec<BackupView>, AppError> {
+    state.0.list_backup_views(instance_id).await
+}
+
+#[tauri::command]
+async fn preview_backup_restore(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+    backup_name: String,
+) -> Result<BackupRestorePreview, AppError> {
+    state
+        .0
+        .preview_backup_restore(instance_id, &backup_name)
+        .await
+}
+
+#[tauri::command]
+async fn restore_backup_by_name(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+    backup_name: String,
+    expected_state_hash: String,
+) -> Result<InstanceHealthView, AppError> {
+    state
+        .0
+        .restore_backup_by_name(instance_id, &backup_name, &expected_state_hash)
+        .await
+}
+
+#[tauri::command]
 async fn rollback(
     state: State<'_, AppState>,
     deployment_id: Uuid,
@@ -421,6 +463,14 @@ async fn logs(
     instance_id: Option<Uuid>,
 ) -> Result<Vec<DeploymentProgress>, AppError> {
     state.0.logs(instance_id).await
+}
+
+#[tauri::command]
+async fn activity_logs(
+    state: State<'_, AppState>,
+    filter: ActivityFilter,
+) -> Result<Vec<LogEventView>, AppError> {
+    state.0.activity_logs(filter).await
 }
 
 #[tauri::command]
@@ -472,6 +522,7 @@ pub fn run() {
             probe_host_key,
             approve_host_key,
             inspect_host,
+            inspect_host_view,
             plan_host_provisioning,
             apply_host_provisioning,
             create_instance,
@@ -510,11 +561,15 @@ pub fn run() {
             refresh_remote_credentials,
             refresh_remote_dns_store,
             list_backups,
+            list_backup_views,
+            preview_backup_restore,
+            restore_backup_by_name,
             rollback,
             health,
             health_view,
             list_deployments,
             logs,
+            activity_logs,
             cancel_deployment,
             export_client_configuration,
             client_qr_svg,
