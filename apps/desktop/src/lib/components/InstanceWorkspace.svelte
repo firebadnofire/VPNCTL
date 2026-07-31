@@ -5,6 +5,7 @@
     BackupView,
     Client,
     ClientActionView,
+    ConfigurationSection,
     DnsHostlist,
     DnsRecord,
     InstanceSummary,
@@ -58,6 +59,13 @@
   } = $props();
 
   const tabs: WorkspaceTab[] = ["Overview", "Clients", "DNS", "Settings", "Backups", "Logs"];
+  const configurationSectionCopy: Record<ConfigurationSection, { label: string; description: string }> = {
+    general: { label: "General", description: "Instance name and public endpoint." },
+    network: { label: "Network", description: "Listener, private addressing, and routing policy." },
+    protocol: { label: "Protocol", description: "Backend-specific transport and security controls." },
+    dns: { label: "DNS", description: "Private zone and managed DNS behavior." },
+    advanced: { label: "Advanced", description: "Specialized backend and compatibility options." },
+  };
   let backend = $derived(options.find((option) => option.kind === summary.instance.backend));
   let instanceLogs = $derived(logs.filter((event) => event.instance_id === summary.instance.id));
   async function tabKeydown(event: KeyboardEvent, current: WorkspaceTab) {
@@ -126,13 +134,34 @@
     {/if}
     <div class="panel"><div class="panel-head"><h3>Global hostlists</h3><span>{hostlists.length}</span></div>{#if hostlists.length}{#each hostlists as hostlist}<div class="workspace-record"><strong>{hostlist.name}</strong><span>{hostlist.coverage || "Custom"}</span><code>{hostlist.url}</code></div>{/each}{:else}<p class="help">No global hostlists are configured.</p>{/if}</div>
   {:else if tab === "Settings"}
-    <div class="panel">
-      <div class="panel-head"><h3>Configuration sections</h3><span>Host and backend are immutable here</span></div>
-      <div class="settings-sections">
-        {#each backend?.presentation.configuration_sections ?? [] as section}<button class="secondary" type="button">{section[0].toUpperCase() + section.slice(1)}</button>{/each}
+    <div class="panel settings-panel">
+      <div class="settings-purpose">
+        <div>
+          <p class="eyebrow">DESIRED CONFIGURATION</p>
+          <h2>Control how this instance should run</h2>
+          <p>Review the local target configuration, preview the operational impact of changes, and save it for a separate deployment review.</p>
+        </div>
+        <button class="primary" type="button" onclick={oneditsettings}>Review and edit settings</button>
       </div>
-      <p class="help">Settings are saved to local desired state after a typed impact preview. Deployment remains a separate reviewed action.</p>
-      <div class="panel-actions"><button class="primary" type="button" onclick={oneditsettings}>Edit desired settings</button></div>
+      <div class="settings-current-facts" aria-label="Current desired configuration">
+        <div><span>Public endpoint</span><strong>{summary.instance.endpoint.host}:{summary.instance.endpoint.port}</strong><small>{summary.listener_summary}</small></div>
+        <div><span>Routing model</span><strong>{backend?.presentation.routing === "proxy" ? "Proxy" : summary.instance.routing_mode.replace("_", " ")}</strong><small>{backend?.presentation.client_addresses === "allocated" ? summary.instance.network.ipv4_subnet : "No managed client subnet"}</small></div>
+        <div><span>Managed DNS</span><strong>{backend?.presentation.dns === "managed_private_dns" ? summary.instance.dns.zone : "Not provided"}</strong><small>{backend?.presentation.dns === "managed_private_dns" ? "Private zone is part of desired state" : "This backend does not publish a private zone"}</small></div>
+        <div><span>Fixed assignment</span><strong>{backend?.display_name ?? summary.instance.backend}</strong><small>Backend and host cannot be changed from this screen</small></div>
+      </div>
+      <div class="settings-editable">
+        <div class="settings-section-heading"><div><h3>What you can edit</h3><p>Only sections supported by this backend are shown.</p></div><span>{backend?.presentation.configuration_sections.length ?? 0} sections</span></div>
+        <div class="settings-section-grid">
+          {#each backend?.presentation.configuration_sections ?? [] as section}
+            <article><strong>{configurationSectionCopy[section].label}</strong><span>{configurationSectionCopy[section].description}</span></article>
+          {/each}
+        </div>
+      </div>
+      <div class="settings-workflow">
+        <div><b>1</b><span><strong>Edit and preview</strong><small>Validation calculates restart, rebuild, or identity impact before save.</small></span></div>
+        <div><b>2</b><span><strong>Save desired state</strong><small>This updates local configuration only; it does not contact the host.</small></span></div>
+        <div><b>3</b><span><strong>Review deployment</strong><small>Apply the remote change later from the reviewed deployment plan.</small></span></div>
+      </div>
     </div>
   {:else if tab === "Backups"}
     <div class="workspace-toolbar"><div><h2>Backups</h2><p>Remote snapshots for this instance.</p></div><button class="primary" type="button" onclick={onbackup}>Create backup</button></div>

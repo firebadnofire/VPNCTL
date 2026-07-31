@@ -156,6 +156,21 @@ describe("backend-aware presentation components", () => {
     expect(ontabchange).toHaveBeenCalledWith("Clients");
   });
 
+  it("explains the settings workflow and renders descriptor sections as information", () => {
+    render(InstanceWorkspace, {
+      summary: summary("wireguard"), options: backendOptions, tab: "Settings", devices: [], records: [], hostlists: [],
+      backups: [], logs: [], onback: vi.fn(), ontabchange: vi.fn(), onhealth: vi.fn(), onplan: vi.fn(),
+      onaddclient: vi.fn(), onclientaction: vi.fn(), onbackup: vi.fn(), onrestore: vi.fn(), oneditsettings: vi.fn(),
+    });
+    expect(screen.getByRole("heading", { name: "Control how this instance should run" })).toBeTruthy();
+    expect(screen.getByText("Public endpoint")).toBeTruthy();
+    expect(screen.getByText("Edit and preview")).toBeTruthy();
+    expect(screen.getAllByText("Review deployment")).toHaveLength(2);
+    expect(screen.getByRole("button", { name: "Review and edit settings" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "General" })).toBeNull();
+    expect(screen.getByText("General")).toBeTruthy();
+  });
+
   it("emits typed log filters and renders readable event titles", async () => {
     const onchange = vi.fn();
     render(LogFilters, { value: {}, hosts: [], instances: [], onchange });

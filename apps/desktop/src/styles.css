@@ -149,8 +149,32 @@ button:focus-visible, input:focus-visible, select:focus-visible, summary:focus-v
 .workspace-toolbar p { color: #627d98; font-size: 12px; margin: 5px 0 0; }
 .workspace-record { display: grid; grid-template-columns: 1fr .5fr 2fr; gap: 15px; padding: 13px 20px; border-bottom: 1px solid #edf1f5; font-size: 12px; align-items: center; }
 .workspace-record code { overflow-wrap: anywhere; }
-.settings-sections { display: flex; flex-wrap: wrap; gap: 9px; padding: 20px; }
-.panel-actions { display: flex; justify-content: flex-end; padding: 0 20px 20px; }
+.settings-panel { min-height: 0; }
+.settings-purpose { padding: 24px; display: flex; align-items: center; justify-content: space-between; gap: 28px; background: linear-gradient(120deg, #f3f8ff, #f4fbf8); border-bottom: 1px solid #dfe9f2; }
+.settings-purpose h2 { margin: 6px 0 7px; font-size: 21px; }
+.settings-purpose p:not(.eyebrow) { max-width: 680px; margin: 0; color: #486581; font-size: 13px; line-height: 1.55; }
+.settings-purpose .primary { flex: 0 0 auto; }
+.settings-current-facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-bottom: 1px solid #e8eef4; }
+.settings-current-facts > div { min-width: 0; padding: 18px 20px; display: grid; gap: 5px; border-right: 1px solid #e8eef4; }
+.settings-current-facts > div:last-child { border-right: 0; }
+.settings-current-facts span { color: #627d98; font-size: 10px; font-weight: 800; letter-spacing: .55px; text-transform: uppercase; }
+.settings-current-facts strong { overflow-wrap: anywhere; font-size: 13px; }
+.settings-current-facts small { color: #829ab1; font-size: 10px; line-height: 1.4; }
+.settings-editable { padding: 21px 24px 23px; border-bottom: 1px solid #e8eef4; }
+.settings-section-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; margin-bottom: 14px; }
+.settings-section-heading h3 { margin: 0; font-size: 14px; }
+.settings-section-heading p { margin: 4px 0 0; color: #627d98; font-size: 11px; }
+.settings-section-heading > span { color: #627d98; font-size: 11px; white-space: nowrap; }
+.settings-section-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
+.settings-section-grid article { padding: 12px 13px; display: grid; gap: 5px; border: 1px solid #d9e5ef; border-radius: 8px; background: #f8fafc; }
+.settings-section-grid strong { color: #334e68; font-size: 12px; }
+.settings-section-grid span { color: #627d98; font-size: 10px; line-height: 1.45; }
+.settings-workflow { padding: 18px 24px 22px; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+.settings-workflow > div { display: grid; grid-template-columns: 28px 1fr; gap: 10px; align-items: start; }
+.settings-workflow b { width: 28px; height: 28px; display: grid; place-items: center; border-radius: 50%; color: #1769bd; background: #e7f1ff; font-size: 11px; }
+.settings-workflow span, .settings-workflow strong, .settings-workflow small { display: block; }
+.settings-workflow strong { color: #334e68; font-size: 11px; }
+.settings-workflow small { margin-top: 3px; color: #627d98; font-size: 10px; line-height: 1.4; }
 .instance-selector { display: flex; align-items: center; gap: 10px; font-size: 12px; font-weight: 700; }
 .instance-selector select { min-width: 240px; }
 .client-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
@@ -252,6 +276,10 @@ input:focus, select:focus { border-color: #2f80ed; box-shadow: 0 0 0 3px #2f80ed
   .readiness-matrix { grid-template-columns: repeat(3, 1fr); }
   .log-filters { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .client-actions { width: 100%; justify-content: flex-start; }
+  .settings-current-facts { grid-template-columns: 1fr 1fr; }
+  .settings-current-facts > div:nth-child(2) { border-right: 0; }
+  .settings-current-facts > div:nth-child(-n+2) { border-bottom: 1px solid #e8eef4; }
+  .settings-section-grid { grid-template-columns: 1fr 1fr; }
   .rows article { flex-wrap: wrap; }
 }
 @media (max-width: 850px) {
@@ -270,6 +298,9 @@ input:focus, select:focus { border-color: #2f80ed; box-shadow: 0 0 0 3px #2f80ed
   .log-filters { grid-template-columns: 1fr 1fr; }
   .form-grid, .form-grid.equal { grid-template-columns: 1fr; }
   .backend-cards { grid-template-columns: 1fr; }
+  .settings-purpose { align-items: flex-start; flex-direction: column; }
+  .settings-purpose .primary { width: 100%; }
+  .settings-workflow { grid-template-columns: 1fr; }
   .modal-backdrop { padding: 12px; }
   .modal { width: min(620px, 100%); max-height: calc(100vh - 24px); padding: 20px; }
   .table, .hostlist-table { margin-inline: 0; }

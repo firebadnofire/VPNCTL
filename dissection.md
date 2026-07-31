@@ -5190,3 +5190,57 @@ Previous signed commit: `4fbf7e3 test: add desktop workflow coverage` (good
 EDDSA signature).
 
 Planned signed commit: `docs: record backend-aware UI implementation`.
+
+### 12J. Actionable instance Settings workspace (2026-07-31)
+
+The instance Settings tab previously presented the backend descriptor's section
+names as five secondary buttons even though they had no action or navigation
+behavior. The rest of the large panel was mostly empty, the local desired-state
+purpose was relegated to one low-contrast sentence, and the primary action said
+only `Edit desired settings`. This made a safe and useful preview/save workflow
+look unfinished.
+
+The panel now leads with its purpose: review the local target configuration,
+preview operational impact, save desired state, and separately review a remote
+deployment. Its single primary action is `Review and edit settings`. Current
+applicable facts show endpoint/listener, routing and managed network, managed
+DNS, and the fixed backend/host assignment. These values come from the existing
+presentation-safe summary and descriptor, so opening the tab performs no SSH,
+health, backup, or readiness operation.
+
+The descriptor's available configuration sections remain authoritative, but
+they are now informational cards with plain-language scope instead of inert
+buttons. The workflow footer explicitly distinguishes edit/preview, local save,
+and later deployment review. Proxy and routed backends continue to receive only
+the facts and sections their Rust descriptor advertises. Responsive rules move
+the four current facts and editable cards to two columns and eventually stack
+the purpose/action and three workflow steps without creating page-wide
+horizontal overflow.
+
+Files changed:
+
+- `apps/desktop/src/lib/components/InstanceWorkspace.svelte`: desired-state
+  overview, applicable current facts, descriptor section explanations, workflow,
+  and clearer action label;
+- `apps/desktop/src/styles.css`: compact panel hierarchy and responsive grids;
+- `apps/desktop/src/lib/components/presentation.test.ts`: actionable purpose,
+  workflow, descriptor content, and absence of inert section buttons.
+
+Validation:
+
+- focused presentation suite passed 20/20 tests;
+- full frontend suite passed 25/25 tests across four files;
+- Svelte check passed with 0 errors and 0 warnings;
+- Vite production build passed (134 modules, 133.91 kB JavaScript and 22.67 kB
+  CSS before gzip);
+- `git diff --check` passed.
+
+The first focused run stopped because `Review deployment` correctly existed in
+both the global action and the new three-step explanation while the test assumed
+one match. The assertion was scoped to the two intentional semantic occurrences
+and the suite passed; no production behavior changed for that test correction.
+
+Previous signed commit: `3068e0d docs: record backend-aware UI implementation`
+(good EDDSA signature).
+
+Planned signed commit: `fix: clarify instance settings workspace`.
