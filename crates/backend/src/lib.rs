@@ -229,7 +229,9 @@ pub enum BackendHealthProbe {
     },
     OpenVpn,
     Ikev2,
-    Xray,
+    Xray {
+        user: &'static str,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

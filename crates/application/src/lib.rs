@@ -2675,8 +2675,10 @@ fi
             &cancellation,
         )
         .await?;
+        let copy =
+            copy_managed_tree_command(&current, &backup, &runtime).map_err(validation_error)?;
         let backup_command = format!(
-            "set -eu; test -d {current}; install -d {parent}; test ! -e {backup} && test ! -L {backup}; cp -a -- {current} {backup}",
+            "set -eu; test -d {current}; install -d {parent}; test ! -e {backup} && test ! -L {backup}; {copy}",
             current = shell_quote(&current),
             parent = shell_quote(&format!("{APP_ROOT}/backups/{}", state.instance.id)),
             backup = shell_quote(&backup),
@@ -3450,8 +3452,14 @@ fi
             deployment.summary.id
         );
         let backup_path = backup_path(instance.id, &name);
+        let backend = self.backends.get(instance.backend).map_err(backend_error)?;
+        let runtime = backend
+            .runtime(&instance.backend_settings)
+            .map_err(backend_error)?;
+        let copy = copy_managed_tree_command(&instance.remote_path(), &backup_path, &runtime)
+            .map_err(validation_error)?;
         let command = format!(
-            "set -eu; test -d {current}; install -d {parent}; cp -a {current} {backup}",
+            "set -eu; test -d {current}; install -d {parent}; test ! -e {backup} && test ! -L {backup}; {copy}",
             current = shell_quote(&instance.remote_path()),
             parent = shell_quote(&format!("{APP_ROOT}/backups/{}", instance.id)),
             backup = shell_quote(&backup_path),
@@ -5259,8 +5267,10 @@ install -d {instances} {staging_root} {backups} {trash} {stage}
             return Err(error);
         }
         let current = state.instance.remote_path();
+        let copy =
+            copy_managed_tree_command(&current, &backup, &runtime).map_err(validation_error)?;
         let backup_command = format!(
-            "set -eu; if test -d {current}; then install -d {backup_parent}; cp -a {current} {backup}; fi",
+            "set -eu; if test -d {current}; then install -d {backup_parent}; test ! -e {backup} && test ! -L {backup}; {copy}; fi",
             current = shell_quote(&current),
             backup_parent = shell_quote(&format!("{APP_ROOT}/backups/{}", state.instance.id)),
             backup = shell_quote(&backup),
@@ -5636,14 +5646,23 @@ impl ApplicationService {
         cancellation: &CancellationToken,
     ) -> Result<InstanceHealth, AppError> {
         let current = state.instance.remote_path();
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
+        let runtime = backend
+            .runtime(&state.instance.backend_settings)
+            .map_err(backend_error)?;
         let failed = format!(
             "{APP_ROOT}/trash/{}-failed-{}",
             state.instance.id,
             Utc::now().format("%Y%m%dT%H%M%SZ")
         );
         let command = if let Some(backup) = backup {
+            let copy =
+                copy_managed_tree_command(backup, &current, &runtime).map_err(validation_error)?;
             format!(
-                "set -eu; test -d {backup}; if test -d {current}; then cd {current}; docker compose down || true; cd /; mv {current} {failed}; fi; cp -a {backup} {current}; cd {current}; docker compose up -d",
+                "set -eu; test -d {backup}; if test -d {current}; then cd {current}; docker compose down || true; cd /; mv {current} {failed}; fi; {copy}; cd {current}; docker compose up -d",
                 current = shell_quote(&current),
                 failed = shell_quote(&failed),
                 backup = shell_quote(backup),
@@ -6322,6 +6341,29 @@ fn prune_command(instance_id: Uuid, retention: usize) -> String {
     )
 }
 
+fn managed_container_path(path: &str) -> Option<String> {
+    let relative = path.strip_prefix(APP_ROOT)?.strip_prefix('/')?;
+    safe_relative_path(relative).then(|| format!("/vam/{relative}"))
+}
+
+fn copy_managed_tree_command(
+    source: &str,
+    destination: &str,
+    runtime: &BackendRuntimeSpec,
+) -> Result<String, &'static str> {
+    let source = managed_container_path(source)
+        .ok_or("The backup source is outside the managed application root.")?;
+    let destination = managed_container_path(destination)
+        .ok_or("The backup destination is outside the managed application root.")?;
+    Ok(format!(
+        "docker run --rm --user 0:0 --entrypoint cp -v {mount} {image} -a -- {source} {destination}",
+        mount = shell_quote(&format!("{APP_ROOT}:/vam")),
+        image = shell_quote(runtime_image_reference(runtime)),
+        source = shell_quote(&source),
+        destination = shell_quote(&destination),
+    ))
+}
+
 fn remote_health_command(
     state: &DesiredState,
     runtime: &BackendRuntimeSpec,
@@ -6379,18 +6421,19 @@ printf 'backend_status=strongSwan daemon and loaded connections\n'
 "#,
             );
         }
-        BackendHealthProbe::Xray => {
+        BackendHealthProbe::Xray { user } => {
             let BackendValidation::Xray { config_path } = runtime.validation else {
                 unreachable!("Xray health requires Xray validation metadata")
             };
             writeln!(
                 command,
                 r#"
-docker compose exec -T gateway xray run -test -c {config_path} >/dev/null 2>&1
+docker compose exec -T --user {user} gateway xray run -test -c {config_path} >/dev/null 2>&1
 printf 'backend=%s\n' "$?"
-client_count="$(docker compose exec -T gateway jq -r '.inbounds[0].settings.clients | length' {config_path} 2>/dev/null | tr -d ' ')"
+client_count="$(docker compose exec -T --user {user} gateway jq -r '.inbounds[0].settings.clients | length' {config_path} 2>/dev/null | tr -d ' ')"
 printf 'client_count=%s\n' "$client_count"
 printf 'backend_status=Xray active configuration self-test\n'"#,
+                user = shell_quote(user),
                 config_path = shell_quote(config_path),
             )
             .expect("writing to a String cannot fail");
@@ -8748,6 +8791,27 @@ mod tests {
     }
 
     #[test]
+    fn managed_tree_copies_use_the_pinned_backend_image_and_reject_external_paths() {
+        let runtime = XrayBackend
+            .runtime(
+                &command_state(VpnBackendKind::Xray)
+                    .instance
+                    .backend_settings,
+            )
+            .unwrap();
+        let source = format!("{APP_ROOT}/instances/source");
+        let destination = format!("{APP_ROOT}/backups/target");
+        let command = copy_managed_tree_command(&source, &destination, &runtime).unwrap();
+
+        assert!(command.contains("docker run --rm --user 0:0 --entrypoint cp"));
+        assert!(command.contains(&shell_quote(&format!("{APP_ROOT}:/vam"))));
+        assert!(command.contains(&shell_quote(runtime_image_reference(&runtime))));
+        assert!(command.contains("-a -- '/vam/instances/source' '/vam/backups/target'"));
+        assert!(copy_managed_tree_command("/tmp/source", &destination, &runtime).is_err());
+        assert!(copy_managed_tree_command(&source, "/tmp/target", &runtime).is_err());
+    }
+
+    #[test]
     fn firewall_commands_manage_active_ufw_and_firewalld_idempotently() {
         let listeners = [
             ListenerPort {
@@ -8797,6 +8861,7 @@ mod tests {
         assert!(!images.contains(COREDNS_IMAGE));
         let health = remote_health_command(&xray, &xray_runtime, false);
         assert!(health.contains("xray run -test"));
+        assert_eq!(health.matches("exec -T --user '10001:10001'").count(), 2);
         assert!(health.contains("--protocol tcp gateway 8443"));
         assert!(!health.contains("nslookup"));
         let ownership =
@@ -10018,8 +10083,14 @@ mod tests {
             .iter()
             .find(|command| command.contains("reviewed-snapshot"))
             .expect("rollback copy command");
-        assert!(restore.contains(&format!("cp -a '{backup}'")));
-        assert!(restore.contains(&format!("'{APP_ROOT}/instances/{}'", state.instance.id)));
+        assert!(restore.contains("docker run --rm --user 0:0 --entrypoint cp"));
+        assert!(restore.contains(&shell_quote(&format!("{APP_ROOT}:/vam"))));
+        assert!(restore.contains("-a --"));
+        assert!(restore.contains(&format!(
+            "'/vam/backups/{}/reviewed-snapshot'",
+            state.instance.id
+        )));
+        assert!(restore.contains(&format!("'/vam/instances/{}'", state.instance.id)));
         assert!(restore.contains("docker compose up -d"));
         assert!(
             commands

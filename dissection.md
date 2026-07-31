@@ -5707,3 +5707,121 @@ signature).
 
 Planned signed commit:
 `fix: make IKEv2 deployment validation restart-safe`.
+
+### 12Q. Xray protected bootstrap, public identity, and UID-safe backups (2026-07-31)
+
+The first live Xray deployment built its pinned, digest-verified multi-architecture
+image but restart-looped immediately. Replaying the exact failed tree without a
+published port produced `xray startup: server template is unavailable`.
+`server-template.json` is intentionally `0600` because it contains client VLESS
+UUIDs once clients exist. The SSH user owns it so staged replacements remain
+transactional, while the container was configured to start directly as UID
+10001 and could not read that host-owned bind mount. Making it globally readable
+would have exposed client authentication material.
+
+The image now performs a narrowly scoped root bootstrap and immediately drops
+privilege:
+
+1. the root entrypoint verifies it is in the bootstrap phase;
+2. it copies the protected host template into the UID-10001-owned state volume
+   as mode `0600`;
+3. pinned Alpine `su-exec=0.3-r0` directly execs the same entrypoint as
+   `xray:xray`, leaving no root supervisor; and
+4. the unprivileged phase verifies UID 10001, generates or validates REALITY
+   identity, materializes the active config, self-tests it, and directly execs
+   Xray.
+
+The source template remains `0600` owned by the SSH user. Live `docker top`
+confirmed the only long-running gateway process is `xray run` as numeric user
+10001. Backend health metadata now also requires both the Xray self-test and
+client-count query to execute explicitly as `10001:10001`; `docker compose exec`
+can no longer default those routine checks to the image's root bootstrap user.
+
+After that fix the server became healthy, but public-identity discovery failed.
+The REALITY private key, public key, and short ID were all inside a `0700`
+identity directory. The application must read the public key and short ID to
+construct client exports and bind future deployments to the approved server
+identity, but it must never read or expose the private key. The identity
+directory is now `0711` (traversable by a caller that knows an exact filename,
+not listable), the private key remains `0600`, and only the distributable public
+key and short ID are `0644`. The unprivileged owner reapplies those modes after
+validating existing identity, making restarts and earlier state idempotent.
+
+The first post-client plan then found that the empty `xray-state/.keep`
+placeholder was mode `0600` after numeric ownership normalization. Host-side
+manifest hashing could not read it and its `set -e` output ended early. The
+placeholder contains no data and is not sensitive, so it is now rendered
+`0644`; the active config, protected template, client UUIDs, and private identity
+remain restricted. This one live fixture was created immediately before the
+mode correction, so only its empty `.keep` was aligned to `0644` through a
+root container before normal planning resumed.
+
+The same plan initially displayed a destructive reinstall warning because the
+last successful deployment snapshot preceded post-health REALITY public-material
+discovery. Xray settings classification now treats only the first complete
+`None -> verified public key and short ID` transition as discovery metadata.
+Changing or clearing an already recorded identity remains reinstall-class, as do
+security-mode and TLS-secret changes. The corrected client plan contained no
+false destructive warning.
+
+Finally, the pre-deploy backup failed before remote mutation because host-side
+`cp -a` could not traverse the UID-10001 private state. All full instance-tree
+copies—deployment safety backups, manual backups, credential-change backups, and
+restores—now use the selected pinned backend image as root with only
+`/opt/vpn-appliance-manager` mounted at `/vam`. Both source and destination must
+resolve beneath that managed root; external paths are rejected before command
+generation. Archive copy preserves numeric ownership without widening private
+file modes. This uses the already-authorized Docker boundary and does not grant
+the SSH user read access to Xray private state.
+
+Deployment `9b9ff575-8e05-480b-af4c-e14f806bac0a` was the first successful
+Xray server activation and persisted the verified public identity. Deployment
+`d9679999-20d4-4a89-b9fb-a92060984aea` successfully backed up the numeric state,
+restarted with the real client UUID, and passed health. A separate manual backup,
+`2026-07-31T19-03-25Z-manual-d9679999-20d4-4a89-b9fb-a92060984aea`, also passed
+through the containerized copy path. The client exported as a 260-byte VLESS
+URI file; contents and UUID were not printed.
+
+Final Xray health correctly reports Compose, gateway, active-config self-test,
+TCP listener, and exact client count as healthy. Managed DNS, DNS containers,
+and DNS resolution are deliberately not required or fabricated for this proxy
+backend. The client has no invented IPv4/IPv6 address or DNS name.
+
+Files changed:
+
+- `crates/backend-xray/src/lib.rs`: protected template bootstrap, immediate
+  privilege drop, sensitivity-specific REALITY permissions, readable empty
+  state placeholder, initial-discovery classification, and regression tests;
+- `crates/backend/src/lib.rs`: typed health-command user metadata;
+- `crates/application/src/lib.rs`: least-privilege Xray health execution,
+  managed-root containerized tree copy for backup/restore paths, external-path
+  rejection, and command-contract/rollback tests.
+
+Validation:
+
+- reproduced the original `server template is unavailable` failure against the
+  exact failed tree without publishing a port;
+- verified pinned Alpine package metadata before adding `su-exec=0.3-r0`; no
+  host package was installed;
+- focused Xray/application/deployment tests passed throughout diagnosis;
+- final affected suites passed: 42/42 application tests, 11/11 Xray tests, and
+  the backend contract tests;
+- strict Clippy for the backend, Xray, and application crates with all targets
+  and `-D warnings` passed;
+- Rust formatting, one-job developer harness builds, and `git diff --check`
+  passed;
+- live server deployment, public-identity persistence, VLESS client creation,
+  warning-free reviewed plan, UID-safe pre-deploy backup, client deployment,
+  manual backup, export, runtime UID check, permission-mode check, and explicit
+  UID-10001 health all passed.
+
+Both failed server attempts rolled back successfully. The later backup failure
+occurred before remote mutation. No unrelated remote state was modified, and no
+secret, UUID, private key, active configuration, or VLESS URI content was logged.
+
+Previous signed commit:
+`5de3ab2 fix: make IKEv2 deployment validation restart-safe` (good EDDSA
+signature).
+
+Planned signed commit:
+`fix: secure Xray deployment state lifecycle`.

@@ -37,6 +37,7 @@ ARG TARGETARCH
 RUN apk add --no-cache \
         ca-certificates=20260611-r0 \
         jq=1.8.1-r0 \
+        su-exec=0.3-r0 \
     && apk add --no-cache --virtual .xray-fetch \
         curl=8.20.0-r0 \
         unzip=6.0-r16 \
@@ -62,7 +63,7 @@ RUN apk add --no-cache \
     && install -d -o xray -g xray -m 0700 /var/lib/vam-xray
 COPY start-xray.sh /usr/local/sbin/start-xray
 RUN chmod 0755 /usr/local/sbin/start-xray
-USER 10001:10001
+USER 0:0
 ENTRYPOINT ["/usr/local/sbin/start-xray"]
 "#;
 
@@ -70,8 +71,9 @@ const XRAY_START_SCRIPT: &str = r#"#!/bin/sh
 set -eu
 umask 077
 
-readonly config_template=/etc/xray/server-template.json
+readonly source_config_template=/etc/xray/server-template.json
 readonly state_dir=/var/lib/vam-xray
+readonly runtime_config_template="${state_dir}/server-template.json"
 readonly identity_dir="${state_dir}/identity"
 readonly active_config="${state_dir}/server.json"
 temp_identity=
@@ -89,6 +91,19 @@ fail() {
     echo "xray startup: $1" >&2
     exit 1
 }
+
+if [ "${1:-}" = "--unprivileged" ]; then
+    [ "$(id -u)" -eq 10001 ] || fail "unprivileged phase has an unexpected user"
+else
+    [ "$(id -u)" -eq 0 ] || fail "bootstrap phase requires the container root user"
+    [ -r "${source_config_template}" ] || fail "server template is unavailable"
+    install -o xray -g xray -m 0600 \
+        "${source_config_template}" "${runtime_config_template}" \
+        || fail "cannot stage the protected server template"
+    exec su-exec xray:xray "$0" --unprivileged
+fi
+
+readonly config_template="${runtime_config_template}"
 
 valid_x25519() {
     [ "${#1}" -eq 43 ] || return 1
@@ -135,11 +150,12 @@ if [ "${security}" = "reality" ]; then
         printf '%s\n' "${private_key}" > "${temp_identity}/private.key"
         printf '%s\n' "${public_key}" > "${temp_identity}/public.key"
         printf '%s\n' "${short_id}" > "${temp_identity}/short-id"
-        chmod 0600 \
-            "${temp_identity}/private.key" \
+        chmod 0600 "${temp_identity}/private.key"
+        chmod 0644 \
             "${temp_identity}/public.key" \
             "${temp_identity}/short-id"
         rm -f "${key_output}"
+        chmod 0711 "${temp_identity}"
         mv "${temp_identity}" "${identity_dir}" \
             || fail "cannot atomically install REALITY identity"
         temp_identity=
@@ -155,6 +171,9 @@ if [ "${security}" = "reality" ]; then
     valid_x25519 "${private_key}" || fail "stored REALITY private key is invalid"
     valid_x25519 "${public_key}" || fail "stored REALITY public key is invalid"
     valid_short_id "${short_id}" || fail "stored REALITY short ID is invalid"
+    chmod 0711 "${identity_dir}"
+    chmod 0600 "${identity_dir}/private.key"
+    chmod 0644 "${identity_dir}/public.key" "${identity_dir}/short-id"
 
     jq --rawfile private_key "${identity_dir}/private.key" \
        --rawfile short_id "${identity_dir}/short-id" '
@@ -303,7 +322,9 @@ impl VpnBackend for XrayBackend {
             validation: BackendValidation::Xray {
                 config_path: "/var/lib/vam-xray/server.json",
             },
-            health: BackendHealthProbe::Xray,
+            health: BackendHealthProbe::Xray {
+                user: "10001:10001",
+            },
         })
     }
 
@@ -421,7 +442,7 @@ impl VpnBackend for XrayBackend {
             RenderedFile {
                 path: "xray-state/.keep".into(),
                 contents: String::new(),
-                mode: 0o600,
+                mode: 0o644,
                 sensitive: false,
             },
         ];
@@ -497,15 +518,29 @@ impl VpnBackend for XrayBackend {
         else {
             return ChangeImpact::Reinstall;
         };
+        let reality_identity_changed = previous.reality_public_key != next.reality_public_key
+            || previous.reality_short_id != next.reality_short_id;
+        let initial_reality_discovery = previous.reality_public_key.is_none()
+            && previous.reality_short_id.is_none()
+            && next.reality_public_key.is_some()
+            && next.reality_short_id.is_some();
         if previous.security != next.security
-            || previous.reality_public_key != next.reality_public_key
-            || previous.reality_short_id != next.reality_short_id
+            || reality_identity_changed && !initial_reality_discovery
             || previous.tls_certificate_ref != next.tls_certificate_ref
             || previous.tls_private_key_ref != next.tls_private_key_ref
         {
             return ChangeImpact::Reinstall;
         }
-        if previous == next || only_fingerprint_changed(previous, next) {
+        let mut comparable_next = next.clone();
+        if initial_reality_discovery {
+            comparable_next
+                .reality_public_key
+                .clone_from(&previous.reality_public_key);
+            comparable_next
+                .reality_short_id
+                .clone_from(&previous.reality_short_id);
+        }
+        if previous == &comparable_next || only_fingerprint_changed(previous, &comparable_next) {
             ChangeImpact::LiveUpdate
         } else {
             ChangeImpact::ServiceRestart
@@ -1270,13 +1305,31 @@ mod tests {
         assert!(runtime.devices.is_empty());
         assert!(runtime.sysctls.is_empty());
         assert_eq!(
+            runtime.health,
+            BackendHealthProbe::Xray {
+                user: "10001:10001"
+            }
+        );
+        assert_eq!(
             runtime.container_listeners,
             vec![ListenerPort {
                 port: XRAY_CONTAINER_PORT,
                 protocol: TransportProtocol::Tcp
             }]
         );
-        assert!(XRAY_DOCKERFILE.contains("USER 10001:10001"));
+        assert!(XRAY_DOCKERFILE.contains("su-exec=0.3-r0"));
+        assert!(XRAY_DOCKERFILE.contains("USER 0:0"));
+        assert!(!XRAY_DOCKERFILE.contains("USER 10001:10001"));
+        assert!(XRAY_START_SCRIPT.contains("exec su-exec xray:xray"));
+        assert!(XRAY_START_SCRIPT.contains("unprivileged phase has an unexpected user"));
+        assert!(XRAY_START_SCRIPT.contains("install -o xray -g xray -m 0600"));
+        assert!(XRAY_START_SCRIPT.contains("chmod 0711 \"${identity_dir}\""));
+        assert!(XRAY_START_SCRIPT.contains("chmod 0600 \"${identity_dir}/private.key\""));
+        assert!(
+            XRAY_START_SCRIPT
+                .contains("chmod 0644 \"${identity_dir}/public.key\" \"${identity_dir}/short-id\"")
+        );
+        assert!(!XRAY_START_SCRIPT.contains("chmod 0644 \"${identity_dir}/private.key\""));
         assert!(XRAY_DOCKERFILE.contains("sha256sum -c -"));
         assert!(XRAY_DOCKERFILE.contains("f3f69cdccdf3443f25248f65bec0f621"));
         assert!(XRAY_DOCKERFILE.contains("7bcc35d375398c0df4b53ee004fb5b4"));
@@ -1338,6 +1391,12 @@ mod tests {
         assert!(!XRAY_START_SCRIPT.contains("sed "));
         assert!(!XRAY_START_SCRIPT.contains("tail -f"));
         assert!(!XRAY_START_SCRIPT.contains("iptables"));
+        let state_placeholder = files
+            .iter()
+            .find(|file| file.path == "xray-state/.keep")
+            .unwrap();
+        assert_eq!(state_placeholder.mode, 0o644);
+        assert!(!state_placeholder.sensitive);
     }
 
     #[test]
@@ -1539,8 +1598,17 @@ mod tests {
         identity.reality_public_key = Some("A".repeat(REALITY_PUBLIC_KEY_LENGTH));
         assert_eq!(
             XrayBackend.classify_settings_change(
-                &BackendSettings::Xray(original),
-                &BackendSettings::Xray(identity)
+                &BackendSettings::Xray(original.clone()),
+                &BackendSettings::Xray(identity.clone())
+            ),
+            ChangeImpact::LiveUpdate
+        );
+        let mut replacement = identity.clone();
+        replacement.reality_public_key = Some("B".repeat(REALITY_PUBLIC_KEY_LENGTH));
+        assert_eq!(
+            XrayBackend.classify_settings_change(
+                &BackendSettings::Xray(identity),
+                &BackendSettings::Xray(replacement)
             ),
             ChangeImpact::Reinstall
         );
