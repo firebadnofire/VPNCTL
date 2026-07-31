@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use ipnet::Ipv4Net;
 use qrcode::{QrCode, render::svg};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 #[cfg(not(test))]
 use tokio::time::timeout;
 use tokio::{sync::Mutex, time::sleep};
@@ -49,7 +50,8 @@ use vam_dns::{next_soa_serial, validate_records};
 use vam_protocol::{
     AppError, BackupInfo, ClientArtifact, DeploymentOperation, DeploymentPlan, DeploymentProgress,
     DeploymentResult, DeploymentStatus, DeploymentSummary, HostInspection, HostKeyInfo,
-    HostKeyProbe, HostKeyState, InstanceHealth, RenderedFile, redact,
+    HostKeyProbe, HostKeyState, HostProvisioningOperation, HostProvisioningPlan, InstanceHealth,
+    PackageManager, RenderedFile, redact,
 };
 use vam_secrets::{SecretStore, SecretStoreError};
 #[cfg(test)]
@@ -804,12 +806,39 @@ impl ApplicationService {
         let command = r#"set +e
 printf 'operating_system='; uname -s
 printf 'architecture='; uname -m
+if command -v apt-get >/dev/null 2>&1; then
+  printf 'package_manager=apt\n'
+elif command -v dnf >/dev/null 2>&1; then
+  printf 'package_manager=dnf\n'
+elif command -v yum >/dev/null 2>&1; then
+  printf 'package_manager=yum\n'
+elif command -v zypper >/dev/null 2>&1; then
+  printf 'package_manager=zypper\n'
+elif command -v pacman >/dev/null 2>&1; then
+  printf 'package_manager=pacman\n'
+else
+  printf 'package_manager=\n'
+fi
+test "$(id -u)" -eq 0
+printf 'effective_user_is_root=%s\n' "$?"
+id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker
+printf 'docker_group_member=%s\n' "$?"
 if command -v docker >/dev/null 2>&1; then
+  printf 'docker_installed=0\n'
   printf 'docker_version='; docker version --format '{{.Server.Version}}' 2>/dev/null
   docker info >/dev/null 2>&1; printf 'docker_accessible=%s\n' "$?"
   printf 'compose_version='; docker compose version --short 2>/dev/null
 else
-  printf 'docker_version=\ncompose_version=\ndocker_accessible=127\n'
+  printf 'docker_installed=127\ndocker_version=\ncompose_version=\ndocker_accessible=127\n'
+fi
+if test "$(id -u)" -eq 0; then
+  docker info >/dev/null 2>&1
+  printf 'docker_privileged_accessible=%s\n' "$?"
+elif sudo -n true >/dev/null 2>&1; then
+  sudo -n docker info >/dev/null 2>&1
+  printf 'docker_privileged_accessible=%s\n' "$?"
+else
+  printf 'docker_privileged_accessible=127\n'
 fi
 test -e /sys/module/wireguard || command -v wg >/dev/null 2>&1
 printf 'wireguard=%s\n' "$?"
@@ -852,22 +881,42 @@ fi
         let values = parse_key_values(&result.stdout_text().map_err(ssh_error)?);
         let docker_version = nonempty(values.get("docker_version"));
         let compose_version = nonempty(values.get("compose_version"));
+        let docker_installed = values
+            .get("docker_installed")
+            .is_some_and(|value| value == "0");
         let docker_accessible = values
             .get("docker_accessible")
             .is_some_and(|value| value == "0");
+        let package_manager = match values.get("package_manager").map(String::as_str) {
+            Some("apt") => Some(PackageManager::Apt),
+            Some("dnf") => Some(PackageManager::Dnf),
+            Some("yum") => Some(PackageManager::Yum),
+            Some("zypper") => Some(PackageManager::Zypper),
+            Some("pacman") => Some(PackageManager::Pacman),
+            _ => None,
+        };
         let operating_system = values.get("operating_system").cloned().unwrap_or_default();
         let mut warnings = Vec::new();
         if operating_system != "Linux" {
             warnings.push("The target is not Linux.".into());
         }
-        if docker_version.is_none() {
+        if !docker_installed {
             warnings.push("Docker Engine was not detected.".into());
+        } else if docker_version.is_none() {
+            warnings
+                .push("Docker Engine is installed, but its server version is unavailable.".into());
         }
         if compose_version.is_none() {
             warnings.push("The Docker Compose plugin was not detected.".into());
         }
         if !docker_accessible {
             warnings.push("The SSH user cannot access Docker directly.".into());
+        }
+        if operating_system == "Linux" && package_manager.is_none() {
+            warnings.push(
+                "No supported package manager (apt, dnf, yum, zypper, or pacman) was detected."
+                    .into(),
+            );
         }
         let sudo_available = values
             .get("sudo_bootstrap")
@@ -891,9 +940,20 @@ fi
         Ok(HostInspection {
             operating_system,
             architecture: values.get("architecture").cloned().unwrap_or_default(),
+            package_manager,
+            effective_user_is_root: values
+                .get("effective_user_is_root")
+                .is_some_and(|value| value == "0"),
+            docker_installed,
             docker_version,
             compose_version,
             docker_accessible,
+            docker_privileged_accessible: values
+                .get("docker_privileged_accessible")
+                .is_some_and(|value| value == "0"),
+            docker_group_member: values
+                .get("docker_group_member")
+                .is_some_and(|value| value == "0"),
             wireguard_kernel_available: values.get("wireguard").is_some_and(|value| value == "0"),
             application_root_writable: values
                 .get("root_writable")
@@ -901,6 +961,77 @@ fi
             sudo_bootstrap_available: sudo_available,
             warnings,
         })
+    }
+
+    pub async fn plan_host_provisioning(
+        &self,
+        host_id: Uuid,
+    ) -> Result<HostProvisioningPlan, AppError> {
+        let inspection = self.inspect_host(host_id).await?;
+        build_host_provisioning_plan(host_id, &inspection)
+            .map_err(|error| host_provisioning_error(host_id, error))
+    }
+
+    pub async fn apply_host_provisioning(
+        &self,
+        host_id: Uuid,
+        expected_state_hash: &str,
+    ) -> Result<HostInspection, AppError> {
+        let plan = self.plan_host_provisioning(host_id).await?;
+        if plan.expected_state_hash != expected_state_hash {
+            return Err(AppError {
+                code: "host_provisioning_plan_stale".into(),
+                message: "The host prerequisite state changed after the setup preview.".into(),
+                scope: Some(host_id.to_string()),
+                remote_state_changed: false,
+                rollback_succeeded: None,
+                remediation: Some("Inspect the host and review a new setup plan.".into()),
+                technical_detail: None,
+            });
+        }
+        if plan.operations.is_empty() {
+            return self.inspect_host(host_id).await;
+        }
+
+        let command = host_provisioning_script(plan.package_manager, &plan.operations)
+            .map_err(|error| host_provisioning_error(host_id, error))?;
+        let (host, trusted, passphrase) = self.trusted_host(host_id).await?;
+        if let Err(mut error) = self
+            .checked_execute(
+                &host,
+                &trusted,
+                passphrase.as_ref(),
+                &command,
+                &CancellationToken::new(),
+            )
+            .await
+        {
+            error.scope = Some(host_id.to_string());
+            error.remote_state_changed = true;
+            error.remediation = Some(
+                "Inspect the remote package-manager and Docker service logs, then create a new setup preview."
+                    .into(),
+            );
+            return Err(error);
+        }
+
+        let inspection = self.inspect_host(host_id).await?;
+        if !host_deployment_prerequisites_ready(&inspection) {
+            return Err(AppError {
+                code: "host_provisioning_verification_failed".into(),
+                message: "Host setup completed, but a fresh SSH check still failed prerequisites."
+                    .into(),
+                scope: Some(host_id.to_string()),
+                remote_state_changed: true,
+                rollback_succeeded: None,
+                remediation: Some(
+                    "Reconnect manually and verify Docker group membership, the Docker service, and Docker Compose v2."
+                        .into(),
+                ),
+                technical_detail: Some(inspection.warnings.join("; ")),
+            });
+        }
+        Ok(inspection)
     }
 
     pub async fn create_instance(
@@ -3515,15 +3646,7 @@ impl DeploymentExecutor for ApplicationService {
         )
         .await?;
         let inspection = self.inspect_host(state.instance.host_id).await?;
-        if inspection.operating_system != "Linux"
-            || !inspection.docker_accessible
-            || inspection.compose_version.is_none()
-            || inspection
-                .compose_version
-                .as_deref()
-                .and_then(version_major)
-                .is_none_or(|major| major < 2)
-        {
+        if !host_deployment_prerequisites_ready(&inspection) {
             let error = AppError {
                 code: "host_prerequisites_failed".into(),
                 message: "The host does not meet deployment prerequisites.".into(),
@@ -3531,7 +3654,8 @@ impl DeploymentExecutor for ApplicationService {
                 remote_state_changed: false,
                 rollback_succeeded: None,
                 remediation: Some(
-                    "Provide Linux, direct Docker access, and the Docker Compose plugin.".into(),
+                    "Review and apply the separate host setup plan, or provide Linux, direct Docker access, and Docker Compose v2 manually."
+                        .into(),
                 ),
                 technical_detail: Some(inspection.warnings.join("; ")),
             };
@@ -5372,6 +5496,309 @@ fn nonempty(value: Option<&String>) -> Option<String> {
     value.filter(|value| !value.is_empty()).cloned()
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum HostProvisioningError {
+    UnsupportedOperatingSystem(String),
+    AuthorityRequired,
+    PackageManagerUnsupported,
+    Serialization(String),
+}
+
+fn host_provisioning_error(host_id: Uuid, error: HostProvisioningError) -> AppError {
+    match error {
+        HostProvisioningError::UnsupportedOperatingSystem(operating_system) => AppError {
+            code: "host_provisioning_unsupported_os".into(),
+            message: "Automatic host setup supports Linux targets only.".into(),
+            scope: Some(host_id.to_string()),
+            remote_state_changed: false,
+            rollback_succeeded: None,
+            remediation: Some("Prepare Docker Engine and Docker Compose v2 manually.".into()),
+            technical_detail: Some(format!("Detected operating system: {operating_system}")),
+        },
+        HostProvisioningError::AuthorityRequired => AppError {
+            code: "host_provisioning_authority_required".into(),
+            message: "Host setup requires root or noninteractive sudo.".into(),
+            scope: Some(host_id.to_string()),
+            remote_state_changed: false,
+            rollback_succeeded: None,
+            remediation: Some(
+                "Connect as root, configure narrowly scoped passwordless sudo, or install Docker and Compose manually."
+                    .into(),
+            ),
+            technical_detail: None,
+        },
+        HostProvisioningError::PackageManagerUnsupported => AppError {
+            code: "host_provisioning_package_manager_unsupported".into(),
+            message: "No supported Linux package manager was detected.".into(),
+            scope: Some(host_id.to_string()),
+            remote_state_changed: false,
+            rollback_succeeded: None,
+            remediation: Some(
+                "Install Docker Engine and Docker Compose v2 manually, then inspect the host again."
+                    .into(),
+            ),
+            technical_detail: Some("Supported managers: apt, dnf, yum, zypper, pacman.".into()),
+        },
+        HostProvisioningError::Serialization(detail) => AppError {
+            code: "serialization".into(),
+            message: "The host setup plan could not be encoded.".into(),
+            scope: Some(host_id.to_string()),
+            remote_state_changed: false,
+            rollback_succeeded: None,
+            remediation: Some("Inspect the host and create a new setup plan.".into()),
+            technical_detail: Some(detail),
+        },
+    }
+}
+
+fn build_host_provisioning_plan(
+    host_id: Uuid,
+    inspection: &HostInspection,
+) -> Result<HostProvisioningPlan, HostProvisioningError> {
+    if inspection.operating_system != "Linux" {
+        return Err(HostProvisioningError::UnsupportedOperatingSystem(
+            inspection.operating_system.clone(),
+        ));
+    }
+
+    let compose_ready = inspection
+        .compose_version
+        .as_deref()
+        .and_then(version_major)
+        .is_some_and(|major| major >= 2);
+    if inspection.docker_accessible && compose_ready {
+        return host_provisioning_plan(host_id, inspection, Vec::new(), Vec::new());
+    }
+
+    if !inspection.effective_user_is_root && !inspection.sudo_bootstrap_available {
+        return Err(HostProvisioningError::AuthorityRequired);
+    }
+
+    let package_changes_required = !inspection.docker_installed || !compose_ready;
+    if package_changes_required && inspection.package_manager.is_none() {
+        return Err(HostProvisioningError::PackageManagerUnsupported);
+    }
+
+    let mut operations = Vec::new();
+    if !inspection.docker_installed {
+        operations.push(HostProvisioningOperation::InstallDockerEngine);
+    }
+    if !compose_ready {
+        operations.push(HostProvisioningOperation::InstallComposePlugin);
+    }
+    if !inspection.docker_privileged_accessible {
+        operations.push(HostProvisioningOperation::EnableDockerService);
+    }
+    if !inspection.effective_user_is_root
+        && !inspection.docker_accessible
+        && !inspection.docker_group_member
+    {
+        operations.push(HostProvisioningOperation::GrantDockerAccess);
+    }
+    operations.push(HostProvisioningOperation::VerifyPrerequisites);
+
+    let mut warnings = Vec::new();
+    if package_changes_required {
+        warnings.push(
+            "Setup installs only distribution-provided packages; package versions are controlled by the host repositories."
+                .into(),
+        );
+    }
+    if operations.contains(&HostProvisioningOperation::GrantDockerAccess) {
+        warnings.push(
+            "Adding the SSH user to the Docker group grants root-equivalent control of this host."
+                .into(),
+        );
+    }
+    host_provisioning_plan(host_id, inspection, operations, warnings)
+}
+
+fn host_provisioning_plan(
+    host_id: Uuid,
+    inspection: &HostInspection,
+    operations: Vec<HostProvisioningOperation>,
+    warnings: Vec<String>,
+) -> Result<HostProvisioningPlan, HostProvisioningError> {
+    let encoded = serde_json::to_vec(&(host_id, inspection, &operations))
+        .map_err(|error| HostProvisioningError::Serialization(error.to_string()))?;
+    let expected_state_hash = format!("{:x}", Sha256::digest(encoded));
+    Ok(HostProvisioningPlan {
+        host_id,
+        package_manager: inspection.package_manager,
+        operations,
+        warnings,
+        expected_state_hash,
+    })
+}
+
+fn host_deployment_prerequisites_ready(inspection: &HostInspection) -> bool {
+    inspection.operating_system == "Linux"
+        && inspection.docker_installed
+        && inspection.docker_accessible
+        && inspection
+            .compose_version
+            .as_deref()
+            .and_then(version_major)
+            .is_some_and(|major| major >= 2)
+}
+
+fn host_provisioning_script(
+    package_manager: Option<PackageManager>,
+    operations: &[HostProvisioningOperation],
+) -> Result<String, HostProvisioningError> {
+    let install_docker = operations.contains(&HostProvisioningOperation::InstallDockerEngine);
+    let install_compose = operations.contains(&HostProvisioningOperation::InstallComposePlugin);
+    let enable_docker = operations.contains(&HostProvisioningOperation::EnableDockerService);
+    let grant_docker = operations.contains(&HostProvisioningOperation::GrantDockerAccess);
+    if (install_docker || install_compose) && package_manager.is_none() {
+        return Err(HostProvisioningError::PackageManagerUnsupported);
+    }
+
+    let mut script = format!(
+        "set -eu\nINSTALL_DOCKER={}\nINSTALL_COMPOSE={}\nENABLE_DOCKER={}\nGRANT_DOCKER={}\n",
+        u8::from(install_docker),
+        u8::from(install_compose),
+        u8::from(enable_docker),
+        u8::from(grant_docker),
+    );
+    script.push_str(
+        r#"if test "$(id -u)" -eq 0; then
+  SUDO=
+else
+  command -v sudo >/dev/null 2>&1
+  sudo -n true
+  SUDO='sudo -n'
+fi
+"#,
+    );
+
+    let package_commands = match package_manager {
+        Some(PackageManager::Apt) => {
+            r#"if test "$INSTALL_DOCKER" = 1 || test "$INSTALL_COMPOSE" = 1; then
+  export DEBIAN_FRONTEND=noninteractive
+  $SUDO apt-get -q update
+fi
+if test "$INSTALL_DOCKER" = 1 && ! command -v docker >/dev/null 2>&1; then
+  $SUDO apt-get -yq install --install-recommends docker.io ca-certificates iproute2
+fi
+if test "$INSTALL_COMPOSE" = 1 && ! docker compose version --short 2>/dev/null | grep -Eq '^v?([2-9]|[1-9][0-9]+)\.'; then
+  if apt-cache show docker-compose-v2 >/dev/null 2>&1; then
+    $SUDO apt-get -yq install docker-compose-v2
+  elif apt-cache show docker-compose-plugin >/dev/null 2>&1; then
+    $SUDO apt-get -yq install docker-compose-plugin
+  else
+    printf 'No distribution-provided Docker Compose v2 package was found.\n' >&2
+    exit 46
+  fi
+fi
+"#
+        }
+        Some(PackageManager::Dnf) => {
+            r#"if test "$INSTALL_DOCKER" = 1 || test "$INSTALL_COMPOSE" = 1; then
+  $SUDO dnf -y makecache
+fi
+if test "$INSTALL_DOCKER" = 1 && ! command -v docker >/dev/null 2>&1; then
+  if dnf -q list --available docker >/dev/null 2>&1 || rpm -q docker >/dev/null 2>&1; then
+    docker_package=docker
+  elif dnf -q list --available moby-engine >/dev/null 2>&1 || rpm -q moby-engine >/dev/null 2>&1; then
+    docker_package=moby-engine
+  else
+    printf 'No distribution-provided Docker Engine package was found.\n' >&2
+    exit 45
+  fi
+  $SUDO dnf -y install "$docker_package" ca-certificates iproute
+fi
+if test "$INSTALL_COMPOSE" = 1 && ! docker compose version --short 2>/dev/null | grep -Eq '^v?([2-9]|[1-9][0-9]+)\.'; then
+  if dnf -q list --available docker-compose-plugin >/dev/null 2>&1 || rpm -q docker-compose-plugin >/dev/null 2>&1; then
+    compose_package=docker-compose-plugin
+  elif dnf -q list --available docker-compose >/dev/null 2>&1 || rpm -q docker-compose >/dev/null 2>&1; then
+    compose_package=docker-compose
+  else
+    printf 'No distribution-provided Docker Compose v2 package was found.\n' >&2
+    exit 46
+  fi
+  $SUDO dnf -y install "$compose_package"
+fi
+"#
+        }
+        Some(PackageManager::Yum) => {
+            r#"if test "$INSTALL_DOCKER" = 1 || test "$INSTALL_COMPOSE" = 1; then
+  $SUDO yum -y makecache
+fi
+if test "$INSTALL_DOCKER" = 1 && ! command -v docker >/dev/null 2>&1; then
+  if yum -q list available docker >/dev/null 2>&1 || rpm -q docker >/dev/null 2>&1; then
+    docker_package=docker
+  elif yum -q list available moby-engine >/dev/null 2>&1 || rpm -q moby-engine >/dev/null 2>&1; then
+    docker_package=moby-engine
+  else
+    printf 'No distribution-provided Docker Engine package was found.\n' >&2
+    exit 45
+  fi
+  $SUDO yum -y -q install "$docker_package" ca-certificates iproute
+fi
+if test "$INSTALL_COMPOSE" = 1 && ! docker compose version --short 2>/dev/null | grep -Eq '^v?([2-9]|[1-9][0-9]+)\.'; then
+  if yum -q list available docker-compose-plugin >/dev/null 2>&1 || rpm -q docker-compose-plugin >/dev/null 2>&1; then
+    compose_package=docker-compose-plugin
+  elif yum -q list available docker-compose >/dev/null 2>&1 || rpm -q docker-compose >/dev/null 2>&1; then
+    compose_package=docker-compose
+  else
+    printf 'No distribution-provided Docker Compose v2 package was found.\n' >&2
+    exit 46
+  fi
+  $SUDO yum -y -q install "$compose_package"
+fi
+"#
+        }
+        Some(PackageManager::Zypper) => {
+            r#"if test "$INSTALL_DOCKER" = 1 || test "$INSTALL_COMPOSE" = 1; then
+  $SUDO zypper -nq refresh
+fi
+if test "$INSTALL_DOCKER" = 1 && ! command -v docker >/dev/null 2>&1; then
+  $SUDO zypper -nq install docker ca-certificates iproute2
+fi
+if test "$INSTALL_COMPOSE" = 1 && ! docker compose version --short 2>/dev/null | grep -Eq '^v?([2-9]|[1-9][0-9]+)\.'; then
+  if ! $SUDO zypper -nq install docker-compose; then
+    $SUDO zypper -nq install docker-compose-plugin
+  fi
+fi
+"#
+        }
+        Some(PackageManager::Pacman) => {
+            r#"if test "$INSTALL_DOCKER" = 1 && ! command -v docker >/dev/null 2>&1; then
+  $SUDO pacman -Sy --needed --noconfirm docker ca-certificates iproute2
+elif test "$INSTALL_COMPOSE" = 1; then
+  $SUDO pacman -Sy
+fi
+if test "$INSTALL_COMPOSE" = 1 && ! docker compose version --short 2>/dev/null | grep -Eq '^v?([2-9]|[1-9][0-9]+)\.'; then
+  $SUDO pacman -S --needed --noconfirm docker-compose
+fi
+"#
+        }
+        None => "",
+    };
+    script.push_str(package_commands);
+    script.push_str(
+        r#"if test "$ENABLE_DOCKER" = 1; then
+  if command -v systemctl >/dev/null 2>&1; then
+    $SUDO systemctl enable --now docker
+  elif command -v service >/dev/null 2>&1; then
+    $SUDO service docker start
+  else
+    printf 'No supported service manager was found for Docker.\n' >&2
+    exit 47
+  fi
+fi
+if test "$GRANT_DOCKER" = 1 && ! id -nG 2>/dev/null | tr ' ' '\n' | grep -qx docker; then
+  getent group docker >/dev/null 2>&1 || $SUDO groupadd --system docker
+  $SUDO usermod -aG docker "$(id -un)"
+fi
+$SUDO docker info >/dev/null
+$SUDO docker compose version --short | grep -Eq '^v?([2-9]|[1-9][0-9]+)\.'
+"#,
+    );
+    Ok(script)
+}
+
 fn version_major(value: &str) -> Option<u64> {
     value
         .trim()
@@ -5642,6 +6069,7 @@ fn io_error(error: std::io::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::sync::RwLock;
     use vam_secrets::MemorySecretStore;
 
@@ -5649,6 +6077,7 @@ mod tests {
         key: RwLock<HostKeyInfo>,
         commands: std::sync::Mutex<Vec<String>>,
         uploads: std::sync::Mutex<Vec<(String, String)>>,
+        responses: std::sync::Mutex<VecDeque<CommandResult>>,
     }
 
     #[async_trait::async_trait]
@@ -5677,6 +6106,14 @@ mod tests {
                 .last()
                 .is_some_and(|previous| previous.contains("docker compose stop"));
             commands.push(command.to_owned());
+            if let Some(result) = self
+                .responses
+                .lock()
+                .expect("test response lock")
+                .pop_front()
+            {
+                return Ok(result);
+            }
             if command.contains("services=\"$(docker compose ps --status running --services") {
                 let stdout = if after_stop {
                     b"project=1\ngateway=1\ndns=1\ngateway_status=exited/none Exited (0)\ndns_status=exited/none Exited (0)\nbackend=1\nclient_count=0\nbackend_status=stopped\nlistener_0=1\nprivate_dns=1\npublic_dns=1\n".to_vec()
@@ -5690,7 +6127,7 @@ mod tests {
                 });
             }
             Ok(CommandResult {
-                stdout: b"operating_system=Linux\narchitecture=x86_64\ndocker_version=29.0.0\ndocker_accessible=0\ncompose_version=5.3.1\nwireguard=0\nroot_writable=0\nsudo_bootstrap=1\n".to_vec(),
+                stdout: b"operating_system=Linux\narchitecture=x86_64\npackage_manager=apt\neffective_user_is_root=1\ndocker_group_member=0\ndocker_installed=0\ndocker_version=29.0.0\ndocker_accessible=0\ncompose_version=5.3.1\ndocker_privileged_accessible=0\nwireguard=0\nroot_writable=0\nsudo_bootstrap=1\n".to_vec(),
                 stderr: Vec::new(),
                 exit_status: 0,
             })
@@ -5726,6 +6163,7 @@ mod tests {
             }),
             commands: std::sync::Mutex::new(Vec::new()),
             uploads: std::sync::Mutex::new(Vec::new()),
+            responses: std::sync::Mutex::new(VecDeque::new()),
         })
     }
 
@@ -5763,6 +6201,122 @@ mod tests {
             dns_records: Vec::new(),
             dns_blocklist_domains: Vec::new(),
         }
+    }
+
+    fn host_inspection(package_manager: Option<PackageManager>) -> HostInspection {
+        HostInspection {
+            operating_system: "Linux".into(),
+            architecture: "x86_64".into(),
+            package_manager,
+            effective_user_is_root: true,
+            docker_installed: false,
+            docker_version: None,
+            compose_version: None,
+            docker_accessible: false,
+            docker_privileged_accessible: false,
+            docker_group_member: false,
+            wireguard_kernel_available: false,
+            application_root_writable: false,
+            sudo_bootstrap_available: false,
+            warnings: vec![],
+        }
+    }
+
+    fn queued_result(stdout: &str, stderr: &str, exit_status: u32) -> CommandResult {
+        CommandResult {
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+            exit_status,
+        }
+    }
+
+    const FRESH_APT_HOST: &str = "operating_system=Linux\narchitecture=x86_64\npackage_manager=apt\neffective_user_is_root=1\ndocker_group_member=1\ndocker_installed=127\ndocker_version=\ndocker_accessible=127\ncompose_version=\ndocker_privileged_accessible=127\nwireguard=1\nroot_writable=1\nsudo_bootstrap=0\n";
+    const READY_APT_HOST: &str = "operating_system=Linux\narchitecture=x86_64\npackage_manager=apt\neffective_user_is_root=1\ndocker_group_member=0\ndocker_installed=0\ndocker_version=29.0.0\ndocker_accessible=0\ncompose_version=2.40.0\ndocker_privileged_accessible=0\nwireguard=1\nroot_writable=1\nsudo_bootstrap=0\n";
+
+    #[test]
+    fn host_setup_plans_are_deterministic_and_noop_when_ready() {
+        let host_id = Uuid::from_u128(42);
+        let mut ready = host_inspection(Some(PackageManager::Apt));
+        ready.docker_installed = true;
+        ready.docker_version = Some("29.0.0".into());
+        ready.compose_version = Some("v2.40.0".into());
+        ready.docker_accessible = true;
+        ready.docker_privileged_accessible = true;
+
+        let first = build_host_provisioning_plan(host_id, &ready).unwrap();
+        let second = build_host_provisioning_plan(host_id, &ready).unwrap();
+        assert!(first.operations.is_empty());
+        assert_eq!(first.expected_state_hash, second.expected_state_hash);
+        assert_eq!(first.expected_state_hash.len(), 64);
+    }
+
+    #[test]
+    fn host_setup_uses_fixed_idempotent_scripts_for_every_supported_manager() {
+        let managers = [
+            (PackageManager::Apt, "apt-get -yq install"),
+            (PackageManager::Dnf, "dnf -y install"),
+            (PackageManager::Yum, "yum -y -q install"),
+            (PackageManager::Zypper, "zypper -nq install"),
+            (PackageManager::Pacman, "pacman -Sy --needed"),
+        ];
+        for (manager, expected_command) in managers {
+            let inspection = host_inspection(Some(manager));
+            let plan = build_host_provisioning_plan(Uuid::from_u128(7), &inspection).unwrap();
+            assert_eq!(
+                plan.operations,
+                vec![
+                    HostProvisioningOperation::InstallDockerEngine,
+                    HostProvisioningOperation::InstallComposePlugin,
+                    HostProvisioningOperation::EnableDockerService,
+                    HostProvisioningOperation::VerifyPrerequisites,
+                ]
+            );
+            let script = host_provisioning_script(plan.package_manager, &plan.operations).unwrap();
+            assert!(script.contains(expected_command));
+            assert!(script.contains("systemctl enable --now docker"));
+            assert!(script.contains("docker compose version --short"));
+            assert!(script.contains("command -v docker"));
+            assert!(!script.contains("curl"));
+            assert!(!script.contains("wget"));
+            assert!(!script.contains("http://"));
+            assert!(!script.contains("https://"));
+        }
+    }
+
+    #[test]
+    fn host_setup_requires_authority_and_supported_package_management() {
+        let mut unprivileged = host_inspection(Some(PackageManager::Apt));
+        unprivileged.effective_user_is_root = false;
+        assert_eq!(
+            build_host_provisioning_plan(Uuid::nil(), &unprivileged).unwrap_err(),
+            HostProvisioningError::AuthorityRequired
+        );
+
+        let unsupported = host_inspection(None);
+        assert_eq!(
+            build_host_provisioning_plan(Uuid::nil(), &unsupported).unwrap_err(),
+            HostProvisioningError::PackageManagerUnsupported
+        );
+    }
+
+    #[test]
+    fn host_setup_discloses_root_equivalent_docker_group_access() {
+        let mut inspection = host_inspection(Some(PackageManager::Apt));
+        inspection.effective_user_is_root = false;
+        inspection.sudo_bootstrap_available = true;
+        let plan = build_host_provisioning_plan(Uuid::nil(), &inspection).unwrap();
+        assert!(
+            plan.operations
+                .contains(&HostProvisioningOperation::GrantDockerAccess)
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("root-equivalent"))
+        );
+        let script = host_provisioning_script(plan.package_manager, &plan.operations).unwrap();
+        assert!(script.contains("usermod -aG docker"));
+        assert!(script.contains("sudo -n true"));
     }
 
     #[test]
@@ -6596,6 +7150,116 @@ mod tests {
             files
                 .iter()
                 .any(|file| file.path == "vpn/wg0.conf.template")
+        );
+    }
+
+    #[tokio::test]
+    async fn host_setup_rejects_stale_plans_and_treats_nonzero_exit_as_authoritative() {
+        let storage = Storage::in_memory().await.unwrap();
+        let fake = fake_transport();
+        let service = ApplicationService::with_transport(
+            storage,
+            Arc::new(MemorySecretStore::default()),
+            fake.clone(),
+        );
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "lab".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let probe = service.probe_host_key(host.id).await.unwrap();
+        service
+            .approve_host_key(host.id, probe.key, "SHA256:first", false)
+            .await
+            .unwrap();
+
+        fake.responses
+            .lock()
+            .expect("test response lock")
+            .push_back(queued_result(FRESH_APT_HOST, "", 0));
+        let plan = service.plan_host_provisioning(host.id).await.unwrap();
+        assert!(!plan.operations.is_empty());
+
+        fake.responses.lock().expect("test response lock").extend([
+            queued_result(FRESH_APT_HOST, "", 0),
+            queued_result("", "password=hunter2", 23),
+        ]);
+        let error = service
+            .apply_host_provisioning(host.id, &plan.expected_state_hash)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "remote_command");
+        assert!(error.remote_state_changed);
+        let detail = error.technical_detail.unwrap();
+        assert!(!detail.contains("hunter2"));
+        assert!(detail.contains("[REDACTED]"));
+
+        let command_count = fake.commands.lock().expect("test command lock").len();
+        let error = service
+            .apply_host_provisioning(host.id, "stale-state")
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "host_provisioning_plan_stale");
+        assert_eq!(
+            fake.commands.lock().expect("test command lock").len(),
+            command_count + 1,
+            "stale apply may inspect but must not execute setup"
+        );
+    }
+
+    #[tokio::test]
+    async fn host_setup_reinspects_after_apply_and_requires_direct_access() {
+        let storage = Storage::in_memory().await.unwrap();
+        let fake = fake_transport();
+        let service = ApplicationService::with_transport(
+            storage,
+            Arc::new(MemorySecretStore::default()),
+            fake.clone(),
+        );
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "lab".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let probe = service.probe_host_key(host.id).await.unwrap();
+        service
+            .approve_host_key(host.id, probe.key, "SHA256:first", false)
+            .await
+            .unwrap();
+
+        fake.responses
+            .lock()
+            .expect("test response lock")
+            .push_back(queued_result(FRESH_APT_HOST, "", 0));
+        let plan = service.plan_host_provisioning(host.id).await.unwrap();
+        fake.responses.lock().expect("test response lock").extend([
+            queued_result(FRESH_APT_HOST, "", 0),
+            queued_result("", "", 0),
+            queued_result(READY_APT_HOST, "", 0),
+        ]);
+        let inspection = service
+            .apply_host_provisioning(host.id, &plan.expected_state_hash)
+            .await
+            .unwrap();
+        assert!(host_deployment_prerequisites_ready(&inspection));
+        assert!(
+            fake.commands
+                .lock()
+                .expect("test command lock")
+                .iter()
+                .any(|command| command.contains("usermod -aG docker"))
         );
     }
 

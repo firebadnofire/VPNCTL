@@ -129,13 +129,52 @@ pub struct HostKeyProbe {
 pub struct HostInspection {
     pub operating_system: String,
     pub architecture: String,
+    #[serde(default)]
+    pub package_manager: Option<PackageManager>,
+    #[serde(default)]
+    pub effective_user_is_root: bool,
+    #[serde(default)]
+    pub docker_installed: bool,
     pub docker_version: Option<String>,
     pub compose_version: Option<String>,
     pub docker_accessible: bool,
+    #[serde(default)]
+    pub docker_privileged_accessible: bool,
+    #[serde(default)]
+    pub docker_group_member: bool,
     pub wireguard_kernel_available: bool,
     pub application_root_writable: bool,
     pub sudo_bootstrap_available: bool,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PackageManager {
+    Apt,
+    Dnf,
+    Yum,
+    Zypper,
+    Pacman,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum HostProvisioningOperation {
+    InstallDockerEngine,
+    InstallComposePlugin,
+    EnableDockerService,
+    GrantDockerAccess,
+    VerifyPrerequisites,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostProvisioningPlan {
+    pub host_id: Uuid,
+    pub package_manager: Option<PackageManager>,
+    pub operations: Vec<HostProvisioningOperation>,
+    pub warnings: Vec<String>,
+    pub expected_state_hash: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

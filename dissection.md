@@ -4093,3 +4093,150 @@ in-app browser runtime itself exited before navigation with a Windows sandbox
 was stopped. No visual-interaction result is claimed; the successful Svelte
 diagnostics and production bundle are the available frontend proof in this
 environment.
+
+## Unit 10: Explicit fresh-host prerequisite provisioning
+
+### 10A plan
+
+The final definition-of-done audit found one functional gap: deployment checks
+for Linux, direct Docker access, and Docker Compose v2, but it cannot prepare a
+fresh supported Linux host. This unit adds that workflow without turning normal
+deployment into an implicit package-manager mutation.
+
+The work is split into these independently validated functional steps:
+
+1. Extend the shared protocol with typed package-manager and provisioning-plan
+   data. Host inspection will distinguish a missing Docker CLI, an inaccessible
+   daemon, a missing Compose v2 plugin, root authority, and noninteractive sudo.
+   It will detect apt, dnf, yum, zypper, and pacman in the same order as the
+   Amnezia client reference.
+2. Add application planning and application methods. Planning is read-only and
+   returns a deterministic operation list, security warnings, and a SHA-256
+   hash bound to the observed host state. Applying will re-inspect and re-plan,
+   reject a stale or altered hash, execute one fixed idempotent script over the
+   already verified SSH connection, then open a new verified SSH operation and
+   require Linux, direct Docker access, and Compose major version 2 or newer.
+3. Expose the workflow through explicit CLI and Tauri commands. No package
+   installation will occur during host inspection or instance deployment.
+4. Add a host-setup review modal to the desktop. A failed inspection will show
+   the detected package manager and authority, let the operator preview each
+   operation and warning, and require a separate Apply action.
+5. Add focused tests for all five manager scripts, no-op hosts, unsupported or
+   unprivileged hosts, stale plans, non-zero SSH exit handling, and secret
+   redaction. Then repeat the relevant Rust, Tauri, Svelte, Vitest, production
+   bundle, formatting, and patch-sanity gates.
+
+Security and runtime decisions:
+
+- provisioning accepts only a currently approved SSH host key;
+- package installation requires root or `sudo -n`; sudo passwords are never
+  collected, stored, or placed in a command;
+- only distribution package managers are used; there is no `curl | sh`,
+  third-party repository bootstrap, or unverified downloaded installer;
+- operations use fixed command templates selected from a closed enum, and
+  remote host or user data is never interpolated into a shell program;
+- Docker service startup uses systemd when present and a conventional service
+  fallback otherwise, followed by a hard Docker/Compose verification;
+- adding the SSH user to the Docker group is presented as a security-sensitive
+  operation because that group grants root-equivalent host control;
+- package and service commands are guarded so rerunning the same plan is safe;
+- the existing deployment prerequisite gate remains fail-closed, so setup and
+  VPN deployment stay separate and understandable.
+
+Expected validation for step 1 is protocol serialization plus application
+inspection tests. Expected validation for step 2 is deterministic plans and
+scripts, stale-state rejection, non-zero-exit authority, and post-apply
+reinspection. Expected validation for steps 3 and 4 is parser/compile checking
+and frontend diagnostics. Any failing gate stops the unit for diagnosis before
+the next step or signed commit.
+
+### 10A implementation
+
+The shared protocol now treats prerequisite setup as first-class data:
+
+- `PackageManager` is a closed apt/dnf/yum/zypper/pacman enum;
+- `HostInspection` reports the detected manager, effective-root status, Docker
+  CLI installation, direct Docker access, privileged Docker access, Docker
+  group membership, Compose version, and the pre-existing kernel/root/sudo
+  checks;
+- `HostProvisioningOperation` describes Docker Engine installation, Compose
+  plugin installation, service enablement, Docker access grant, and final
+  verification;
+- `HostProvisioningPlan` binds those operations and security warnings to a
+  SHA-256 `expected_state_hash`.
+
+Inspection remains non-mutating. Its fixed shell program reports exit statuses
+as key/value data and detects package managers in the reference client's
+apt/dnf/yum/zypper/pacman order. It separately asks whether the current SSH
+session can use Docker and whether root or `sudo -n` can reach the daemon. That
+distinction prevents a stopped service from being mislabeled as only a group
+permission problem.
+
+`plan_host_provisioning` enforces these cases:
+
+- a Linux host with direct Docker and Compose v2 produces an empty no-op plan;
+- a non-Linux target is rejected with manual-preparation remediation;
+- any required mutation without root or noninteractive sudo is rejected;
+- package changes without a supported manager are rejected;
+- missing Docker plans Engine installation;
+- missing or pre-v2 Compose plans a Compose v2 distribution package;
+- an unreachable privileged daemon plans service startup;
+- a non-root user who lacks direct access and group membership plans an
+  explicit Docker-group grant;
+- every mutating plan ends with a verification operation.
+
+The plan hash covers the host ID, complete observed inspection, and ordered
+operations. `apply_host_provisioning` immediately re-inspects and recreates the
+plan, then rejects a mismatched hash before executing setup. A matching plan
+selects one closed script template; no host-supplied value is interpolated.
+After the command, the application performs another verified-SSH inspection.
+Success requires Linux, an installed and directly accessible Docker Engine,
+and Compose major version 2 or newer. This new SSH operation is important
+because group membership only takes effect for a new login session.
+
+The fixed scripts use:
+
+- apt: `docker.io`, `ca-certificates`, `iproute2`, then
+  `docker-compose-v2` or `docker-compose-plugin` only when available;
+- dnf/yum: a repository-available `docker` or `moby-engine`, plus
+  `ca-certificates`/`iproute`, then a repository-available
+  `docker-compose-plugin` or `docker-compose`;
+- zypper: `docker`, `ca-certificates`, `iproute2`, then
+  `docker-compose` with a plugin-package fallback;
+- pacman: `docker`, `ca-certificates`, `iproute2`, and `docker-compose`
+  with `--needed`.
+
+All branches guard already-satisfied state, use only the configured
+distribution repositories, start Docker through systemd or a conventional
+service fallback, and verify privileged Docker plus Compose v2 before returning.
+The application then verifies direct unprivileged access separately. A failed
+setup is conservatively reported as potentially having changed remote state;
+stderr passes through structured secret redaction.
+
+Ordinary VPN deployment still only validates prerequisites. Its remediation
+now directs the operator to the separate setup preview rather than silently
+installing packages during Apply.
+
+### 10A validation
+
+The first focused test run stopped with 25/26 application tests passing. The
+new all-manager invariant found that pacman used `--needed` but did not include
+the same explicit `command -v docker` guard as the other four branches. The
+branch was corrected, and the exact suite was rerun before any further work.
+
+Passing gates after that correction:
+
+- 26 application tests, including deterministic/no-op planning, all five fixed
+  package-manager templates, unsupported-manager and missing-authority errors,
+  Docker root-equivalence disclosure, stale-hash rejection, authoritative
+  non-zero SSH exit handling with stderr redaction, and successful fresh-session
+  reinspection;
+- 2 protocol tests;
+- strict Clippy for protocol and application, all targets, with `-D warnings`;
+- formatting and `git diff --check`.
+
+As in earlier units, native compilation used the temporary Ring diagnostic
+because this machine lacks NASM for AWS-LC. The manifest was restored after the
+gates, and `cargo tree -i aws-lc-rs -e features` confirms the delivered default
+russh/AWS-LC graph. The intentional lockfile change only adds the existing
+workspace-pinned `sha2` crate to `vam-application`.
