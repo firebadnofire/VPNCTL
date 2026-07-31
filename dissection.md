@@ -5037,3 +5037,78 @@ Previous signed commit: `f8efa79 feat: deliver backend-aware desktop workflows`
 (good EDDSA signature).
 
 Planned signed commit: `fix: improve desktop responsiveness and accessibility`.
+
+### 12H. Automated desktop workflow coverage (2026-07-31)
+
+The frontend previously had only two pure error-formatting tests and no DOM
+environment. Capability-driven rendering, lazy command boundaries, keyboard
+interaction, restore warnings, and per-backend form isolation therefore lacked
+repeatable component-level proof even though the Rust contracts were covered.
+
+Vitest now has an explicit jsdom configuration and resolves Svelte through its
+browser condition. Svelte Testing Library supplies semantic DOM queries and
+event dispatch. The additions are development-only dependencies; they do not
+enter the packaged application bundle or change runtime behavior. A small test
+harness owns backend form data as Svelte reactive state so bindable controls are
+tested under the same reactivity model as the application rather than producing
+non-reactive test-only warnings.
+
+Typed fixtures cover all five public backend descriptors without secrets.
+Component coverage verifies badge plus full-name presentation, the implemented
+QR matrix, Xray's lack of an invented managed address or exposed identifier,
+revoked certificate replacement actions, five-backend readiness, exact backup
+metadata, readable activity, typed reinstall consequences, overflow-menu focus
+restoration, workspace keyboard navigation, Xray DNS unsupported messaging,
+global hostlist independence, and all five isolated backend forms. The AWG2
+advanced section is closed by default, IKEv2 documents both fixed listeners and
+PKCS#12 export, and Xray REALITY rendering contains neither certificate inputs
+nor private-key material.
+
+An application integration fixture mocks only the Tauri command boundary. It
+proves startup loads hosts, instance summaries, descriptors, and local activity
+without clients, DNS hostlists, backups, inspection, or health. Entering the
+relevant screen lazily loads its data. The fixture traverses Instances, Clients,
+DNS, Hostlists, Backups, and Logs; it also verifies that an exact backup name is
+sent to restore preview and that identity impact, affected clients, the safety
+snapshot, and the explicit restore action are shown before mutation.
+
+Files and subsystems changed:
+
+- `apps/desktop/package.json` and `pnpm-lock.yaml`: test-only Svelte Testing
+  Library and jsdom dependencies;
+- `apps/desktop/vitest.config.ts` and `src/test/setup.ts`: browser-conditioned
+  jsdom setup with deterministic cleanup;
+- `src/test/fixtures.ts` and `BackendFormHarness.svelte`: typed, non-secret
+  backend/application fixtures;
+- `src/lib/components/presentation.test.ts`: presentation, capability,
+  accessibility, readiness, backup, log, and workspace scenarios;
+- `src/lib/components/forms/backend-forms.test.ts`: all backend form surfaces;
+- `src/App.integration.test.ts`: mocked-native lazy-loading and cross-screen
+  workflows.
+
+Validation for this unit:
+
+- full Vitest passed 24/24 tests across four files;
+- Svelte check passed with 0 errors and 0 warnings;
+- the production Vite build passed unchanged at 134 modules, 131.42 kB
+  JavaScript and 20.14 kB CSS before gzip;
+- `git diff --check` passed;
+- dependency installation passed the repository's pnpm supply-chain policy
+  check; only the desktop development manifest and workspace lockfile changed.
+
+The first test run stopped because Vitest had selected Svelte's server export;
+the config now explicitly selects the browser condition. The second run reached
+19/20 tests and exposed Testing Library's `events` mount-option collision plus
+test-only non-reactive form inputs; an explicit props envelope and reactive
+harness corrected both. A subsequent Svelte check stopped on one widened fixture
+string and passed after narrowing it to the declared readiness union. No
+production behavior was weakened to make a test pass.
+
+No native secret store, file picker, SSH host, backup repository, or remote
+service is touched by these tests. Native command behavior remains covered by
+Rust tests; this suite verifies the Svelte side of that typed boundary.
+
+Previous signed commit: `62fdc79 fix: improve desktop responsiveness and accessibility`
+(good EDDSA signature).
+
+Planned signed commit: `test: add desktop workflow coverage`.
