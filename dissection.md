@@ -4857,3 +4857,109 @@ Previous signed commit: `3a5885a feat: add safe backend-aware instance editing`
 (good EDDSA signature).
 
 Planned signed commit: `refactor: componentize desktop management UI`.
+
+### 12F. Backend-aware desktop workflows (2026-07-31)
+
+The componentized shell still retained several compatibility surfaces: raw
+`InstanceHealth` booleans after Apply and refresh operations, raw `DeviceView`
+in client rows, raw `DeploymentOperation` JSON in the preview, deployment-based
+rollback rather than exact backup restore, a flat creation form, and a Settings
+tab with no editor. Host cards also rendered generic Docker/WireGuard checks
+instead of the all-backend readiness evaluation already available in Rust.
+
+The application/Tauri boundary now has presentation-safe wrappers for Apply,
+host provisioning, credential refresh, and DNS refresh. Each wrapper reuses the
+already obtained result; it does not run a second SSH health or inspection
+probe. Svelte no longer imports or indexes `InstanceHealth`. Named checks,
+configured image, observation time, and the generic operational state flow into
+status notices. Explicit Start, Stop, Health, Apply, Restore, and refresh actions
+update the selected summary with live evidence; ordinary rendering remains
+local and does not claim a running state.
+
+Instance rows now use the Rust-produced summary/state and keep Manage visible,
+with Start, Stop, Refresh health, Preview deployment, Backup, and separately
+labelled Delete in a compact action menu. Deployment review calls
+`plan_instance_preview`, renders typed impact/backup/server/client consequences,
+and shows the redacted human-readable operation label. Technical operation
+detail is expandable; Svelte no longer serializes raw operation objects.
+
+Client screens now load `ClientView` and render its identity summary, optional
+managed address, state label, exact export formats, and state-specific
+`ClientActionView` list. Labels, warnings, destructive designation, QR
+availability, certificate revocation/replacement behavior, and statistics
+absence therefore come from Rust. Xray has no invented IP or exposed UUID.
+Export extension selection follows the advertised export enum (WG/AWG config,
+OVPN, protected PKCS#12, or VLESS URI), and QR is callable only when Rust
+advertises it. Confirmation dialogs display the backend-provided consequence
+warning. User-facing validation/activity language touched in this unit now says
+Client while persisted `Device` APIs and storage remain unchanged.
+
+Host Inspect calls the single `inspect_host_view` command. The resulting matrix
+separates SSH trust, connectivity, Docker/Compose readiness, and Ready, Ready
+with fallback, Needs setup, or Unsupported for all five backends. Applying a
+host setup returns the same typed matrix from its final verification result.
+Opening or selecting a host still does not inspect automatically.
+
+Backups load `BackupView` with instance/backend/reason metadata. Every Restore
+button first calls `preview_backup_restore`, displays identity and affected-client
+impact plus the mandatory safety snapshot, then calls `restore_backup_by_name`
+with the exact selected name and expected hash. The backend continues to health
+verify and automatically recover from the pre-restore snapshot on failure. The
+legacy deployment rollback command is no longer reachable from the desktop
+backup UI. Logs use `activity_logs` with server-side host, instance, backend,
+severity, and operation filters and retain technical detail behind expansion.
+
+Creation is now a five-step wizard: cached host readiness, descriptor-backed VPN
+type cards, common basics, isolated backend form, and applicable review facts.
+It has only Create; successful creation opens Overview with Review deployment.
+AWG advanced defaults remain collapsed, IKEv2 explains its fixed UDP listeners,
+and Xray supports REALITY or TLS/mKCP as allowed. Xray TLS certificate and key
+paths come from native file pickers. JavaScript never opens the files; Rust reads,
+validates, stores, and persists only opaque references.
+
+The workspace Settings tab now opens a safe editor. Backend and host are shown
+read-only because `UpdateInstanceInput` omits both. The editor requests a
+non-mutating `preview_instance_update`, shows server identity/client re-export
+effects, requires explicit acknowledgement for disruptive impacts, and only then
+saves local desired state with the current-state hash. Deployment remains a
+separate reviewed action. Existing Xray TLS material is retained when both file
+paths are blank; replacement requires both paths and is handled by Rust's
+transactional secret workflow.
+
+Files and subsystems changed:
+
+- `crates/application/src/lib.rs`: view wrappers that reuse Apply/provisioning/
+  refresh results and Client terminology in public errors;
+- `apps/desktop/src-tauri/src/lib.rs`: corresponding presentation-safe commands;
+- `apps/desktop/src/App.svelte`: typed workflows, wizard, safe Settings preview,
+  exact backup restore, server-side logs, and live evidence updates;
+- `apps/desktop/src/lib/components`: client action group, deployment impact,
+  readiness matrix, instance action menu, and log filters;
+- shared client/backup/workspace components and Xray form updated to consume the
+  new contracts and native file selection;
+- `apps/desktop/src/lib/types.ts` and `styles.css`: exact DTO and visual support.
+
+Validation for this unit:
+
+- all 37 application tests passed, including existing descriptor, health,
+  client-state, backup recovery, readiness, redaction, and safe-edit tests;
+- strict Clippy passed for `vam-application` and the Tauri desktop package with
+  all targets and `-D warnings`;
+- Svelte check passed with 0 errors and 0 warnings;
+- Vitest passed 2/2 existing frontend tests;
+- the Vite production build passed (134 modules, 127.81 kB JavaScript and 18.45
+  kB CSS before gzip);
+- Rust formatting and `git diff --check` passed.
+
+The first Svelte check correctly stopped on the two remaining raw health types
+used by credential and DNS refresh. Presentation wrappers were added and the
+check was rerun. A later check stopped on TypeScript's nullable narrowing inside
+a Settings descriptor callback; the lookup moved to a typed helper and passed.
+No remote host, Docker service, backup, credential store, or certificate file
+was accessed during validation. Rust used the existing portable NASM through
+the command process PATH, and frontend tools used existing local dependencies.
+
+Previous signed commit: `1296493 refactor: componentize desktop management UI`
+(good EDDSA signature).
+
+Planned signed commit: `feat: deliver backend-aware desktop workflows`.

@@ -148,8 +148,48 @@ h1 { font-size: 30px; margin: 2px 0 0; letter-spacing: -0.7px; }
 .workspace-record { display: grid; grid-template-columns: 1fr .5fr 2fr; gap: 15px; padding: 13px 20px; border-bottom: 1px solid #edf1f5; font-size: 12px; align-items: center; }
 .workspace-record code { overflow-wrap: anywhere; }
 .settings-sections { display: flex; flex-wrap: wrap; gap: 9px; padding: 20px; }
+.panel-actions { display: flex; justify-content: flex-end; padding: 0 20px 20px; }
 .instance-selector { display: flex; align-items: center; gap: 10px; font-size: 12px; font-weight: 700; }
 .instance-selector select { min-width: 240px; }
+.client-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; flex-wrap: wrap; }
+.client-state { color: #486581; font-size: 11px; font-weight: 750; }
+.readiness-summary { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: #edf1f5; }
+.readiness-summary div { background: #f8fafc; display: grid; gap: 4px; padding: 14px 18px; }
+.readiness-summary span { color: #627d98; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
+.readiness-matrix { display: grid; grid-template-columns: repeat(5, 1fr); gap: 1px; background: #edf1f5; }
+.readiness-matrix article { background: white; border-top: 3px solid #ef4e4e; padding: 14px; display: grid; gap: 5px; }
+.readiness-matrix article[data-readiness="ready"], .readiness-matrix article[data-readiness="ready_with_fallback"] { border-top-color: #27ab83; }
+.readiness-matrix article > div { display: grid; gap: 3px; }
+.readiness-matrix span, .readiness-matrix small { color: #627d98; font-size: 10px; }
+.impact-panel { margin: 13px 0; padding: 14px; border: 1px solid #c8ddf8; border-radius: 9px; background: #f3f8ff; }
+.impact-panel.critical { border-color: #ef4e4e; background: #fff4e5; }
+.impact-title { display: flex; justify-content: space-between; text-transform: capitalize; }
+.impact-title span, .impact-facts span { color: #627d98; font-size: 10px; text-transform: uppercase; letter-spacing: .5px; }
+.impact-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 12px 0; }
+.impact-facts div { display: grid; gap: 3px; }
+.impact-panel p { color: #486581; font-size: 12px; margin: 7px 0; }
+.impact-warning { color: #8d4b00; font-size: 11px; }
+.log-filters { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 9px; padding: 14px 20px; border-bottom: 1px solid #edf1f5; }
+.log-filters label { display: grid; gap: 4px; color: #627d98; font-size: 10px; font-weight: 750; }
+.log-filters input, .log-filters select { padding: 7px 8px; font-size: 11px; }
+.wizard-steps { display: grid; grid-template-columns: repeat(5, 1fr); gap: 5px; margin-bottom: 18px; }
+.wizard-steps span { color: #829ab1; border-top: 3px solid #d9e2ec; padding-top: 6px; font-size: 10px; font-weight: 750; }
+.wizard-steps span.active { color: #1769bd; border-color: #2f80ed; }
+.backend-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.backend-cards > button { border: 1px solid #d9e2ec; border-radius: 9px; background: white; padding: 13px; text-align: left; cursor: pointer; display: grid; gap: 8px; }
+.backend-cards > button.selected { border-color: #2f80ed; box-shadow: 0 0 0 2px #2f80ed22; }
+.backend-cards > button > span { color: #627d98; font-size: 11px; line-height: 1.4; }
+.review-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }
+.review-facts div { display: grid; gap: 4px; padding: 11px; background: #f8fafc; border: 1px solid #e3eaf1; border-radius: 7px; }
+.review-facts span { color: #627d98; font-size: 10px; text-transform: uppercase; }
+.overflow-menu { position: relative; }
+.overflow-menu summary { list-style: none; border: 1px solid #cbd8e5; border-radius: 7px; background: white; color: #334e68; padding: 7px 10px; font-size: 12px; font-weight: 650; cursor: pointer; }
+.overflow-menu summary::-webkit-details-marker { display: none; }
+.overflow-menu > div { position: absolute; right: 0; top: calc(100% + 5px); z-index: 5; width: 190px; display: grid; padding: 6px; background: white; border: 1px solid #d9e2ec; border-radius: 9px; box-shadow: 0 12px 30px #102a4328; }
+.overflow-menu button { border: 0; background: transparent; text-align: left; padding: 8px; border-radius: 5px; cursor: pointer; }
+.overflow-menu button:hover { background: #f3f6f9; }
+.overflow-menu hr { border: 0; border-top: 1px solid #edf1f5; width: 100%; }
+.danger-action { background: #ba2525; }
 footer { color: #9fb3c8; font-size: 11px; text-align: center; padding: 24px 0 0; }
 
 .modal-backdrop { position: fixed; inset: 0; background: #102a4378; backdrop-filter: blur(3px); display: grid; place-items: center; padding: 30px; z-index: 20; }

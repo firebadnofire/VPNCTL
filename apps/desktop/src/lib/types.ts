@@ -482,6 +482,15 @@ export interface DeploymentResult {
   health: InstanceHealth;
 }
 
+export interface DeploymentResultView {
+  deployment_id: UUID;
+  status: string;
+  remote_state_changed: boolean;
+  rollback_succeeded?: boolean | null;
+  backup_name?: string | null;
+  health: InstanceHealthView;
+}
+
 export interface BackupInfo {
   name: string;
   created_at: string;

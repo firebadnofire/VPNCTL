@@ -1,8 +1,9 @@
 <script lang="ts">
   import type {
     BackendOption,
-    BackupInfo,
-    Device,
+    BackupView,
+    Client,
+    ClientActionView,
     DnsHostlist,
     DnsRecord,
     InstanceSummary,
@@ -31,34 +32,28 @@
     onhealth,
     onplan,
     onaddclient,
-    onexportclient,
-    ontoggleclient,
-    onreplaceclient,
-    onqrclient,
-    onremoveclient,
+    onclientaction,
     onbackup,
     onrestore,
+    oneditsettings,
   }: {
     summary: InstanceSummary;
     options: BackendOption[];
     tab: WorkspaceTab;
-    devices: Device[];
+    devices: Client[];
     records: DnsRecord[];
     hostlists: DnsHostlist[];
-    backups: BackupInfo[];
+    backups: BackupView[];
     logs: LogEvent[];
     onback: () => void;
     ontabchange: (tab: WorkspaceTab) => void;
     onhealth: () => void;
     onplan: () => void;
     onaddclient: () => void;
-    onexportclient: (device: Device) => void;
-    ontoggleclient: (device: Device) => void;
-    onreplaceclient: (device: Device) => void;
-    onqrclient: (device: Device) => void;
-    onremoveclient: (device: Device) => void;
+    onclientaction: (client: Client, action: ClientActionView) => void;
     onbackup: () => void;
-    onrestore: (backup: BackupInfo) => void;
+    onrestore: (backup: BackupView) => void;
+    oneditsettings: () => void;
   } = $props();
 
   const tabs: WorkspaceTab[] = ["Overview", "Clients", "DNS", "Settings", "Backups", "Logs"];
@@ -107,7 +102,7 @@
     </div>
   {:else if tab === "Clients"}
     <div class="workspace-toolbar"><div><h2>Clients</h2><p>Identity actions and exports for this instance.</p></div><button class="primary" type="button" onclick={onaddclient}>Add client</button></div>
-    <div class="panel"><ClientsContent clients={devices} backendOptions={options} ontoggle={ontoggleclient} onreplace={onreplaceclient} onqr={onqrclient} onexport={onexportclient} onremove={onremoveclient} /></div>
+    <div class="panel"><ClientsContent clients={devices} onaction={onclientaction} /></div>
   {:else if tab === "DNS"}
     {#if backend?.presentation.dns === "unsupported"}
       <EmptyState title="Managed private DNS is not supported" description={`${backend.display_name} does not allocate routed client addresses. Global hostlists remain available below.`} />
@@ -122,6 +117,7 @@
         {#each backend?.presentation.configuration_sections ?? [] as section}<button class="secondary" type="button">{section[0].toUpperCase() + section.slice(1)}</button>{/each}
       </div>
       <p class="help">Settings are saved to local desired state after a typed impact preview. Deployment remains a separate reviewed action.</p>
+      <div class="panel-actions"><button class="primary" type="button" onclick={oneditsettings}>Edit desired settings</button></div>
     </div>
   {:else if tab === "Backups"}
     <div class="workspace-toolbar"><div><h2>Backups</h2><p>Remote snapshots for this instance.</p></div><button class="primary" type="button" onclick={onbackup}>Create backup</button></div>

@@ -5,33 +5,43 @@
   import BackendBadge from "./lib/components/BackendBadge.svelte";
   import BackupsContent from "./lib/components/BackupsContent.svelte";
   import ClientsContent from "./lib/components/ClientsContent.svelte";
+  import DeploymentImpactPanel from "./lib/components/DeploymentImpactPanel.svelte";
   import EmptyState from "./lib/components/EmptyState.svelte";
   import InstanceSelector from "./lib/components/InstanceSelector.svelte";
+  import InstanceActions from "./lib/components/InstanceActions.svelte";
   import InstanceWorkspace, { type WorkspaceTab } from "./lib/components/InstanceWorkspace.svelte";
   import ModalShell from "./lib/components/ModalShell.svelte";
   import LogsContent from "./lib/components/LogsContent.svelte";
+  import HostReadinessMatrix from "./lib/components/HostReadinessMatrix.svelte";
+  import LogFilters from "./lib/components/LogFilters.svelte";
   import StateBadge from "./lib/components/StateBadge.svelte";
   import { backendForms } from "./lib/components/forms/backend-forms";
   import { newInstanceForm, type InstanceForm } from "./lib/instance-form";
   import type {
     AppError,
     AppInfo,
+    ActivityFilter,
     BackendOption,
     BackendSettings,
     BackupInfo,
-    DeploymentPlan,
-    DeploymentResult,
-    Device,
+    BackupRestorePreview,
+    BackupView,
+    Client,
+    ClientActionView,
+    DeploymentPreview,
+    DeploymentResultView,
     DnsHostlist,
     DnsRecord,
     DnsRecordType,
     DockerHost,
-    HostInspection,
+    HostInspectionView,
     HostKeyProbe,
     HostProvisioningOperation,
     HostProvisioningPlan,
-    InstanceHealth,
+    InstanceHealthView,
+    InstanceDetail,
     InstanceSummary,
+    InstanceUpdatePreview,
     LogEvent,
     UpdateDeviceInput,
     VpnBackendKind,
@@ -49,19 +59,14 @@
     | "hostlist"
     | "host-setup"
     | "plan"
+    | "restore"
+    | "settings"
     | "qr"
     | null;
 
   const sections: Section[] = ["Hosts", "Instances", "Clients", "DNS", "Backups", "Logs"];
   const dnsPanels: DnsPanel[] = ["Records", "Hostlists"];
   const recordTypes: DnsRecordType[] = ["A", "AAAA", "CNAME", "TXT", "SRV"];
-  const healthCheckLabels: Array<[keyof InstanceHealth, string]> = [
-    ["compose_project_exists", "Compose project exists"],
-    ["gateway_running", "Gateway container running"],
-    ["backend_ready", "VPN backend is ready"],
-    ["listeners_ready", "Required listeners are published"],
-    ["client_state_matches", "Client identities match desired state"],
-  ];
 
   function shellSingleQuote(value: string) {
     return `'${value.replaceAll("'", "'\"'\"'")}'`;
@@ -84,11 +89,12 @@
   let instances: VpnInstance[] = [];
   let instanceSummaries: InstanceSummary[] = [];
   let backendOptions: BackendOption[] = [];
-  let devices: Device[] = [];
+  let clients: Client[] = [];
   let records: DnsRecord[] = [];
   let hostlists: DnsHostlist[] = [];
-  let backups: BackupInfo[] = [];
+  let backups: BackupView[] = [];
   let logs: LogEvent[] = [];
+  let activityFilter: ActivityFilter = {};
   let selectedHostId = "";
   let selectedInstanceId = "";
   let selectedDeviceId = "";
@@ -96,15 +102,21 @@
   let workspaceTab: WorkspaceTab = "Overview";
   let busy = "";
   let notice = "";
-  let noticeHealth: InstanceHealth | null = null;
+  let noticeHealth: InstanceHealthView | null = null;
   let error: AppError | null = null;
-  let inspection: HostInspection | null = null;
+  let inspection: HostInspectionView | null = null;
   let hostSetupPlan: HostProvisioningPlan | null = null;
   let probe: HostKeyProbe | null = null;
   let defaultSshUsername = "";
   let fingerprintConfirmation = "";
   let replaceChangedKey = false;
-  let plan: DeploymentPlan | null = null;
+  let plan: DeploymentPreview | null = null;
+  let restorePreview: BackupRestorePreview | null = null;
+  let settingsDetail: InstanceDetail | null = null;
+  let settingsForm: InstanceForm | null = null;
+  let settingsPreview: InstanceUpdatePreview | null = null;
+  let settingsImpactAcknowledged = false;
+  let wizardStep = 1;
   let qrSvg = "";
   let technicalOpen = false;
 
@@ -143,7 +155,7 @@
   $: selectedHost = hosts.find((item) => item.id === selectedHostId);
   $: instanceFormBackend = backendOptions.find((item) => item.kind === instanceForm.backend);
   $: BackendForm = backendForms[instanceForm.backend];
-  $: instanceDevices = devices.filter((item) => item.instance_id === selectedInstanceId);
+  $: instanceClients = clients.filter((item) => item.instance_id === selectedInstanceId);
   $: instanceRecords = records.filter((item) => item.instance_id === selectedInstanceId);
   $: dnsFormInstance = instances.find((item) => item.id === dnsForm.instance_id);
   $: deviceFormInstance = instances.find((item) => item.id === deviceForm.instance_id);
@@ -184,20 +196,25 @@
 
   async function refreshClientAndDnsData() {
     if (!selectedInstanceId) {
-      devices = [];
+      clients = [];
       records = [];
       return;
     }
-    [devices, records] = await Promise.all([
-      call<Device[]>("list_devices", { instanceId: selectedInstanceId }),
+    [clients, records] = await Promise.all([
+      call<Client[]>("list_clients", { instanceId: selectedInstanceId }),
       call<DnsRecord[]>("list_dns_records", { instanceId: selectedInstanceId }),
     ]);
   }
 
   async function refreshBackups() {
     backups = selectedInstanceId
-      ? await call<BackupInfo[]>("list_backups", { instanceId: selectedInstanceId })
+      ? await call<BackupView[]>("list_backup_views", { instanceId: selectedInstanceId })
       : [];
+  }
+
+  async function updateActivityFilter(filter: ActivityFilter) {
+    activityFilter = filter;
+    logs = await call<LogEvent[]>("activity_logs", { filter });
   }
 
   async function selectSection(section: Section) {
@@ -260,7 +277,7 @@
     }
   }
 
-  function setNotice(message: string, health: InstanceHealth | null = null) {
+  function setNotice(message: string, health: InstanceHealthView | null = null) {
     notice = message;
     noticeHealth = health;
   }
@@ -268,6 +285,14 @@
   function clearNotice() {
     notice = "";
     noticeHealth = null;
+  }
+
+  function applyLiveHealth(instanceId: string, health: InstanceHealthView) {
+    instanceSummaries = instanceSummaries.map((summary) =>
+      summary.instance.id === instanceId
+        ? { ...summary, state: health.state, state_evidence: "live_health", observed_at: health.observed_at }
+        : summary,
+    );
   }
 
   function openHost() {
@@ -335,23 +360,9 @@
     inspection = null;
     hostSetupPlan = null;
     const result = await task("Inspecting host", () =>
-      call<HostInspection>("inspect_host", { hostId: host.id }),
+      call<HostInspectionView>("inspect_host_view", { hostId: host.id }),
     );
     if (result) inspection = result;
-  }
-
-  function composeV2Available(value?: string) {
-    const major = value?.trim().replace(/^v/, "").split(".")[0];
-    return Boolean(major && Number.parseInt(major, 10) >= 2);
-  }
-
-  function hostPrerequisitesReady(value: HostInspection) {
-    return (
-      value.operating_system === "Linux" &&
-      value.docker_installed &&
-      value.docker_accessible &&
-      composeV2Available(value.compose_version)
-    );
   }
 
   function hostSetupOperationLabel(operation: HostProvisioningOperation) {
@@ -383,7 +394,7 @@
     if (!hostSetupPlan) return;
     const pendingPlan = hostSetupPlan;
     const result = await task("Applying and verifying host setup", () =>
-      call<HostInspection>("apply_host_provisioning", {
+      call<HostInspectionView>("apply_host_provisioning_view", {
         hostId: pendingPlan.host_id,
         expectedStateHash: pendingPlan.expected_state_hash,
       }),
@@ -419,6 +430,7 @@
     const hostId = selectedHostId || hosts[0]?.id || "";
     const endpointHost = hosts.find((host) => host.id === hostId)?.ssh.hostname || "";
     instanceForm = newInstanceForm(hostId, endpointHost);
+    wizardStep = 1;
     modal = "instance";
   }
 
@@ -431,39 +443,39 @@
     }
   }
 
-  function backendSettingsFromForm(): BackendSettings {
-    switch (instanceForm.backend) {
+  function backendSettingsFromForm(form: InstanceForm = instanceForm): BackendSettings {
+    switch (form.backend) {
       case "wireguard":
         return {
           backend: "wireguard",
-          settings: { userspace_fallback: instanceForm.wireguard_userspace_fallback },
+          settings: { userspace_fallback: form.wireguard_userspace_fallback },
         };
       case "amnezia_wg":
         return {
           backend: "amnezia_wg",
           settings: {
             generation: "awg2",
-            jc: instanceForm.awg_jc,
-            jmin: instanceForm.awg_jmin,
-            jmax: instanceForm.awg_jmax,
-            s1: instanceForm.awg_s1,
-            s2: instanceForm.awg_s2,
-            s3: instanceForm.awg_s3,
-            s4: instanceForm.awg_s4,
-            h1: { min: instanceForm.awg_h1_min, max: instanceForm.awg_h1_max },
-            h2: { min: instanceForm.awg_h2_min, max: instanceForm.awg_h2_max },
-            h3: { min: instanceForm.awg_h3_min, max: instanceForm.awg_h3_max },
-            h4: { min: instanceForm.awg_h4_min, max: instanceForm.awg_h4_max },
+            jc: form.awg_jc,
+            jmin: form.awg_jmin,
+            jmax: form.awg_jmax,
+            s1: form.awg_s1,
+            s2: form.awg_s2,
+            s3: form.awg_s3,
+            s4: form.awg_s4,
+            h1: { min: form.awg_h1_min, max: form.awg_h1_max },
+            h2: { min: form.awg_h2_min, max: form.awg_h2_max },
+            h3: { min: form.awg_h3_min, max: form.awg_h3_max },
+            h4: { min: form.awg_h4_min, max: form.awg_h4_max },
           },
         };
       case "openvpn":
         return {
           backend: "openvpn",
           settings: {
-            transport: instanceForm.openvpn_transport,
-            cipher: instanceForm.openvpn_cipher,
-            tls_protection: instanceForm.openvpn_tls_protection,
-            certificate_lifetime_days: instanceForm.openvpn_certificate_lifetime_days,
+            transport: form.openvpn_transport,
+            cipher: form.openvpn_cipher,
+            tls_protection: form.openvpn_tls_protection,
+            certificate_lifetime_days: form.openvpn_certificate_lifetime_days,
           },
         };
       case "ikev2":
@@ -471,24 +483,128 @@
           backend: "ikev2",
           settings: {
             server_identity:
-              instanceForm.ikev2_server_identity.trim() || instanceForm.endpoint_host.trim(),
-            certificate_lifetime_days: instanceForm.ikev2_certificate_lifetime_days,
+              form.ikev2_server_identity.trim() || form.endpoint_host.trim(),
+            certificate_lifetime_days: form.ikev2_certificate_lifetime_days,
           },
         };
       case "xray":
         return {
           backend: "xray",
           settings: {
-            security: instanceForm.xray_security,
-            transport: instanceForm.xray_transport,
-            server_name: instanceForm.xray_server_name,
-            fingerprint: instanceForm.xray_fingerprint,
-            xhttp_path: instanceForm.xray_xhttp_path,
+            security: form.xray_security,
+            transport: form.xray_transport,
+            server_name: form.xray_server_name,
+            fingerprint: form.xray_fingerprint,
+            xhttp_path: form.xray_xhttp_path,
             reality_public_key: null,
             reality_short_id: null,
           },
         };
     }
+  }
+
+  function editFormFromInstance(instance: VpnInstance) {
+    const form = newInstanceForm(instance.host_id, instance.endpoint.host);
+    Object.assign(form, {
+      display_name: instance.display_name,
+      backend: instance.backend,
+      endpoint_port: instance.endpoint.port,
+      ipv4_subnet: instance.network.ipv4_subnet,
+      dns_zone: instance.dns.zone,
+      routing_mode: instance.routing_mode,
+    });
+    const settings = instance.backend_settings;
+    switch (settings.backend) {
+      case "wireguard": form.wireguard_userspace_fallback = settings.settings.userspace_fallback; break;
+      case "amnezia_wg": Object.assign(form, {
+        awg_jc: settings.settings.jc, awg_jmin: settings.settings.jmin, awg_jmax: settings.settings.jmax,
+        awg_s1: settings.settings.s1, awg_s2: settings.settings.s2, awg_s3: settings.settings.s3, awg_s4: settings.settings.s4,
+        awg_h1_min: settings.settings.h1.min, awg_h1_max: settings.settings.h1.max,
+        awg_h2_min: settings.settings.h2.min, awg_h2_max: settings.settings.h2.max,
+        awg_h3_min: settings.settings.h3.min, awg_h3_max: settings.settings.h3.max,
+        awg_h4_min: settings.settings.h4.min, awg_h4_max: settings.settings.h4.max,
+      }); break;
+      case "openvpn": Object.assign(form, {
+        openvpn_transport: settings.settings.transport,
+        openvpn_cipher: settings.settings.cipher,
+        openvpn_tls_protection: settings.settings.tls_protection,
+        openvpn_certificate_lifetime_days: settings.settings.certificate_lifetime_days,
+      }); break;
+      case "ikev2": Object.assign(form, {
+        ikev2_server_identity: settings.settings.server_identity,
+        ikev2_certificate_lifetime_days: settings.settings.certificate_lifetime_days,
+      }); break;
+      case "xray": Object.assign(form, {
+        xray_security: settings.settings.security,
+        xray_transport: settings.settings.transport,
+        xray_server_name: settings.settings.server_name,
+        xray_fingerprint: settings.settings.fingerprint,
+        xray_xhttp_path: settings.settings.xhttp_path,
+      }); break;
+    }
+    return form;
+  }
+
+  function settingsUpdateInput() {
+    if (!settingsDetail || !settingsForm) return null;
+    if (Boolean(settingsForm.xray_certificate_path) !== Boolean(settingsForm.xray_private_key_path)) {
+      error = { code: "validation", message: "Choose both Xray TLS files, or leave both blank to retain existing material.", remote_state_changed: false };
+      return null;
+    }
+    const backendSettings = backendSettingsFromForm(settingsForm);
+    return {
+      id: settingsDetail.summary.instance.id,
+      display_name: settingsForm.display_name,
+      endpoint_host: settingsForm.endpoint_host,
+      endpoint_port: settingsForm.endpoint_port,
+      ipv4_subnet: settingsForm.ipv4_subnet,
+      dns_zone: settingsForm.dns_zone,
+      routing_mode: settingsForm.routing_mode,
+      persistent_keepalive: settingsDetail.summary.instance.persistent_keepalive,
+      backend_settings: backendSettings,
+      expected_current_state_hash: settingsDetail.current_state_hash,
+      xray_tls_import:
+        settingsForm.backend === "xray" && settingsForm.xray_security === "tls" && settingsForm.xray_certificate_path && settingsForm.xray_private_key_path
+          ? { certificate_path: settingsForm.xray_certificate_path, private_key_path: settingsForm.xray_private_key_path }
+          : null,
+    };
+  }
+
+  async function openInstanceSettings() {
+    if (!selectedInstanceId) return;
+    const detail = await task("Loading instance settings", () =>
+      call<InstanceDetail>("instance_detail", { instanceId: selectedInstanceId }),
+    );
+    if (!detail) return;
+    settingsDetail = detail;
+    settingsForm = editFormFromInstance(detail.summary.instance);
+    settingsPreview = null;
+    settingsImpactAcknowledged = false;
+    modal = "settings";
+  }
+
+  async function previewSettingsUpdate() {
+    const input = settingsUpdateInput();
+    if (!input) return;
+    settingsPreview = await task("Previewing settings impact", () =>
+      call<InstanceUpdatePreview>("preview_instance_update", { input }),
+    ) ?? null;
+    settingsImpactAcknowledged = false;
+  }
+
+  async function saveSettingsUpdate() {
+    const input = settingsUpdateInput();
+    if (!input || !settingsPreview) return;
+    const disruptive = settingsPreview.impact !== "no_changes" && settingsPreview.impact !== "live_reload";
+    if (disruptive && !settingsImpactAcknowledged) return;
+    const result = await task("Saving desired settings", () => call<VpnInstance>("update_instance", { input }));
+    if (!result) return;
+    modal = null;
+    settingsDetail = null;
+    settingsForm = null;
+    settingsPreview = null;
+    await refresh();
+    notice = "Desired settings saved locally. Review the deployment before applying remote changes.";
   }
 
   async function saveInstance() {
@@ -526,7 +642,7 @@
   async function reviewPlan(instance: VpnInstance) {
     selectedInstanceId = instance.id;
     const result = await task("Calculating deployment plan", () =>
-      call<DeploymentPlan>("plan_instance", { instanceId: instance.id }),
+      call<DeploymentPreview>("plan_instance_preview", { instanceId: instance.id }),
     );
     if (!result) return;
     plan = result;
@@ -539,44 +655,35 @@
     modal = null;
     plan = null;
     const result = await task("Applying and verifying deployment", () =>
-      call<DeploymentResult>("apply_instance", {
+      call<DeploymentResultView>("apply_instance_view", {
         instanceId: pendingPlan.instance_id,
         expectedStateHash: pendingPlan.desired_state_hash,
       }),
     );
     if (!result) return;
-    setNotice(`Deployment ${result.status}. ${healthSummary(result.health)}`, result.health);
     await refresh();
+    applyLiveHealth(pendingPlan.instance_id, result.health);
+    setNotice(`Deployment ${result.status}. ${healthSummary(result.health)}`, result.health);
   }
 
   async function instanceAction(command: "start_instance" | "stop_instance" | "health", instance: VpnInstance) {
+    const viewCommand = {
+      start_instance: "start_instance_view",
+      stop_instance: "stop_instance_view",
+      health: "health_view",
+    }[command];
     const result = await task(command.replace("_", " "), () =>
-      call<InstanceHealth>(command, { instanceId: instance.id }),
+      call<InstanceHealthView>(viewCommand, { instanceId: instance.id }),
     );
     if (result) {
+      applyLiveHealth(instance.id, result);
       setNotice(healthSummary(result), result);
     }
   }
 
-  function healthSummary(health: InstanceHealth) {
-    const checks = healthChecks(health);
-    const healthy = checks.filter((check) => check.passing).length;
-    return `${healthy}/${checks.length} required health checks passing.`;
-  }
-
-  function healthChecks(health: InstanceHealth) {
-    const checks = healthCheckLabels.map(([key, label]) => ({
-      label,
-      passing: Boolean(health[key]),
-    }));
-    if (health.dns_required) {
-      checks.push(
-        { label: "DNS container running", passing: health.dns_running },
-        { label: "Private DNS resolves", passing: health.private_dns_resolves },
-        { label: "Public DNS resolves", passing: health.public_dns_resolves },
-      );
-    }
-    return checks;
+  function healthSummary(health: InstanceHealthView) {
+    const passing = health.checks.filter((check) => check.passing).length;
+    return `${health.state.replace("_", " ")}: ${passing}/${health.checks.length} checks passing.`;
   }
 
   async function removeInstance(instance: VpnInstance) {
@@ -620,8 +727,8 @@
       };
       return;
     }
-    const created = await task("Generating device identity", () =>
-      call<Device>("create_device", {
+    const created = await task("Generating client identity", () =>
+      call<unknown>("create_device", {
         input: {
           ...deviceForm,
           user_id: null,
@@ -631,17 +738,18 @@
     );
     if (!created) return;
     modal = null;
-    selectedInstanceId = created.instance_id;
+    selectedInstanceId = deviceForm.instance_id;
     await refreshClientAndDnsData();
+    const backend = deviceFormInstance?.backend;
     notice =
-      created.backend === "xray"
+      backend === "xray"
         ? "Xray client UUID created locally. Review and deploy the instance before export."
-        : created.backend === "openvpn" || created.backend === "ikev2"
+        : backend === "openvpn" || backend === "ikev2"
           ? "Client key generated locally and certificate issued through the verified SSH authority."
-          : "Device keys were generated locally and saved in the native credential store.";
+          : "Client keys were generated locally and saved in the native credential store.";
   }
 
-  async function toggleDevice(device: Device) {
+  async function toggleDevice(device: Client) {
     const input: UpdateDeviceInput = {
       id: device.id,
       user_id: device.user_id ?? null,
@@ -649,52 +757,46 @@
       dns_name: device.dns_name ?? null,
       enabled: !device.enabled,
     };
-    const result = await task("Updating device", () =>
-      call<Device>("update_device", { input }),
+    const result = await task("Updating client", () =>
+      call<unknown>("update_device", { input }),
     );
     if (result) await refreshClientAndDnsData();
   }
 
-  async function replaceDeviceIdentity(device: Device) {
-    const accepted = await confirm(
-      `Replace the cryptographic identity for "${device.display_name}"? Its previous configuration will stop working after deployment.`,
-      { title: "Replace device identity", kind: "warning" },
-    );
-    if (!accepted) return;
-    const result = await task("Replacing device identity", () =>
-      call<Device>("replace_device_identity", { deviceId: device.id }),
+  async function replaceDeviceIdentity(device: Client) {
+    const result = await task("Replacing client identity", () =>
+      call<unknown>("replace_device_identity", { deviceId: device.id }),
     );
     if (!result) return;
     await refreshClientAndDnsData();
     notice = "A new client identity was created in the native credential store. Review and deploy before exporting it.";
   }
 
-  async function removeDevice(device: Device) {
-    const accepted = await confirm(
-      `Remove "${device.display_name}" and its managed DNS record? Its address remains reserved by retained deployment snapshots.`,
-      { title: "Remove device", kind: "warning" },
-    );
-    if (!accepted) return;
-    const result = await task("Removing device", () =>
+  async function removeDevice(device: Client) {
+    const result = await task("Removing client", () =>
       call<void>("delete_device", { deviceId: device.id }),
     );
     if (result === undefined && error) return;
     await refreshClientAndDnsData();
     notice =
       device.backend === "openvpn" || device.backend === "ikev2"
-        ? "Client certificate revoked and device removed."
+        ? "Client certificate revoked and client removed."
         : "Client removed locally. Review and deploy the instance to revoke its identity.";
   }
 
-  async function exportDevice(device: Device) {
-    const exportInfo =
-      device.backend === "openvpn"
-        ? { suffix: "ovpn", filterExtension: "ovpn", name: "OpenVPN profile" }
-        : device.backend === "ikev2"
-          ? { suffix: "p12", filterExtension: "p12", name: "Protected PKCS#12 credential" }
-          : device.backend === "xray"
-            ? { suffix: "vless.txt", filterExtension: "txt", name: "VLESS URI" }
-            : { suffix: "conf", filterExtension: "conf", name: `${backendDisplayName(device.backend)} configuration` };
+  async function exportDevice(device: Client) {
+    const format = device.export_formats[0];
+    const exportInfo = {
+      wire_guard_configuration: { suffix: "conf", filterExtension: "conf", name: "WireGuard configuration" },
+      amnezia_wg_configuration: { suffix: "conf", filterExtension: "conf", name: "AWG configuration" },
+      open_vpn_profile: { suffix: "ovpn", filterExtension: "ovpn", name: "OpenVPN profile" },
+      protected_pkcs12: { suffix: "p12", filterExtension: "p12", name: "Protected PKCS#12 credential" },
+      vless_uri: { suffix: "vless.txt", filterExtension: "txt", name: "VLESS URI" },
+    }[format];
+    if (!exportInfo) {
+      error = { code: "unsupported_export", message: "This client has no implemented export format.", remote_state_changed: false };
+      return;
+    }
     const destination = await save({
       title: `Export ${exportInfo.name}`,
       defaultPath: `${device.display_name.toLowerCase().replaceAll(/[^a-z0-9]+/g, "-")}.${exportInfo.suffix}`,
@@ -710,7 +812,7 @@
     if (result) notice = `Configuration exported to ${result} with mode 0600.`;
   }
 
-  async function showQr(device: Device) {
+  async function showQr(device: Client) {
     selectedDeviceId = device.id;
     const result = await task("Generating QR code", () =>
       call<string>("client_qr_svg", { deviceId: device.id }),
@@ -720,8 +822,45 @@
     modal = "qr";
   }
 
+  async function handleClientAction(client: Client, action: ClientActionView) {
+    if (action.warning) {
+      const accepted = await confirm(action.warning, {
+        title: `${action.label}: ${client.display_name}`,
+        kind: action.destructive ? "warning" : "info",
+      });
+      if (!accepted) return;
+    }
+    switch (action.action) {
+      case "enable":
+      case "disable":
+      case "revoke":
+        await toggleDevice(client);
+        break;
+      case "rotate_identity":
+      case "replace_identity":
+        await replaceDeviceIdentity(client);
+        break;
+      case "export":
+        await exportDevice(client);
+        break;
+      case "qr_export":
+        await showQr(client);
+        break;
+      case "remove":
+        await removeDevice(client);
+        break;
+      case "inspect_statistics":
+        notice = "Statistics are not available until the backend returns observed client data.";
+        break;
+    }
+  }
+
   function backendDisplayName(kind: VpnBackendKind) {
     return backendOptions.find((option) => option.kind === kind)?.display_name ?? kind;
+  }
+
+  function backendOption(kind: VpnBackendKind) {
+    return backendOptions.find((option) => option.kind === kind);
   }
 
   function openDns() {
@@ -872,34 +1011,51 @@
   async function refreshRemoteCredentials() {
     if (!selectedInstanceId) return;
     const result = await task("Refreshing remote credential store", () =>
-      call<InstanceHealth>("refresh_remote_credentials", { instanceId: selectedInstanceId }),
+      call<InstanceHealthView>("refresh_remote_credentials_view", { instanceId: selectedInstanceId }),
     );
     if (!result) return;
+    applyLiveHealth(selectedInstanceId, result);
     setNotice(`Credential store refreshed. ${healthSummary(result)}`, result);
   }
 
   async function refreshRemoteDnsStore() {
     if (!selectedInstanceId) return;
     const result = await task("Refreshing remote DNS store", () =>
-      call<InstanceHealth>("refresh_remote_dns_store", { instanceId: selectedInstanceId }),
+      call<InstanceHealthView>("refresh_remote_dns_store_view", { instanceId: selectedInstanceId }),
     );
     if (!result) return;
+    applyLiveHealth(selectedInstanceId, result);
     setNotice(`DNS store refreshed. ${healthSummary(result)}`, result);
   }
 
-  async function rollbackBackup(backup: BackupInfo) {
-    if (!backup.deployment_id) return;
-    const accepted = await confirm(
-      `Re-render and apply deployment ${backup.deployment_id} with a fresh DNS serial?`,
-      { title: "Rollback instance", kind: "warning" },
+  async function reviewBackupRestore(backup: BackupView) {
+    const preview = await task("Reviewing backup restore", () =>
+      call<BackupRestorePreview>("preview_backup_restore", {
+        instanceId: backup.instance_id,
+        backupName: backup.name,
+      }),
     );
-    if (!accepted) return;
-    const result = await task("Rolling back deployment", () =>
-      call<{ status: string }>("rollback", { deploymentId: backup.deployment_id }),
+    if (!preview) return;
+    restorePreview = preview;
+    modal = "restore";
+  }
+
+  async function applyBackupRestore() {
+    if (!restorePreview) return;
+    const pending = restorePreview;
+    modal = null;
+    restorePreview = null;
+    const health = await task("Restoring and verifying backup", () =>
+      call<InstanceHealthView>("restore_backup_by_name", {
+        instanceId: pending.instance_id,
+        backupName: pending.backup_name,
+        expectedStateHash: pending.expected_state_hash,
+      }),
     );
-    if (!result) return;
-    await refresh();
-    notice = `Rollback ${result.status}.`;
+    if (!health) return;
+    await refreshBackups();
+    applyLiveHealth(pending.instance_id, health);
+    setNotice(`Backup ${pending.backup_name} restored and verified.`, health);
   }
 </script>
 
@@ -929,7 +1085,7 @@
         summary={selectedSummary}
         options={backendOptions}
         tab={workspaceTab}
-        {devices}
+        devices={clients}
         {records}
         {hostlists}
         {backups}
@@ -939,13 +1095,10 @@
         onhealth={() => instanceAction("health", selectedSummary.instance)}
         onplan={() => reviewPlan(selectedSummary.instance)}
         onaddclient={openDevice}
-        onexportclient={exportDevice}
-        ontoggleclient={toggleDevice}
-        onreplaceclient={replaceDeviceIdentity}
-        onqrclient={showQr}
-        onremoveclient={removeDevice}
+        onclientaction={handleClientAction}
         onbackup={() => backupInstance(selectedSummary.instance)}
-        onrestore={rollbackBackup}
+        onrestore={reviewBackupRestore}
+        oneditsettings={openInstanceSettings}
       />
       <footer>{appInfo.name} {appInfo.version} · Local-first management over verified SSH</footer>
     {:else}
@@ -979,7 +1132,7 @@
             <details class="check-log">
               <summary>Checks</summary>
               <div class="check-log-list">
-                {#each healthChecks(noticeHealth) as check}
+                {#each noticeHealth.checks as check}
                   <div class:pass={check.passing} class:fail={!check.passing}>
                     <b>{check.passing ? "Pass" : "Fail"}</b><span>{check.label}</span>
                   </div>
@@ -1054,22 +1207,14 @@
       </section>
       {#if inspection && selectedHost}
         <section class="panel compact">
-          <div class="panel-head"><h3>{selectedHost.display_name} inspection</h3><span>{inspection.operating_system} · {inspection.architecture}</span></div>
-          <div class="checks">
-            <div class:pass={inspection.docker_installed}><b>Docker Engine</b><span>{inspection.docker_version || (inspection.docker_installed ? "Installed; daemon unavailable" : "Not found")}</span></div>
-            <div class:pass={inspection.docker_accessible}><b>Direct Docker access</b><span>{inspection.docker_accessible ? "Available" : inspection.docker_privileged_accessible ? "Privilege works; user access blocked" : "Daemon unavailable"}</span></div>
-            <div class:pass={composeV2Available(inspection.compose_version)}><b>Compose v2</b><span>{inspection.compose_version || "Not found"}</span></div>
-            <div class:pass={Boolean(inspection.package_manager) || hostPrerequisitesReady(inspection)}><b>Package manager</b><span>{inspection.package_manager?.toUpperCase() || (hostPrerequisitesReady(inspection) ? "Not needed" : "Unsupported")}</span></div>
-            <div class:pass={inspection.wireguard_kernel_available}><b>WireGuard</b><span>{inspection.wireguard_kernel_available ? "Available" : "Userspace fallback via container"}</span></div>
-            <div class:pass={inspection.effective_user_is_root || inspection.sudo_bootstrap_available}><b>Setup authority</b><span>{inspection.effective_user_is_root ? "Root session" : inspection.sudo_bootstrap_available ? "sudo -n available" : "Manual setup required"}</span></div>
-            <div class:pass={inspection.application_root_writable || inspection.sudo_bootstrap_available}><b>/opt bootstrap</b><span>{inspection.application_root_writable ? "Writable" : inspection.sudo_bootstrap_available ? "sudo -n available" : "Blocked"}</span></div>
-          </div>
-          {#if inspection.warnings.length}
+          <div class="panel-head"><h3>{selectedHost.display_name} readiness</h3><span>{inspection.inspection.operating_system} · {inspection.inspection.architecture}</span></div>
+          <HostReadinessMatrix view={inspection} />
+          {#if inspection.inspection.warnings.length}
             <div class="warning-list">
-              {#each inspection.warnings as warning}<div class="warning">{warning}</div>{/each}
+              {#each inspection.inspection.warnings as warning}<div class="warning">{warning}</div>{/each}
             </div>
           {/if}
-          {#if !hostPrerequisitesReady(inspection)}
+          {#if !inspection.docker_ready}
             <div class="host-setup-cta">
               <div><strong>Prerequisites need attention</strong><span>Review the exact package, service, and access changes before anything is installed.</span></div>
               <button class="primary" onclick={() => reviewHostSetup(selectedHost)}>Review setup</button>
@@ -1095,12 +1240,7 @@
                 </button>
                 <StateBadge state={summary.state} />
                 <button class="primary small" onclick={() => manageInstance(summary.instance.id)}>Manage</button>
-                <button class="secondary" onclick={() => instanceAction("start_instance", summary.instance)}>Start</button>
-                <button class="secondary" onclick={() => instanceAction("stop_instance", summary.instance)}>Stop</button>
-                <button class="secondary" onclick={() => instanceAction("health", summary.instance)}>Health</button>
-                <button class="secondary" title="Preview deployment changes before applying them" onclick={() => reviewPlan(summary.instance)}>Preview deploy</button>
-                <button class="secondary" title="Back up this instance, including its credential and DNS stores" onclick={() => backupInstance(summary.instance)}>Backup</button>
-                <button class="menu danger" title="Delete" onclick={() => removeInstance(summary.instance)}>Delete</button>
+                <InstanceActions instance={summary.instance} onstart={(instance) => instanceAction("start_instance", instance)} onstop={(instance) => instanceAction("stop_instance", instance)} onhealth={(instance) => instanceAction("health", instance)} onplan={reviewPlan} onbackup={backupInstance} ondelete={removeInstance} />
               </article>
             {/each}
           </div>
@@ -1113,8 +1253,8 @@
         <InstanceSelector {instances} value={selectedInstanceId} onchange={selectedInstanceChanged} />
       </div>
       <section class="panel">
-        <div class="panel-head"><h3>Client identities</h3><span>{instanceDevices.length} for selected instance</span></div>
-        <ClientsContent clients={instanceDevices} {backendOptions} ontoggle={toggleDevice} onreplace={replaceDeviceIdentity} onqr={showQr} onexport={exportDevice} onremove={removeDevice} />
+        <div class="panel-head"><h3>Client identities</h3><span>{instanceClients.length} for selected instance</span></div>
+        <ClientsContent clients={instanceClients} onaction={handleClientAction} />
       </section>
     {:else if active === "DNS"}
       <div class="toolbar">
@@ -1176,11 +1316,12 @@
       </div>
       <section class="panel">
         <div class="panel-head"><h3>Deployment backups</h3><span>10 retained per instance</span></div>
-        <BackupsContent {backups} onrestore={rollbackBackup} />
+        <BackupsContent {backups} onrestore={reviewBackupRestore} />
       </section>
     {:else}
       <section class="panel">
         <div class="panel-head"><h3>Operational history</h3><span>Secrets redacted · {logs.length} events</span></div>
+        <LogFilters value={activityFilter} {hosts} {instances} onchange={updateActivityFilter} />
         <LogsContent events={logs} />
       </section>
     {/if}
@@ -1221,30 +1362,25 @@
         {#if probe.state === "changed"}<label class="checkbox critical-text"><input type="checkbox" bind:checked={replaceChangedKey} /> I separately verified and intend to replace the approved key.</label>{/if}
         <div class="modal-actions"><button class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary" onclick={approveKey} disabled={fingerprintConfirmation !== probe.key.sha256_fingerprint || (probe.state === "changed" && !replaceChangedKey)}>Approve key</button></div>
       {:else if modal === "instance"}
-        <div class="modal-head"><div><p class="eyebrow">DESIRED STATE</p><h2>Create VPN instance</h2></div><button onclick={() => (modal = null)}>×</button></div>
-        <form onsubmit={(event) => { event.preventDefault(); saveInstance(); }}>
-          <label>Display name<input bind:value={instanceForm.display_name} required placeholder="Home VPN" /></label>
-          <label>Docker host<select bind:value={instanceForm.host_id} required>{#each hosts as host}<option value={host.id}>{host.display_name}</option>{/each}</select></label>
-          <label>Protocol
-            <select value={instanceForm.backend} onchange={(event) => backendChanged((event.currentTarget as HTMLSelectElement).value as VpnBackendKind)}>
-              {#each backendOptions as option}<option value={option.kind}>{option.display_name}</option>{/each}
-            </select>
-          </label>
-          <div class="form-grid">
-            <label>Public endpoint<input bind:value={instanceForm.endpoint_host} required placeholder="vpn.example.com" /></label>
-            <label>{instanceForm.backend === "openvpn" ? instanceForm.openvpn_transport.toUpperCase() : instanceForm.backend === "xray" && instanceForm.xray_transport === "mkcp" ? "UDP" : instanceForm.backend === "xray" ? "TCP" : "UDP"} port
-              <input type="number" bind:value={instanceForm.endpoint_port} min="1" max="65535" disabled={instanceForm.backend === "ikev2"} required />
-            </label>
-          </div>
-          {#if instanceFormBackend?.capabilities.allocated_tunnel_addresses}
-            <div class="form-grid"><label>Private IPv4 subnet<input bind:value={instanceForm.ipv4_subnet} required /></label><label>Private DNS zone<input bind:value={instanceForm.dns_zone} required /></label></div>
-            <label>Default routing<select bind:value={instanceForm.routing_mode}><option value="split_tunnel">Split tunnel</option><option value="full_tunnel">Full tunnel (IPv4)</option></select></label>
+        <div class="modal-head"><div><p class="eyebrow">STEP {wizardStep} OF 5</p><h2>Create VPN instance</h2></div><button onclick={() => (modal = null)}>×</button></div>
+        <div class="wizard-steps" aria-label="Creation progress"><span class:active={wizardStep >= 1}>Host</span><span class:active={wizardStep >= 2}>Type</span><span class:active={wizardStep >= 3}>Basics</span><span class:active={wizardStep >= 4}>Backend</span><span class:active={wizardStep >= 5}>Review</span></div>
+        <form onsubmit={(event) => { event.preventDefault(); if (wizardStep < 5) wizardStep += 1; else saveInstance(); }}>
+          {#if wizardStep === 1}
+            <label>Docker host<select bind:value={instanceForm.host_id} required>{#each hosts as host}<option value={host.id}>{host.display_name}</option>{/each}</select></label>
+            {#if inspection && selectedHostId === instanceForm.host_id}<HostReadinessMatrix view={inspection} />{:else}<div class="empty small-empty"><h3>Readiness not cached</h3><p>Finish or cancel this wizard, then use Inspect on the Hosts screen. Opening the wizard never probes SSH automatically.</p></div>{/if}
+          {:else if wizardStep === 2}
+            <div class="backend-cards">{#each backendOptions as option}<button type="button" class:selected={instanceForm.backend === option.kind} onclick={() => backendChanged(option.kind)}><BackendBadge backend={option.kind} options={backendOptions} /><span>{option.presentation.description}</span></button>{/each}</div>
+          {:else if wizardStep === 3}
+            <label>Display name<input bind:value={instanceForm.display_name} required placeholder="Home VPN" /></label>
+            <div class="form-grid"><label>Public endpoint<input bind:value={instanceForm.endpoint_host} required placeholder="vpn.example.com" /></label><label>Listener port<input type="number" bind:value={instanceForm.endpoint_port} min="1" max="65535" disabled={instanceForm.backend === "ikev2"} required /></label></div>
+            {#if instanceFormBackend?.presentation.client_addresses === "allocated"}<div class="form-grid"><label>Private IPv4 subnet<input bind:value={instanceForm.ipv4_subnet} required /></label><label>Private DNS zone<input bind:value={instanceForm.dns_zone} required /></label></div><label>Default routing<select bind:value={instanceForm.routing_mode}><option value="split_tunnel">Split tunnel</option><option value="full_tunnel">Full tunnel (IPv4)</option></select></label>{/if}
+          {:else if wizardStep === 4}
+            <BackendForm bind:form={instanceForm} />
+          {:else}
+            <div class="review-facts"><div><span>Host</span><strong>{hosts.find((host) => host.id === instanceForm.host_id)?.display_name}</strong></div><div><span>Backend</span><strong>{instanceFormBackend?.display_name}</strong></div><div><span>Endpoint</span><strong>{instanceForm.endpoint_host}:{instanceForm.endpoint_port}</strong></div>{#if instanceFormBackend?.presentation.client_addresses === "allocated"}<div><span>Network</span><strong>{instanceForm.ipv4_subnet}</strong></div><div><span>DNS</span><strong>{instanceForm.dns_zone}</strong></div>{/if}</div>
+            <p class="help">Create saves local desired state only. After creation, review the typed deployment impact before changing the host.</p>
           {/if}
-
-          <BackendForm bind:form={instanceForm} />
-
-          <p class="help">{instanceForm.backend === "xray" ? "Xray creates VLESS proxy identities without tunnel addresses or managed private DNS." : "The gateway receives the first usable address. IPv6 is not advertised until an IPv6 tunnel address exists."}</p>
-          <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary">Create instance</button></div>
+          <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button>{#if wizardStep > 1}<button type="button" class="secondary" onclick={() => (wizardStep -= 1)}>Back</button>{/if}<button class="primary">{wizardStep === 5 ? "Create" : "Continue"}</button></div>
         </form>
       {:else if modal === "device"}
         <div class="modal-head"><div><p class="eyebrow">CLIENT IDENTITY</p><h2>Add client</h2></div><button onclick={() => (modal = null)}>×</button></div>
@@ -1295,7 +1431,7 @@
         <p class="help">This preview is bound to the current verified inspection. Apply will re-inspect first and stop if the host state or plan has changed.</p>
         <div class="setup-facts">
           <div><span>Package manager</span><strong>{hostSetupPlan.package_manager?.toUpperCase() || "Not required"}</strong></div>
-          <div><span>Authority</span><strong>{inspection?.effective_user_is_root ? "Root session" : inspection?.sudo_bootstrap_available ? "Noninteractive sudo" : "Unavailable"}</strong></div>
+          <div><span>Authority</span><strong>{inspection?.inspection.effective_user_is_root ? "Root session" : inspection?.inspection.sudo_bootstrap_available ? "Noninteractive sudo" : "Unavailable"}</strong></div>
         </div>
         {#if hostSetupPlan.operations.length}
           <ol class="operations">
@@ -1310,12 +1446,38 @@
       {:else if modal === "plan" && plan}
         <div class="modal-head"><div><p class="eyebrow">DEPLOYMENT PREVIEW</p><h2>Preview remote changes</h2></div><button onclick={() => (modal = null)}>×</button></div>
         <p class="help">This preview shows what Apply will change on the verified SSH host. Nothing is changed until you apply it.</p>
+        <DeploymentImpactPanel preview={plan} />
         {#if plan.operations.length}
-          <ol class="operations">{#each plan.operations as operation}<li><code>{JSON.stringify(operation)}</code></li>{/each}</ol>
+          <ol class="operations">{#each plan.operations as operation}<li>{operation.label}{#if operation.technical_detail}<details><summary>Technical detail</summary><code>{operation.technical_detail}</code></details>{/if}</li>{/each}</ol>
         {:else}<div class="empty small-empty"><h3>No changes</h3><p>Remote hashes match desired state.</p></div>{/if}
         {#each plan.warnings as warning}<div class="warning">{warning}</div>{/each}
         <div class="hash">Desired state <code>{plan.desired_state_hash}</code></div>
         <div class="modal-actions"><button class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary" onclick={applyPlan} disabled={!plan.operations.length}>Apply these changes</button></div>
+      {:else if modal === "settings" && settingsForm && settingsDetail}
+        {@const SettingsBackendForm = backendForms[settingsForm.backend]}
+        {@const settingsDescriptor = backendOption(settingsForm.backend)}
+        <div class="modal-head"><div><p class="eyebrow">LOCAL DESIRED STATE</p><h2>Edit {settingsDetail.summary.instance.display_name}</h2></div><button onclick={() => (modal = null)}>×</button></div>
+        <form onsubmit={(event) => { event.preventDefault(); previewSettingsUpdate(); }}>
+          <div class="form-grid equal"><label>Backend<input value={settingsDescriptor?.display_name ?? settingsForm.backend} readonly /></label><label>Host<input value={settingsDetail.host_display_name} readonly /></label></div>
+          <label>Display name<input bind:value={settingsForm.display_name} required /></label>
+          <div class="form-grid"><label>Public endpoint<input bind:value={settingsForm.endpoint_host} required /></label><label>Listener port<input type="number" bind:value={settingsForm.endpoint_port} min="1" max="65535" required /></label></div>
+          {#if settingsDescriptor?.presentation.client_addresses === "allocated"}<div class="form-grid equal"><label>Private IPv4 subnet<input bind:value={settingsForm.ipv4_subnet} required /></label><label>DNS zone<input bind:value={settingsForm.dns_zone} required /></label></div><label>Routing<select bind:value={settingsForm.routing_mode}><option value="split_tunnel">Split tunnel</option><option value="full_tunnel">Full tunnel</option></select></label>{/if}
+          <SettingsBackendForm form={settingsForm} />
+          {#if settingsPreview}
+            <div class:critical={settingsPreview.impact === "reinstall"} class="impact-panel"><div class="impact-title"><span>Expected impact</span><strong>{settingsPreview.impact.replaceAll("_", " ")}</strong></div><p>{settingsPreview.server_identity_effect}</p><p>{settingsPreview.client_effect}</p>{#each settingsPreview.warnings as warning}<div class="warning">{warning}</div>{/each}</div>
+            {#if settingsPreview.impact !== "no_changes" && settingsPreview.impact !== "live_reload"}<label class="checkbox critical-text"><input type="checkbox" bind:checked={settingsImpactAcknowledged} /> I reviewed and acknowledge this disruptive deployment impact.</label>{/if}
+          {/if}
+          <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button><button type="submit" class="secondary">Preview impact</button><button type="button" class="primary" onclick={saveSettingsUpdate} disabled={!settingsPreview || (settingsPreview.impact !== "no_changes" && settingsPreview.impact !== "live_reload" && !settingsImpactAcknowledged)}>Save desired settings</button></div>
+        </form>
+      {:else if modal === "restore" && restorePreview}
+        <div class="modal-head"><div><p class="eyebrow">RESTORE PREVIEW</p><h2>Restore {restorePreview.backup_name}</h2></div><button onclick={() => { modal = null; restorePreview = null; }}>×</button></div>
+        <div class="warning">{restorePreview.identity_impact}</div>
+        <div class="setup-facts">
+          <div><span>Affected clients</span><strong>{restorePreview.affected_clients}</strong></div>
+          <div><span>Safety backup</span><strong>{restorePreview.creates_safety_backup ? "Created before restore" : "Not available"}</strong></div>
+        </div>
+        <p class="help">The selected backup name is validated exactly. Health is checked after restore; a failed target automatically recovers from the new pre-restore snapshot.</p>
+        <div class="modal-actions"><button class="secondary" onclick={() => { modal = null; restorePreview = null; }}>Cancel</button><button class="primary danger-action" onclick={applyBackupRestore}>Restore this backup</button></div>
       {:else if modal === "qr"}
         <div class="modal-head"><div><p class="eyebrow">PRIVATE CONFIGURATION</p><h2>{selectedInstance ? backendDisplayName(selectedInstance.backend) : "Client"} QR code</h2></div><button onclick={() => { modal = null; qrSvg = ""; }}>×</button></div>
         <div class="qr">{@html qrSvg}</div>

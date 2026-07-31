@@ -1,0 +1,5 @@
+<script lang="ts">
+  import type { VpnInstance } from "../types";
+  let { instance, onstart, onstop, onhealth, onplan, onbackup, ondelete }: { instance: VpnInstance; onstart: (instance: VpnInstance) => void; onstop: (instance: VpnInstance) => void; onhealth: (instance: VpnInstance) => void; onplan: (instance: VpnInstance) => void; onbackup: (instance: VpnInstance) => void; ondelete: (instance: VpnInstance) => void } = $props();
+</script>
+<details class="overflow-menu"><summary aria-label={`More actions for ${instance.display_name}`}>More</summary><div role="menu"><button role="menuitem" type="button" onclick={() => onstart(instance)}>Start</button><button role="menuitem" type="button" onclick={() => onstop(instance)}>Stop</button><button role="menuitem" type="button" onclick={() => onhealth(instance)}>Refresh health</button><button role="menuitem" type="button" onclick={() => onplan(instance)}>Preview deployment</button><button role="menuitem" type="button" onclick={() => onbackup(instance)}>Create backup</button><hr /><button role="menuitem" class="danger" type="button" onclick={() => ondelete(instance)}>Delete instance</button></div></details>

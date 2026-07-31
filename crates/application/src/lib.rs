@@ -601,6 +601,16 @@ pub struct DeploymentPreviewView {
     pub desired_state_hash: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeploymentResultView {
+    pub deployment_id: Uuid,
+    pub status: DeploymentStatus,
+    pub remote_state_changed: bool,
+    pub rollback_succeeded: Option<bool>,
+    pub backup_name: Option<String>,
+    pub health: InstanceHealthView,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum BackendReadinessStatus {
@@ -1415,28 +1425,7 @@ fi
 
     pub async fn inspect_host_view(&self, host_id: Uuid) -> Result<HostInspectionView, AppError> {
         let inspection = self.inspect_host(host_id).await?;
-        let docker_ready = host_deployment_prerequisites_ready(&inspection);
-        let backend_readiness = [
-            VpnBackendKind::WireGuard,
-            VpnBackendKind::AmneziaWg,
-            VpnBackendKind::OpenVpn,
-            VpnBackendKind::Ikev2,
-            VpnBackendKind::Xray,
-        ]
-        .into_iter()
-        .filter_map(|backend| {
-            self.backends
-                .presentation(backend)
-                .map(|presentation| evaluate_backend_readiness(backend, &presentation, &inspection))
-        })
-        .collect();
-        let view = HostInspectionView {
-            inspection,
-            ssh_trust: "trusted".into(),
-            connectivity: "reachable".into(),
-            docker_ready,
-            backend_readiness,
-        };
+        let view = self.host_inspection_view(inspection);
         self.storage
             .record_activity(&ActivityRecord {
                 id: Uuid::new_v4(),
@@ -1455,6 +1444,31 @@ fi
             .await
             .map_err(storage_error)?;
         Ok(view)
+    }
+
+    fn host_inspection_view(&self, inspection: HostInspection) -> HostInspectionView {
+        let docker_ready = host_deployment_prerequisites_ready(&inspection);
+        let backend_readiness = [
+            VpnBackendKind::WireGuard,
+            VpnBackendKind::AmneziaWg,
+            VpnBackendKind::OpenVpn,
+            VpnBackendKind::Ikev2,
+            VpnBackendKind::Xray,
+        ]
+        .into_iter()
+        .filter_map(|backend| {
+            self.backends
+                .presentation(backend)
+                .map(|presentation| evaluate_backend_readiness(backend, &presentation, &inspection))
+        })
+        .collect();
+        HostInspectionView {
+            inspection,
+            ssh_trust: "trusted".into(),
+            connectivity: "reachable".into(),
+            docker_ready,
+            backend_readiness,
+        }
     }
 
     pub async fn plan_host_provisioning(
@@ -1526,6 +1540,17 @@ fi
             });
         }
         Ok(inspection)
+    }
+
+    pub async fn apply_host_provisioning_view(
+        &self,
+        host_id: Uuid,
+        expected_state_hash: &str,
+    ) -> Result<HostInspectionView, AppError> {
+        let inspection = self
+            .apply_host_provisioning(host_id, expected_state_hash)
+            .await?;
+        Ok(self.host_inspection_view(inspection))
     }
 
     pub async fn create_instance(
@@ -1962,7 +1987,7 @@ fi
 
     pub async fn create_device(&self, input: CreateDeviceInput) -> Result<Device, AppError> {
         if input.display_name.trim().is_empty() {
-            return Err(validation_error("Device name is required."));
+            return Err(validation_error("Client name is required."));
         }
         let lock = self.instance_lock(input.instance_id).await;
         let _guard = lock.lock().await;
@@ -2148,7 +2173,7 @@ fi
                         remote_state_changed: false,
                         rollback_succeeded: None,
                         remediation: Some(
-                            "Replace the device identity to issue a new certificate.".into(),
+                            "Replace the client identity to issue a new certificate.".into(),
                         ),
                         technical_detail: None,
                     });
@@ -2356,7 +2381,7 @@ fi
         input: UpdateDeviceInput,
     ) -> Result<DeviceView, AppError> {
         if input.display_name.trim().is_empty() {
-            return Err(validation_error("Device name is required."));
+            return Err(validation_error("Client name is required."));
         }
         let mut device = self
             .storage
@@ -3174,6 +3199,27 @@ fi
         result
     }
 
+    pub async fn apply_instance_view(
+        &self,
+        instance_id: Uuid,
+        expected_state_hash: &str,
+    ) -> Result<DeploymentResultView, AppError> {
+        let result = self
+            .apply_instance(instance_id, expected_state_hash)
+            .await?;
+        let health = self
+            .instance_health_view(instance_id, &result.health)
+            .await?;
+        Ok(DeploymentResultView {
+            deployment_id: result.deployment_id,
+            status: result.status,
+            remote_state_changed: result.remote_state_changed,
+            rollback_succeeded: result.rollback_succeeded,
+            backup_name: result.backup_name,
+            health,
+        })
+    }
+
     pub async fn cancel_deployment(&self, deployment_id: Uuid) -> bool {
         if let Some(token) = self.cancellations.lock().await.get(&deployment_id) {
             token.cancel();
@@ -3555,6 +3601,14 @@ fi
         Ok(health)
     }
 
+    pub async fn refresh_remote_credentials_view(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<InstanceHealthView, AppError> {
+        let health = self.refresh_remote_credentials(instance_id).await?;
+        self.instance_health_view(instance_id, &health).await
+    }
+
     pub async fn refresh_remote_dns_store(
         &self,
         instance_id: Uuid,
@@ -3601,6 +3655,14 @@ fi
         }
         self.wait_for_healthy(&state, &host, &trusted, passphrase.as_ref(), &cancellation)
             .await
+    }
+
+    pub async fn refresh_remote_dns_store_view(
+        &self,
+        instance_id: Uuid,
+    ) -> Result<InstanceHealthView, AppError> {
+        let health = self.refresh_remote_dns_store(instance_id).await?;
+        self.instance_health_view(instance_id, &health).await
     }
 
     pub async fn list_backups(&self, instance_id: Uuid) -> Result<Vec<BackupInfo>, AppError> {
@@ -7994,7 +8056,7 @@ fn secret_error(error: SecretStoreError) -> AppError {
         remote_state_changed: false,
         rollback_succeeded: None,
         remediation: Some(
-            "Replace the affected device identity if the secret cannot be recovered.".into(),
+            "Replace the affected client identity if the secret cannot be recovered.".into(),
         ),
         technical_detail: match error {
             SecretStoreError::NotFound => None,

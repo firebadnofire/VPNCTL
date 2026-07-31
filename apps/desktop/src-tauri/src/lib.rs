@@ -5,9 +5,9 @@ use uuid::Uuid;
 use vam_application::{
     ActivityFilter, ApplicationService, BackendOptionView, BackupRestorePreview, BackupView,
     ClientView, CreateDeviceInput, CreateDnsHostlistInput, CreateDnsRecordInput, CreateHostInput,
-    CreateInstanceInput, DeploymentPreviewView, DeviceView, DnsHostlist, HostInspectionView,
-    InstanceDetailView, InstanceHealthView, InstanceSummaryView, InstanceUpdatePreview,
-    InstanceView, LogEventView, UpdateDeviceInput, UpdateInstanceInput,
+    CreateInstanceInput, DeploymentPreviewView, DeploymentResultView, DeviceView, DnsHostlist,
+    HostInspectionView, InstanceDetailView, InstanceHealthView, InstanceSummaryView,
+    InstanceUpdatePreview, InstanceView, LogEventView, UpdateDeviceInput, UpdateInstanceInput,
 };
 use vam_core::{DnsRecord, DockerHost, User};
 use vam_protocol::{
@@ -118,6 +118,18 @@ async fn apply_host_provisioning(
 }
 
 #[tauri::command]
+async fn apply_host_provisioning_view(
+    state: State<'_, AppState>,
+    host_id: Uuid,
+    expected_state_hash: String,
+) -> Result<HostInspectionView, AppError> {
+    state
+        .0
+        .apply_host_provisioning_view(host_id, &expected_state_hash)
+        .await
+}
+
+#[tauri::command]
 async fn create_instance(
     state: State<'_, AppState>,
     input: CreateInstanceInput,
@@ -209,6 +221,18 @@ async fn apply_instance(
     state
         .0
         .apply_instance(instance_id, &expected_state_hash)
+        .await
+}
+
+#[tauri::command]
+async fn apply_instance_view(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+    expected_state_hash: String,
+) -> Result<DeploymentResultView, AppError> {
+    state
+        .0
+        .apply_instance_view(instance_id, &expected_state_hash)
         .await
 }
 
@@ -396,11 +420,27 @@ async fn refresh_remote_credentials(
 }
 
 #[tauri::command]
+async fn refresh_remote_credentials_view(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+) -> Result<InstanceHealthView, AppError> {
+    state.0.refresh_remote_credentials_view(instance_id).await
+}
+
+#[tauri::command]
 async fn refresh_remote_dns_store(
     state: State<'_, AppState>,
     instance_id: Uuid,
 ) -> Result<InstanceHealth, AppError> {
     state.0.refresh_remote_dns_store(instance_id).await
+}
+
+#[tauri::command]
+async fn refresh_remote_dns_store_view(
+    state: State<'_, AppState>,
+    instance_id: Uuid,
+) -> Result<InstanceHealthView, AppError> {
+    state.0.refresh_remote_dns_store_view(instance_id).await
 }
 
 #[tauri::command]
@@ -541,6 +581,7 @@ pub fn run() {
             inspect_host_view,
             plan_host_provisioning,
             apply_host_provisioning,
+            apply_host_provisioning_view,
             create_instance,
             preview_instance_update,
             update_instance,
@@ -552,6 +593,7 @@ pub fn run() {
             plan_instance,
             plan_instance_preview,
             apply_instance,
+            apply_instance_view,
             start_instance,
             stop_instance,
             start_instance_view,
@@ -577,7 +619,9 @@ pub fn run() {
             delete_dns_hostlist,
             create_backup,
             refresh_remote_credentials,
+            refresh_remote_credentials_view,
             refresh_remote_dns_store,
+            refresh_remote_dns_store_view,
             list_backups,
             list_backup_views,
             preview_backup_restore,
