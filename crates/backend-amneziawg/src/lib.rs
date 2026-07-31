@@ -305,10 +305,16 @@ impl VpnBackend for AmneziaWgBackend {
         previous: &BackendSettings,
         next: &BackendSettings,
     ) -> ChangeImpact {
-        if previous == next {
-            ChangeImpact::LiveUpdate
-        } else {
-            ChangeImpact::ServiceRestart
+        match (previous, next) {
+            (BackendSettings::AmneziaWg(previous), BackendSettings::AmneziaWg(next))
+                if previous == next =>
+            {
+                ChangeImpact::LiveUpdate
+            }
+            (BackendSettings::AmneziaWg(_), BackendSettings::AmneziaWg(_)) => {
+                ChangeImpact::ServiceRestart
+            }
+            _ => ChangeImpact::Reinstall,
         }
     }
 }
@@ -576,5 +582,28 @@ mod tests {
         assert_ne!(first_psk.as_str(), second_psk.as_str());
         assert_eq!(first_private.len(), 44);
         assert_eq!(first_psk.len(), 44);
+    }
+
+    #[test]
+    fn settings_change_classification_separates_restart_from_reinstall() {
+        let baseline = BackendSettings::AmneziaWg(AmneziaWgSettings::default());
+        assert_eq!(
+            AmneziaWgBackend.classify_settings_change(&baseline, &baseline),
+            ChangeImpact::LiveUpdate
+        );
+
+        let mut changed = baseline.clone();
+        let BackendSettings::AmneziaWg(settings) = &mut changed else {
+            unreachable!("fixture settings are AmneziaWG")
+        };
+        settings.jc += 1;
+        assert_eq!(
+            AmneziaWgBackend.classify_settings_change(&baseline, &changed),
+            ChangeImpact::ServiceRestart
+        );
+        assert_eq!(
+            AmneziaWgBackend.classify_settings_change(&baseline, &BackendSettings::default()),
+            ChangeImpact::Reinstall
+        );
     }
 }

@@ -186,10 +186,11 @@ impl XrayBackend {
         display_name: &str,
         device_id: Uuid,
         transport: XrayTransport,
+        client_id_ref: SecretReference,
     ) -> XrayDeviceData {
         let label = slug(display_name);
         XrayDeviceData {
-            client_id: Uuid::new_v4(),
+            client_id_ref,
             email: format!("{label}-{}@vam.invalid", short_uuid(device_id)),
             flow: (transport == XrayTransport::Tcp).then(|| VISION_FLOW.into()),
         }
@@ -279,7 +280,7 @@ impl VpnBackend for XrayBackend {
         validate_endpoint_host(&state.instance.endpoint.host)?;
         validate_settings(settings)?;
 
-        let mut client_ids = HashSet::new();
+        let mut client_id_refs = HashSet::new();
         let mut emails = HashSet::new();
         for device in state
             .devices
@@ -298,8 +299,11 @@ impl VpnBackend for XrayBackend {
             let data = xray_device(device, self.kind())?;
             validate_email(&data.email)?;
             validate_flow(data.flow.as_deref(), settings.transport)?;
-            if !client_ids.insert(data.client_id) {
-                return invalid("client_id", "active Xray client UUIDs must be unique");
+            if !client_id_refs.insert(&data.client_id_ref) {
+                return invalid(
+                    "client_id_ref",
+                    "Xray devices must not share a client credential reference",
+                );
             }
             if !emails.insert(data.email.as_str()) {
                 return invalid("email", "active Xray client labels must be unique");
@@ -309,21 +313,32 @@ impl VpnBackend for XrayBackend {
     }
 
     fn server_secret_references(&self, state: &DesiredState) -> Vec<SecretReference> {
-        state
+        let mut references: Vec<_> = state
             .instance
             .backend_settings
             .secret_references()
             .into_iter()
             .cloned()
-            .collect()
+            .collect();
+        references.extend(
+            state
+                .devices
+                .iter()
+                .filter(|device| device.enabled && device.deleted_at.is_none())
+                .filter_map(|device| match &device.backend_data {
+                    DeviceBackendData::Xray(data) => Some(data.client_id_ref.clone()),
+                    _ => None,
+                }),
+        );
+        references
     }
 
     fn client_secret_references(
         &self,
         device: &Device,
     ) -> Result<Vec<SecretReference>, BackendError> {
-        xray_device(device, self.kind())?;
-        Ok(Vec::new())
+        let data = xray_device(device, self.kind())?;
+        Ok(vec![data.client_id_ref.clone()])
     }
 
     fn render_server(
@@ -344,7 +359,7 @@ impl VpnBackend for XrayBackend {
             },
             RenderedFile {
                 path: "xray/server-template.json".into(),
-                contents: render_server_json(state, settings)?,
+                contents: render_server_json(state, settings, secrets)?,
                 mode: 0o600,
                 sensitive: true,
             },
@@ -397,7 +412,7 @@ impl VpnBackend for XrayBackend {
         &self,
         state: &DesiredState,
         device: &Device,
-        _secrets: &HashMap<SecretReference, Zeroizing<String>>,
+        secrets: &HashMap<SecretReference, Zeroizing<String>>,
     ) -> Result<ClientArtifact, BackendError> {
         self.validate(state)?;
         if !state
@@ -411,7 +426,8 @@ impl VpnBackend for XrayBackend {
             return Err(BackendError::BackendMismatch(self.kind()));
         };
         let data = xray_device(device, self.kind())?;
-        let uri = render_vless_uri(state, device, data, settings)?;
+        let client_id = xray_client_id(data, secrets)?;
+        let uri = render_vless_uri(state, device, data, settings, client_id)?;
         Ok(ClientArtifact::text(
             format!("{}.vless.txt", slug(&device.display_name)),
             uri,
@@ -682,25 +698,32 @@ fn validate_private_key_pem(value: &str) -> Result<(), BackendError> {
 fn render_server_json(
     state: &DesiredState,
     settings: &XraySettings,
+    secrets: &HashMap<SecretReference, Zeroizing<String>>,
 ) -> Result<String, BackendError> {
-    let mut devices: Vec<_> = state
+    let mut resolved_devices = Vec::new();
+    let mut client_ids = HashSet::new();
+    for device in state
         .devices
         .iter()
         .filter(|device| device.enabled && device.deleted_at.is_none())
-        .collect();
-    devices.sort_by_key(|device| {
-        xray_device(device, VpnBackendKind::Xray)
-            .expect("validation rejects non-Xray devices")
-            .client_id
-    });
-    let clients: Vec<_> = devices
+    {
+        let data = xray_device(device, VpnBackendKind::Xray)?;
+        let client_id = xray_client_id(data, secrets)?;
+        if !client_ids.insert(client_id) {
+            return invalid(
+                "client_id",
+                "active Xray client UUID credentials must be unique",
+            );
+        }
+        resolved_devices.push((client_id, data));
+    }
+    resolved_devices.sort_by_key(|(client_id, _)| *client_id);
+    let clients: Vec<_> = resolved_devices
         .into_iter()
-        .map(|device| {
-            let data = xray_device(device, VpnBackendKind::Xray)
-                .expect("validation rejects non-Xray devices");
+        .map(|(client_id, data)| {
             let mut client = json!({
                 "email": data.email,
-                "id": data.client_id,
+                "id": client_id,
                 "level": 0
             });
             if let Some(flow) = data.flow.as_deref().filter(|flow| !flow.is_empty()) {
@@ -799,6 +822,7 @@ fn render_vless_uri(
     device: &Device,
     data: &XrayDeviceData,
     settings: &XraySettings,
+    client_id: Uuid,
 ) -> Result<String, BackendError> {
     let mut uri = Url::parse("vless://placeholder.invalid").map_err(|error| {
         BackendError::InvalidSetting {
@@ -807,7 +831,7 @@ fn render_vless_uri(
             message: error.to_string(),
         }
     })?;
-    uri.set_username(&data.client_id.to_string())
+    uri.set_username(&client_id.to_string())
         .map_err(|()| BackendError::InvalidSetting {
             backend: VpnBackendKind::Xray,
             field: "client_id",
@@ -877,6 +901,18 @@ fn render_vless_uri(
     }
     uri.set_fragment(Some(&device.display_name));
     Ok(uri.into())
+}
+
+fn xray_client_id(
+    data: &XrayDeviceData,
+    secrets: &HashMap<SecretReference, Zeroizing<String>>,
+) -> Result<Uuid, BackendError> {
+    let value = required_secret(secrets, &data.client_id_ref, VpnBackendKind::Xray)?;
+    Uuid::parse_str(value.as_str()).map_err(|_| BackendError::InvalidSetting {
+        backend: VpnBackendKind::Xray,
+        field: "client_id_secret",
+        message: "the stored Xray client credential is not a valid UUID".into(),
+    })
 }
 
 fn required_secret<'a>(
@@ -989,6 +1025,7 @@ mod tests {
         let device_id = Uuid::from_u128(2);
         let certificate_ref = SecretReference(Uuid::from_u128(3));
         let private_key_ref = SecretReference(Uuid::from_u128(4));
+        let client_id_ref = SecretReference(Uuid::from_u128(5));
         let settings = XraySettings {
             security,
             transport,
@@ -1030,7 +1067,7 @@ mod tests {
             deleted_at: None,
         };
         let data = XrayDeviceData {
-            client_id: Uuid::from_u128(100),
+            client_id_ref: client_id_ref.clone(),
             email: "work-laptop-000000000002@vam.invalid".into(),
             flow: (transport == XrayTransport::Tcp).then(|| VISION_FLOW.into()),
         };
@@ -1067,22 +1104,94 @@ mod tests {
                     "-----BEGIN PRIVATE KEY-----\nZmFrZQ==\n-----END PRIVATE KEY-----\n".into(),
                 ),
             ),
+            (
+                client_id_ref,
+                Zeroizing::new(Uuid::from_u128(100).to_string()),
+            ),
         ]);
         (state, device, secrets)
     }
 
     #[test]
-    fn identity_generation_is_unique_and_transport_aware() {
-        let first =
-            XrayBackend::generate_identity("Work Laptop", Uuid::from_u128(1), XrayTransport::Tcp);
-        let second =
-            XrayBackend::generate_identity("Work Laptop", Uuid::from_u128(2), XrayTransport::Xhttp);
-        assert_ne!(first.client_id, second.client_id);
+    fn identity_metadata_is_reference_based_and_transport_aware() {
+        let first = XrayBackend::generate_identity(
+            "Work Laptop",
+            Uuid::from_u128(1),
+            XrayTransport::Tcp,
+            SecretReference(Uuid::from_u128(11)),
+        );
+        let second = XrayBackend::generate_identity(
+            "Work Laptop",
+            Uuid::from_u128(2),
+            XrayTransport::Xhttp,
+            SecretReference(Uuid::from_u128(12)),
+        );
+        assert_ne!(first.client_id_ref, second.client_id_ref);
         assert_ne!(first.email, second.email);
         assert_eq!(first.flow.as_deref(), Some(VISION_FLOW));
         assert!(second.flow.is_none());
         validate_email(&first.email).unwrap();
         validate_email(&second.email).unwrap();
+    }
+
+    #[test]
+    fn client_credentials_are_required_validated_and_unique() {
+        let (mut state, device, mut secrets) = fixture(XraySecurity::Reality, XrayTransport::Tcp);
+        let data = xray_device(&device, VpnBackendKind::Xray).unwrap();
+        let client_id_ref = data.client_id_ref.clone();
+        assert_eq!(
+            XrayBackend.client_secret_references(&device).unwrap(),
+            vec![client_id_ref.clone()]
+        );
+        assert!(
+            XrayBackend
+                .server_secret_references(&state)
+                .contains(&client_id_ref)
+        );
+
+        secrets.remove(&client_id_ref);
+        assert!(matches!(
+            XrayBackend.render_server(&state, &secrets),
+            Err(BackendError::MissingSecret { reference, .. }) if reference == client_id_ref
+        ));
+        secrets.insert(client_id_ref, Zeroizing::new("not-a-uuid".into()));
+        assert!(matches!(
+            XrayBackend.render_server(&state, &secrets),
+            Err(BackendError::InvalidSetting {
+                field: "client_id_secret",
+                ..
+            })
+        ));
+
+        let duplicate_ref = SecretReference(Uuid::from_u128(6));
+        state.devices.push(Device {
+            id: Uuid::from_u128(6),
+            display_name: "Phone".into(),
+            backend_data: DeviceBackendData::Xray(XrayDeviceData {
+                client_id_ref: duplicate_ref.clone(),
+                email: "phone@vam.invalid".into(),
+                flow: Some(VISION_FLOW.into()),
+            }),
+            ..device
+        });
+        secrets.insert(
+            xray_device(&state.devices[0], VpnBackendKind::Xray)
+                .unwrap()
+                .client_id_ref
+                .clone(),
+            Zeroizing::new(Uuid::from_u128(100).to_string()),
+        );
+        secrets.insert(
+            duplicate_ref,
+            Zeroizing::new(Uuid::from_u128(100).to_string()),
+        );
+        assert!(matches!(
+            XrayBackend.render_server(&state, &secrets),
+            Err(BackendError::InvalidSetting {
+                field: "client_id",
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -1119,15 +1228,20 @@ mod tests {
 
     #[test]
     fn reality_server_json_is_structured_sorted_and_contains_no_private_key() {
-        let (mut state, device, secrets) = fixture(XraySecurity::Reality, XrayTransport::Tcp);
+        let (mut state, device, mut secrets) = fixture(XraySecurity::Reality, XrayTransport::Tcp);
         let mut second = device;
         second.id = Uuid::from_u128(3);
         second.display_name = "Phone".into();
+        let second_client_id_ref = SecretReference(Uuid::from_u128(6));
         second.backend_data = DeviceBackendData::Xray(XrayDeviceData {
-            client_id: Uuid::from_u128(50),
+            client_id_ref: second_client_id_ref.clone(),
             email: "phone@vam.invalid".into(),
             flow: Some(VISION_FLOW.into()),
         });
+        secrets.insert(
+            second_client_id_ref,
+            Zeroizing::new(Uuid::from_u128(50).to_string()),
+        );
         state.devices.insert(0, second);
         let files = XrayBackend.render_server(&state, &secrets).unwrap();
         let template = files
@@ -1231,10 +1345,7 @@ mod tests {
         assert_eq!(artifact.suggested_filename, "work-laptop.vless.txt");
         let text = artifact.contents.as_text().unwrap();
         let parsed = Url::parse(text).unwrap();
-        let expected_client_id = xray_device(&device, VpnBackendKind::Xray)
-            .unwrap()
-            .client_id
-            .to_string();
+        let expected_client_id = Uuid::from_u128(100).to_string();
         assert_eq!(parsed.scheme(), "vless");
         assert_eq!(parsed.username(), expected_client_id);
         assert_eq!(parsed.host_str(), Some("vpn.example.test"));
@@ -1266,10 +1377,8 @@ mod tests {
 
     #[test]
     fn desired_state_reconciliation_removes_disabled_and_replaced_ids() {
-        let (mut state, device, secrets) = fixture(XraySecurity::Reality, XrayTransport::Tcp);
-        let original = xray_device(&device, VpnBackendKind::Xray)
-            .unwrap()
-            .client_id;
+        let (mut state, device, mut secrets) = fixture(XraySecurity::Reality, XrayTransport::Tcp);
+        let original = Uuid::from_u128(100);
         state.devices[0].enabled = false;
         let disabled = XrayBackend.render_server(&state, &secrets).unwrap();
         let disabled_json: Value = serde_json::from_str(
@@ -1288,11 +1397,17 @@ mod tests {
         );
 
         state.devices[0].enabled = true;
+        let replacement_ref = SecretReference(Uuid::from_u128(7));
         state.devices[0].backend_data = DeviceBackendData::Xray(XrayBackend::generate_identity(
             "Work Laptop",
             device.id,
             XrayTransport::Tcp,
+            replacement_ref.clone(),
         ));
+        secrets.insert(
+            replacement_ref,
+            Zeroizing::new(Uuid::from_u128(200).to_string()),
+        );
         let replaced = XrayBackend.render_server(&state, &secrets).unwrap();
         let replaced_text = &replaced
             .iter()

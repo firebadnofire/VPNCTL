@@ -506,7 +506,7 @@ pub struct Ikev2DeviceData {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct XrayDeviceData {
-    pub client_id: Uuid,
+    pub client_id_ref: SecretReference,
     pub email: String,
     pub flow: Option<String>,
 }
@@ -562,7 +562,7 @@ impl DeviceBackendData {
                 references.extend(data.ca_certificate_ref.iter());
                 references
             }
-            Self::Xray(_) => Vec::new(),
+            Self::Xray(data) => vec![&data.client_id_ref],
         }
     }
 }

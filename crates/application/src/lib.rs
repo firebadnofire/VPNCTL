@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vam_backend::{
     BackendError, BackendHealthProbe, BackendRegistry, BackendRuntimeSpec, BackendValidation,
-    ContainerImage, ContainerMountOwnership, CredentialAction, CredentialOperation,
+    ChangeImpact, ContainerImage, ContainerMountOwnership, CredentialAction, CredentialOperation,
     ServerIdentityStrategy, VpnBackend,
 };
 use vam_backend_amneziawg::AmneziaWgBackend;
@@ -294,11 +294,7 @@ pub enum DevicePublicIdentity {
         certificate_serial: Option<String>,
     },
     #[serde(rename = "xray")]
-    Xray {
-        client_id: Uuid,
-        email: String,
-        flow: Option<String>,
-    },
+    Xray { email: String, flow: Option<String> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -335,7 +331,6 @@ impl From<&Device> for DeviceView {
                 certificate_serial: data.certificate_serial.clone(),
             },
             DeviceBackendData::Xray(data) => DevicePublicIdentity::Xray {
-                client_id: data.client_id,
                 email: data.email.clone(),
                 flow: data.flow.clone(),
             },
@@ -510,13 +505,16 @@ fn generate_device_identity(
             let BackendSettings::Xray(settings) = &instance.backend_settings else {
                 return Err(BackendError::BackendMismatch(instance.backend));
             };
+            let client_id_ref = SecretReference(Uuid::new_v4());
+            let client_id = Zeroizing::new(Uuid::new_v4().to_string());
             Ok((
                 DeviceBackendData::Xray(XrayBackend::generate_identity(
                     display_name,
                     device_id,
                     settings.transport,
+                    client_id_ref.clone(),
                 )),
-                Vec::new(),
+                vec![pending_text_secret(client_id_ref, &client_id)],
             ))
         }
     }
@@ -584,7 +582,9 @@ fn device_secret_registrations(device: &Device) -> Vec<(Uuid, String)> {
             );
             values
         }
-        DeviceBackendData::Xray(_) => Vec::new(),
+        DeviceBackendData::Xray(data) => {
+            vec![(data.client_id_ref.0, "xray_client_id".to_owned())]
+        }
     }
 }
 
@@ -878,6 +878,9 @@ fi
             )
             .await
             .map_err(ssh_error)?;
+        if result.exit_status != 0 {
+            return Err(command_error("inspect_host", &result, false));
+        }
         let values = parse_key_values(&result.stdout_text().map_err(ssh_error)?);
         let docker_version = nonempty(values.get("docker_version"));
         let compose_version = nonempty(values.get("compose_version"));
@@ -2180,7 +2183,7 @@ fi
         let runtime = backend
             .runtime(&state.instance.backend_settings)
             .map_err(backend_error)?;
-        vam_deployment::DefaultDeploymentPlanner
+        let mut plan = vam_deployment::DefaultDeploymentPlanner
             .calculate(
                 &state,
                 &runtime,
@@ -2188,7 +2191,10 @@ fi
                 &files,
                 remote.as_ref(),
             )
-            .map_err(deployment_error)
+            .map_err(deployment_error)?;
+        self.annotate_settings_change(&state, backend.as_ref(), &mut plan)
+            .await?;
+        Ok(plan)
     }
 
     pub async fn apply_instance(
@@ -2208,7 +2214,7 @@ fi
         let runtime = backend
             .runtime(&state.instance.backend_settings)
             .map_err(backend_error)?;
-        let plan = vam_deployment::DefaultDeploymentPlanner
+        let mut plan = vam_deployment::DefaultDeploymentPlanner
             .calculate(
                 &state,
                 &runtime,
@@ -2217,6 +2223,8 @@ fi
                 remote.as_ref(),
             )
             .map_err(deployment_error)?;
+        self.annotate_settings_change(&state, backend.as_ref(), &mut plan)
+            .await?;
         if plan.desired_state_hash != expected_state_hash {
             return Err(AppError {
                 code: "stale_deployment_plan".into(),
@@ -3431,6 +3439,9 @@ fi
             )
             .await
             .map_err(ssh_error)?;
+        if result.exit_status != 0 {
+            return Err(command_error("health", &result, false));
+        }
         let text = result.stdout_text().map_err(ssh_error)?;
         let values = parse_key_values(&text);
         let zero = |key: &str| values.get(key).is_some_and(|value| value == "0");
@@ -4248,6 +4259,33 @@ install -d {instances} {staging_root} {backups} {trash} {stage}
 }
 
 impl ApplicationService {
+    async fn annotate_settings_change(
+        &self,
+        state: &DesiredState,
+        backend: &dyn VpnBackend,
+        plan: &mut DeploymentPlan,
+    ) -> Result<(), AppError> {
+        if plan.operations.is_empty() {
+            return Ok(());
+        }
+        let Some(previous) = self
+            .storage
+            .last_successful_deployment(state.instance.id)
+            .await
+            .map_err(storage_error)?
+        else {
+            return Ok(());
+        };
+        let impact = backend.classify_settings_change(
+            &previous.desired_state.instance.backend_settings,
+            &state.instance.backend_settings,
+        );
+        if let Some(warning) = settings_change_warning(impact) {
+            plan.warnings.push(warning.into());
+        }
+        Ok(())
+    }
+
     async fn restore_backup(
         &self,
         state: &DesiredState,
@@ -5484,6 +5522,18 @@ fn health_is_healthy(health: &InstanceHealth) -> bool {
             || (health.dns_running && health.private_dns_resolves && health.public_dns_resolves))
 }
 
+fn settings_change_warning(impact: ChangeImpact) -> Option<&'static str> {
+    match impact {
+        ChangeImpact::LiveUpdate => None,
+        ChangeImpact::ServiceRestart => {
+            Some("Backend settings changed; the gateway service must restart.")
+        }
+        ChangeImpact::Reinstall => Some(
+            "Destructive reinstall-class backend settings change detected. Review the persistent identity impact before Apply; the complete instance tree will be backed up first.",
+        ),
+    }
+}
+
 fn parse_key_values(output: &str) -> HashMap<String, String> {
     output
         .lines()
@@ -6042,7 +6092,12 @@ fn serialization_error(error: serde_json::Error) -> AppError {
 }
 
 fn command_error(scope: &str, result: &CommandResult, changed: bool) -> AppError {
+    let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
+    let detail = format!(
+        "exit_status={}\nstdout:\n{}\nstderr:\n{}",
+        result.exit_status, stdout, stderr
+    );
     AppError {
         code: "remote_command".into(),
         message: "A fixed remote operation failed.".into(),
@@ -6050,7 +6105,7 @@ fn command_error(scope: &str, result: &CommandResult, changed: bool) -> AppError
         remote_state_changed: changed,
         rollback_succeeded: None,
         remediation: Some("Expand the technical details and inspect the remote host.".into()),
-        technical_detail: Some(redact(&stderr, &[])),
+        technical_detail: Some(redact(&detail, &[])),
     }
 }
 
@@ -6232,6 +6287,7 @@ mod tests {
 
     const FRESH_APT_HOST: &str = "operating_system=Linux\narchitecture=x86_64\npackage_manager=apt\neffective_user_is_root=1\ndocker_group_member=1\ndocker_installed=127\ndocker_version=\ndocker_accessible=127\ncompose_version=\ndocker_privileged_accessible=127\nwireguard=1\nroot_writable=1\nsudo_bootstrap=0\n";
     const READY_APT_HOST: &str = "operating_system=Linux\narchitecture=x86_64\npackage_manager=apt\neffective_user_is_root=1\ndocker_group_member=0\ndocker_installed=0\ndocker_version=29.0.0\ndocker_accessible=0\ncompose_version=2.40.0\ndocker_privileged_accessible=0\nwireguard=1\nroot_writable=1\nsudo_bootstrap=0\n";
+    const HEALTHY_XRAY: &str = "project=1\ngateway=0\ndns=1\ngateway_status=running/none Up 1 second\ndns_status=absent\nbackend=0\nclient_count=0\nbackend_status=ready\nlistener_0=0\nprivate_dns=1\npublic_dns=1\n";
 
     #[test]
     fn host_setup_plans_are_deterministic_and_noop_when_ready() {
@@ -6317,6 +6373,19 @@ mod tests {
         let script = host_provisioning_script(plan.package_manager, &plan.operations).unwrap();
         assert!(script.contains("usermod -aG docker"));
         assert!(script.contains("sudo -n true"));
+    }
+
+    #[test]
+    fn deployment_preview_discloses_restart_and_destructive_reinstall_impact() {
+        assert!(settings_change_warning(ChangeImpact::LiveUpdate).is_none());
+        assert!(
+            settings_change_warning(ChangeImpact::ServiceRestart)
+                .is_some_and(|warning| warning.contains("must restart"))
+        );
+        assert!(
+            settings_change_warning(ChangeImpact::Reinstall)
+                .is_some_and(|warning| warning.contains("Destructive reinstall-class"))
+        );
     }
 
     #[test]
@@ -6530,8 +6599,12 @@ mod tests {
         let xray = command_state(VpnBackendKind::Xray);
         let (data, secrets) =
             generate_device_identity(&xray.instance, "Laptop", Uuid::from_u128(14), true).unwrap();
-        assert!(matches!(data, DeviceBackendData::Xray(_)));
-        assert!(secrets.is_empty());
+        let DeviceBackendData::Xray(data) = data else {
+            panic!("expected Xray identity");
+        };
+        assert_eq!(secrets.len(), 1);
+        assert_eq!(secrets[0].reference, data.client_id_ref);
+        Uuid::parse_str(std::str::from_utf8(secrets[0].value.as_slice()).unwrap()).unwrap();
     }
 
     #[test]
@@ -6866,12 +6939,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn xray_device_creation_allocates_no_tunnel_address_dns_or_secret() {
+    async fn xray_device_creation_keeps_client_credential_out_of_public_view() {
         let storage = Storage::in_memory().await.unwrap();
         let secrets = Arc::new(MemorySecretStore::default());
         let service = ApplicationService::with_transport(
             storage,
-            secrets,
+            secrets.clone(),
             Arc::new(RusshTransport::default()),
         );
         let host = service
@@ -6911,7 +6984,24 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(device_secret_registrations(&device).is_empty());
+        let DeviceBackendData::Xray(data) = &device.backend_data else {
+            panic!("expected Xray device metadata");
+        };
+        assert_eq!(
+            device_secret_registrations(&device),
+            vec![(data.client_id_ref.0, "xray_client_id".to_owned())]
+        );
+        let stored = secrets.get(&data.client_id_ref).await.unwrap();
+        let client_id = std::str::from_utf8(stored.as_slice()).unwrap();
+        Uuid::parse_str(client_id).unwrap();
+
+        let persisted_json = serde_json::to_string(&device.backend_data).unwrap();
+        assert!(!persisted_json.contains(client_id));
+        assert!(persisted_json.contains(&data.client_id_ref.0.to_string()));
+        let public_json = serde_json::to_string(&DeviceView::from(&device)).unwrap();
+        assert!(!public_json.contains("client_id"));
+        assert!(!public_json.contains(&data.client_id_ref.0.to_string()));
+        assert!(!public_json.contains(client_id));
     }
 
     #[tokio::test]
@@ -7199,6 +7289,7 @@ mod tests {
         let detail = error.technical_detail.unwrap();
         assert!(!detail.contains("hunter2"));
         assert!(detail.contains("[REDACTED]"));
+        assert!(detail.contains("exit_status=23"));
 
         let command_count = fake.commands.lock().expect("test command lock").len();
         let error = service
@@ -7260,6 +7351,144 @@ mod tests {
                 .expect("test command lock")
                 .iter()
                 .any(|command| command.contains("usermod -aG docker"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_the_complete_backend_identity_tree_before_health() {
+        let storage = Storage::in_memory().await.unwrap();
+        let fake = fake_transport();
+        let service = ApplicationService::with_transport(
+            storage,
+            Arc::new(MemorySecretStore::default()),
+            fake.clone(),
+        );
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "lab".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let probe = service.probe_host_key(host.id).await.unwrap();
+        service
+            .approve_host_key(host.id, probe.key, "SHA256:first", false)
+            .await
+            .unwrap();
+        let mut state = command_state(VpnBackendKind::Xray);
+        state.instance.host_id = host.id;
+        let (host, trusted, passphrase) = service.trusted_host(host.id).await.unwrap();
+        fake.responses.lock().expect("test response lock").extend([
+            queued_result("", "", 0),
+            queued_result(HEALTHY_XRAY, "", 0),
+            queued_result("", "", 0),
+        ]);
+
+        let backup = format!("{APP_ROOT}/backups/{}/reviewed-snapshot", state.instance.id);
+        let health = service
+            .restore_backup(
+                &state,
+                &host,
+                &trusted,
+                passphrase.as_ref(),
+                Some(&backup),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(health_is_healthy(&health));
+
+        let commands = fake.commands.lock().expect("test command lock");
+        let restore = commands
+            .iter()
+            .find(|command| command.contains("reviewed-snapshot"))
+            .expect("rollback copy command");
+        assert!(restore.contains(&format!("cp -a '{backup}'")));
+        assert!(restore.contains(&format!("'{APP_ROOT}/instances/{}'", state.instance.id)));
+        assert!(restore.contains("docker compose up -d"));
+        assert!(
+            commands
+                .iter()
+                .any(|command| command.contains("xray run -test"))
+        );
+        assert_eq!(
+            commands.len(),
+            2,
+            "archive-mode full-tree restore preserves Xray's numeric identity ownership"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspection_and_health_treat_remote_exit_status_as_authoritative() {
+        let storage = Storage::in_memory().await.unwrap();
+        let fake = fake_transport();
+        let service = ApplicationService::with_transport(
+            storage,
+            Arc::new(MemorySecretStore::default()),
+            fake.clone(),
+        );
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "lab".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let probe = service.probe_host_key(host.id).await.unwrap();
+        service
+            .approve_host_key(host.id, probe.key, "SHA256:first", false)
+            .await
+            .unwrap();
+
+        fake.responses
+            .lock()
+            .expect("test response lock")
+            .push_back(queued_result(
+                "operating_system=Linux\n",
+                "inspect failed",
+                17,
+            ));
+        let inspection_error = service.inspect_host(host.id).await.unwrap_err();
+        assert_eq!(inspection_error.code, "remote_command");
+        assert!(
+            inspection_error
+                .technical_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("exit_status=17"))
+        );
+
+        let mut state = command_state(VpnBackendKind::Xray);
+        state.instance.host_id = host.id;
+        let (host, trusted, passphrase) = service.trusted_host(host.id).await.unwrap();
+        fake.responses
+            .lock()
+            .expect("test response lock")
+            .push_back(queued_result(HEALTHY_XRAY, "health failed", 19));
+        let health_error = service
+            .remote_health(
+                &state,
+                &host,
+                &trusted,
+                passphrase.as_ref(),
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(health_error.code, "remote_command");
+        assert_eq!(health_error.scope.as_deref(), Some("health"));
+        assert!(
+            health_error
+                .technical_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("exit_status=19"))
         );
     }
 

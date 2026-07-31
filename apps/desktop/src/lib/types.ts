@@ -161,7 +161,7 @@ export interface Device {
       }
     | {
         backend: "xray";
-        identity: { client_id: UUID; email: string; flow?: string | null };
+        identity: { email: string; flow?: string | null };
       };
   created_at: string;
 }

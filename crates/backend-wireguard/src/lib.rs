@@ -277,10 +277,16 @@ impl VpnBackend for WireGuardBackend {
         previous: &BackendSettings,
         next: &BackendSettings,
     ) -> ChangeImpact {
-        if previous == next {
-            ChangeImpact::LiveUpdate
-        } else {
-            ChangeImpact::ServiceRestart
+        match (previous, next) {
+            (BackendSettings::WireGuard(previous), BackendSettings::WireGuard(next))
+                if previous == next =>
+            {
+                ChangeImpact::LiveUpdate
+            }
+            (BackendSettings::WireGuard(_), BackendSettings::WireGuard(_)) => {
+                ChangeImpact::ServiceRestart
+            }
+            _ => ChangeImpact::Reinstall,
         }
     }
 }
@@ -309,8 +315,8 @@ mod tests {
     use chrono::Utc;
     use uuid::Uuid;
     use vam_core::{
-        BackendSettings, DEFAULT_KEEPALIVE, DnsConfig, EndpointConfig, NetworkConfig,
-        VpnBackendKind, VpnInstance, WireGuardDeviceData,
+        AmneziaWgSettings, BackendSettings, DEFAULT_KEEPALIVE, DnsConfig, EndpointConfig,
+        NetworkConfig, VpnBackendKind, VpnInstance, WireGuardDeviceData,
     };
     use zeroize::Zeroize;
 
@@ -447,5 +453,31 @@ mod tests {
         assert!(!contents.contains("::/0"));
         assert!(artifact.ipv6_warning.is_some());
         assert_eq!(artifact.suggested_filename, "macbook-injected.conf");
+    }
+
+    #[test]
+    fn settings_change_classification_separates_restart_from_reinstall() {
+        let baseline = BackendSettings::default();
+        assert_eq!(
+            WireGuardBackend.classify_settings_change(&baseline, &baseline),
+            ChangeImpact::LiveUpdate
+        );
+
+        let mut changed = baseline.clone();
+        let BackendSettings::WireGuard(settings) = &mut changed else {
+            unreachable!("default settings are WireGuard")
+        };
+        settings.userspace_fallback = !settings.userspace_fallback;
+        assert_eq!(
+            WireGuardBackend.classify_settings_change(&baseline, &changed),
+            ChangeImpact::ServiceRestart
+        );
+        assert_eq!(
+            WireGuardBackend.classify_settings_change(
+                &baseline,
+                &BackendSettings::AmneziaWg(AmneziaWgSettings::default()),
+            ),
+            ChangeImpact::Reinstall
+        );
     }
 }
