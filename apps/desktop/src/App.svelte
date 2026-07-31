@@ -5,6 +5,8 @@
   import type {
     AppError,
     AppInfo,
+    BackendOption,
+    BackendSettings,
     BackupInfo,
     DeploymentPlan,
     DeploymentProgress,
@@ -17,6 +19,8 @@
     HostInspection,
     HostKeyProbe,
     InstanceHealth,
+    UpdateDeviceInput,
+    VpnBackendKind,
     VpnInstance,
   } from "./lib/types";
 
@@ -36,17 +40,91 @@
   const sections: Section[] = ["Hosts", "Instances", "Devices", "DNS", "Backups", "Logs"];
   const dnsPanels: DnsPanel[] = ["Records", "Hostlists"];
   const recordTypes: DnsRecordType[] = ["A", "AAAA", "CNAME", "TXT", "SRV"];
-  const healthCheckLabels: Record<keyof Omit<InstanceHealth, "details">, string> = {
-    compose_project_exists: "Compose project exists",
-    gateway_running: "Gateway container running",
-    dns_running: "DNS container running",
-    watchtower_running: "Watchtower container running",
-    private_dns_resolves: "Private DNS resolves",
-    public_dns_resolves: "Public DNS resolves",
-    wireguard_interface_exists: "WireGuard interface exists",
-    listen_port_matches: "WireGuard UDP port published",
-    expected_peers_present: "Peer set matches desired state",
-  };
+  const healthCheckLabels: Array<[keyof InstanceHealth, string]> = [
+    ["compose_project_exists", "Compose project exists"],
+    ["gateway_running", "Gateway container running"],
+    ["backend_ready", "VPN backend is ready"],
+    ["listeners_ready", "Required listeners are published"],
+    ["client_state_matches", "Client identities match desired state"],
+  ];
+
+  interface InstanceForm {
+    display_name: string;
+    host_id: string;
+    backend: VpnBackendKind;
+    endpoint_host: string;
+    endpoint_port: number;
+    ipv4_subnet: string;
+    dns_zone: string;
+    routing_mode: "full_tunnel" | "split_tunnel";
+    wireguard_userspace_fallback: boolean;
+    awg_jc: number;
+    awg_jmin: number;
+    awg_jmax: number;
+    awg_s1: number;
+    awg_s2: number;
+    awg_s3: number;
+    awg_s4: number;
+    awg_h1_min: number;
+    awg_h1_max: number;
+    awg_h2_min: number;
+    awg_h2_max: number;
+    awg_h3_min: number;
+    awg_h3_max: number;
+    awg_h4_min: number;
+    awg_h4_max: number;
+    openvpn_transport: "tcp" | "udp";
+    openvpn_cipher: "aes256-gcm" | "chacha20-poly1305";
+    openvpn_tls_protection: "tls_crypt" | "none";
+    openvpn_certificate_lifetime_days: number;
+    ikev2_server_identity: string;
+    ikev2_certificate_lifetime_days: number;
+    xray_security: "reality";
+    xray_transport: "tcp" | "xhttp" | "mkcp";
+    xray_server_name: string;
+    xray_fingerprint: string;
+    xray_xhttp_path: string;
+  }
+
+  function newInstanceForm(hostId = "", endpointHost = ""): InstanceForm {
+    return {
+      display_name: "",
+      host_id: hostId,
+      backend: "wireguard",
+      endpoint_host: endpointHost,
+      endpoint_port: 51820,
+      ipv4_subnet: "10.64.0.0/24",
+      dns_zone: "internal",
+      routing_mode: "split_tunnel",
+      wireguard_userspace_fallback: false,
+      awg_jc: 5,
+      awg_jmin: 10,
+      awg_jmax: 50,
+      awg_s1: 64,
+      awg_s2: 96,
+      awg_s3: 32,
+      awg_s4: 8,
+      awg_h1_min: 5,
+      awg_h1_max: 999,
+      awg_h2_min: 1000,
+      awg_h2_max: 1999,
+      awg_h3_min: 2000,
+      awg_h3_max: 2999,
+      awg_h4_min: 3000,
+      awg_h4_max: 3999,
+      openvpn_transport: "udp",
+      openvpn_cipher: "aes256-gcm",
+      openvpn_tls_protection: "tls_crypt",
+      openvpn_certificate_lifetime_days: 825,
+      ikev2_server_identity: endpointHost,
+      ikev2_certificate_lifetime_days: 825,
+      xray_security: "reality",
+      xray_transport: "tcp",
+      xray_server_name: "www.cloudflare.com",
+      xray_fingerprint: "chrome",
+      xray_xhttp_path: "/",
+    };
+  }
   function shellSingleQuote(value: string) {
     return `'${value.replaceAll("'", "'\"'\"'")}'`;
   }
@@ -66,6 +144,7 @@
   };
   let hosts: DockerHost[] = [];
   let instances: VpnInstance[] = [];
+  let backendOptions: BackendOption[] = [];
   let devices: Device[] = [];
   let records: DnsRecord[] = [];
   let hostlists: DnsHostlist[] = [];
@@ -95,15 +174,7 @@
     private_key_path: "",
     passphrase: "",
   };
-  let instanceForm = {
-    display_name: "",
-    host_id: "",
-    endpoint_host: "",
-    endpoint_port: 51820,
-    ipv4_subnet: "10.64.0.0/24",
-    dns_zone: "internal",
-    routing_mode: "split_tunnel",
-  };
+  let instanceForm = newInstanceForm();
   let deviceForm = {
     instance_id: "",
     display_name: "",
@@ -127,10 +198,13 @@
 
   $: selectedInstance = instances.find((item) => item.id === selectedInstanceId);
   $: selectedHost = hosts.find((item) => item.id === selectedHostId);
+  $: instanceFormBackend = backendOptions.find((item) => item.kind === instanceForm.backend);
   $: instanceDevices = devices.filter((item) => item.instance_id === selectedInstanceId);
   $: instanceRecords = records.filter((item) => item.instance_id === selectedInstanceId);
   $: dnsFormInstance = instances.find((item) => item.id === dnsForm.instance_id);
   $: deviceFormInstance = instances.find((item) => item.id === deviceForm.instance_id);
+  $: deviceFormBackend = backendOptions.find((item) => item.kind === deviceFormInstance?.backend);
+  $: selectedBackend = backendOptions.find((item) => item.kind === selectedInstance?.backend);
   $: deviceDnsPreview = deviceDnsNamePreview(deviceForm.dns_name, deviceFormInstance?.dns.zone || "");
 
   onMount(load);
@@ -147,14 +221,16 @@
   }
 
   async function refresh() {
-    const [nextHosts, nextInstances, nextHostlists, nextLogs] = await Promise.all([
+    const [nextHosts, nextInstances, nextBackends, nextHostlists, nextLogs] = await Promise.all([
       call<DockerHost[]>("list_hosts"),
       call<VpnInstance[]>("list_instances", { hostId: null }),
+      call<BackendOption[]>("backend_options"),
       call<DnsHostlist[]>("list_dns_hostlists"),
       call<DeploymentProgress[]>("logs", { instanceId: null }),
     ]);
     hosts = nextHosts;
     instances = nextInstances;
+    backendOptions = nextBackends;
     hostlists = nextHostlists;
     logs = nextLogs;
     if (selectedHostId && !hosts.some((host) => host.id === selectedHostId)) selectedHostId = "";
@@ -176,6 +252,11 @@
       call<DnsRecord[]>("list_dns_records", { instanceId: selectedInstanceId }),
       call<BackupInfo[]>("list_backups", { instanceId: selectedInstanceId }),
     ]);
+  }
+
+  async function selectedInstanceChanged(event: Event) {
+    selectedInstanceId = (event.currentTarget as HTMLSelectElement).value;
+    await refreshInstanceData();
   }
 
   async function task<T>(label: string, operation: () => Promise<T>): Promise<T | undefined> {
@@ -304,21 +385,96 @@
   }
 
   function openInstance() {
-    instanceForm = {
-      display_name: "",
-      host_id: selectedHostId || hosts[0]?.id || "",
-      endpoint_host: hosts.find((host) => host.id === selectedHostId)?.ssh.hostname || "",
-      endpoint_port: 51820,
-      ipv4_subnet: "10.64.0.0/24",
-      dns_zone: "internal",
-      routing_mode: "split_tunnel",
-    };
+    const hostId = selectedHostId || hosts[0]?.id || "";
+    const endpointHost = hosts.find((host) => host.id === hostId)?.ssh.hostname || "";
+    instanceForm = newInstanceForm(hostId, endpointHost);
     modal = "instance";
+  }
+
+  function backendChanged(backend: VpnBackendKind) {
+    instanceForm.backend = backend;
+    const option = backendOptions.find((item) => item.kind === instanceForm.backend);
+    if (option) instanceForm.endpoint_port = option.default_port;
+    if (instanceForm.backend === "ikev2" && !instanceForm.ikev2_server_identity) {
+      instanceForm.ikev2_server_identity = instanceForm.endpoint_host;
+    }
+  }
+
+  function backendSettingsFromForm(): BackendSettings {
+    switch (instanceForm.backend) {
+      case "wireguard":
+        return {
+          backend: "wireguard",
+          settings: { userspace_fallback: instanceForm.wireguard_userspace_fallback },
+        };
+      case "amnezia_wg":
+        return {
+          backend: "amnezia_wg",
+          settings: {
+            generation: "awg2",
+            jc: instanceForm.awg_jc,
+            jmin: instanceForm.awg_jmin,
+            jmax: instanceForm.awg_jmax,
+            s1: instanceForm.awg_s1,
+            s2: instanceForm.awg_s2,
+            s3: instanceForm.awg_s3,
+            s4: instanceForm.awg_s4,
+            h1: { min: instanceForm.awg_h1_min, max: instanceForm.awg_h1_max },
+            h2: { min: instanceForm.awg_h2_min, max: instanceForm.awg_h2_max },
+            h3: { min: instanceForm.awg_h3_min, max: instanceForm.awg_h3_max },
+            h4: { min: instanceForm.awg_h4_min, max: instanceForm.awg_h4_max },
+          },
+        };
+      case "openvpn":
+        return {
+          backend: "openvpn",
+          settings: {
+            transport: instanceForm.openvpn_transport,
+            cipher: instanceForm.openvpn_cipher,
+            tls_protection: instanceForm.openvpn_tls_protection,
+            certificate_lifetime_days: instanceForm.openvpn_certificate_lifetime_days,
+          },
+        };
+      case "ikev2":
+        return {
+          backend: "ikev2",
+          settings: {
+            server_identity:
+              instanceForm.ikev2_server_identity.trim() || instanceForm.endpoint_host.trim(),
+            certificate_lifetime_days: instanceForm.ikev2_certificate_lifetime_days,
+          },
+        };
+      case "xray":
+        return {
+          backend: "xray",
+          settings: {
+            security: instanceForm.xray_security,
+            transport: instanceForm.xray_transport,
+            server_name: instanceForm.xray_server_name,
+            fingerprint: instanceForm.xray_fingerprint,
+            xhttp_path: instanceForm.xray_xhttp_path,
+            reality_public_key: null,
+            reality_short_id: null,
+          },
+        };
+    }
   }
 
   async function saveInstance() {
     const created = await task("Creating instance", () =>
-      call<VpnInstance>("create_instance", { input: instanceForm }),
+      call<VpnInstance>("create_instance", {
+        input: {
+          host_id: instanceForm.host_id,
+          display_name: instanceForm.display_name,
+          backend: instanceForm.backend,
+          backend_settings: backendSettingsFromForm(),
+          endpoint_host: instanceForm.endpoint_host,
+          endpoint_port: instanceForm.endpoint_port,
+          ipv4_subnet: instanceForm.ipv4_subnet,
+          dns_zone: instanceForm.dns_zone,
+          routing_mode: instanceForm.routing_mode,
+        },
+      }),
     );
     if (!created) return;
     modal = null;
@@ -363,16 +519,24 @@
   }
 
   function healthSummary(health: InstanceHealth) {
-    const values = Object.entries(health).filter(([key]) => key !== "details");
-    const healthy = values.filter(([, value]) => value === true).length;
-    return `${healthy}/${values.length} health checks passing.`;
+    const checks = healthChecks(health);
+    const healthy = checks.filter((check) => check.passing).length;
+    return `${healthy}/${checks.length} required health checks passing.`;
   }
 
   function healthChecks(health: InstanceHealth) {
-    return Object.entries(healthCheckLabels).map(([key, label]) => ({
+    const checks = healthCheckLabels.map(([key, label]) => ({
       label,
-      passing: health[key as keyof Omit<InstanceHealth, "details">],
+      passing: Boolean(health[key]),
     }));
+    if (health.dns_required) {
+      checks.push(
+        { label: "DNS container running", passing: health.dns_running },
+        { label: "Private DNS resolves", passing: health.private_dns_resolves },
+        { label: "Public DNS resolves", passing: health.public_dns_resolves },
+      );
+    }
+    return checks;
   }
 
   async function removeInstance(instance: VpnInstance) {
@@ -391,18 +555,23 @@
   }
 
   function openDevice() {
+    const instanceId = selectedInstanceId || instances[0]?.id || "";
+    const instance = instances.find((item) => item.id === instanceId);
+    const capabilities = backendOptions.find((item) => item.kind === instance?.backend)?.capabilities;
     deviceForm = {
-      instance_id: selectedInstanceId || instances[0]?.id || "",
+      instance_id: instanceId,
       display_name: "",
       preshared_key: true,
-      create_dns_record: true,
+      create_dns_record: capabilities?.managed_dns ?? true,
       dns_name: "",
     };
     modal = "device";
   }
 
   async function saveDevice() {
-    const dnsNameError = deviceDnsNameZoneError(deviceForm.dns_name, deviceFormInstance?.dns.zone || "");
+    const dnsNameError = deviceFormBackend?.capabilities.managed_dns
+      ? deviceDnsNameZoneError(deviceForm.dns_name, deviceFormInstance?.dns.zone || "")
+      : null;
     if (dnsNameError) {
       error = {
         code: "validation",
@@ -424,13 +593,24 @@
     modal = null;
     selectedInstanceId = created.instance_id;
     await refreshInstanceData();
-    notice = "Device keys were generated locally and saved in Keychain.";
+    notice =
+      created.backend === "xray"
+        ? "Xray client UUID created locally. Review and deploy the instance before export."
+        : created.backend === "openvpn" || created.backend === "ikev2"
+          ? "Client key generated locally and certificate issued through the verified SSH authority."
+          : "Device keys were generated locally and saved in the native credential store.";
   }
 
   async function toggleDevice(device: Device) {
-    const updated = { ...device, enabled: !device.enabled };
+    const input: UpdateDeviceInput = {
+      id: device.id,
+      user_id: device.user_id ?? null,
+      display_name: device.display_name,
+      dns_name: device.dns_name ?? null,
+      enabled: !device.enabled,
+    };
     const result = await task("Updating device", () =>
-      call<Device>("update_device", { device: updated }),
+      call<Device>("update_device", { input }),
     );
     if (result) await refreshInstanceData();
   }
@@ -446,7 +626,7 @@
     );
     if (!result) return;
     await refreshInstanceData();
-    notice = "A new Keychain identity was created. Deploy before exporting the replacement configuration.";
+    notice = "A new client identity was created in the native credential store. Review and deploy before exporting it.";
   }
 
   async function removeDevice(device: Device) {
@@ -460,14 +640,25 @@
     );
     if (result === undefined && error) return;
     await refreshInstanceData();
-    notice = "Device removed locally. Deploy the instance to revoke its peer.";
+    notice =
+      device.backend === "openvpn" || device.backend === "ikev2"
+        ? "Client certificate revoked and device removed."
+        : "Device removed locally. Review and deploy the instance to revoke its identity.";
   }
 
   async function exportDevice(device: Device) {
+    const exportInfo =
+      device.backend === "openvpn"
+        ? { suffix: "ovpn", filterExtension: "ovpn", name: "OpenVPN profile" }
+        : device.backend === "ikev2"
+          ? { suffix: "p12", filterExtension: "p12", name: "Protected PKCS#12 credential" }
+          : device.backend === "xray"
+            ? { suffix: "vless.txt", filterExtension: "txt", name: "VLESS URI" }
+            : { suffix: "conf", filterExtension: "conf", name: `${backendDisplayName(device.backend)} configuration` };
     const destination = await save({
-      title: "Export WireGuard configuration",
-      defaultPath: `${device.display_name.toLowerCase().replaceAll(/[^a-z0-9]+/g, "-")}.conf`,
-      filters: [{ name: "WireGuard configuration", extensions: ["conf"] }],
+      title: `Export ${exportInfo.name}`,
+      defaultPath: `${device.display_name.toLowerCase().replaceAll(/[^a-z0-9]+/g, "-")}.${exportInfo.suffix}`,
+      filters: [{ name: exportInfo.name, extensions: [exportInfo.filterExtension] }],
     });
     if (!destination) return;
     const result = await task("Exporting private configuration", () =>
@@ -487,6 +678,35 @@
     if (!result) return;
     qrSvg = result;
     modal = "qr";
+  }
+
+  function backendDisplayName(kind: VpnBackendKind) {
+    return backendOptions.find((option) => option.kind === kind)?.display_name ?? kind;
+  }
+
+  function backendBadge(kind: VpnBackendKind) {
+    return {
+      wireguard: "WG",
+      amnezia_wg: "AWG",
+      openvpn: "OVPN",
+      ikev2: "IKE",
+      xray: "XRAY",
+    }[kind];
+  }
+
+  function deviceIdentitySummary(device: Device) {
+    switch (device.public_identity.backend) {
+      case "wireguard":
+        return `WireGuard public key ${device.public_identity.identity.public_key}`;
+      case "amnezia_wg":
+        return `AWG2 public key ${device.public_identity.identity.public_key}`;
+      case "openvpn":
+        return `OpenVPN certificate ${device.public_identity.identity.common_name}`;
+      case "ikev2":
+        return `IKEv2 identity ${device.public_identity.identity.identity}`;
+      case "xray":
+        return `VLESS client ${device.public_identity.identity.email}`;
+    }
   }
 
   function openDns() {
@@ -692,13 +912,15 @@
         {#if active === "Hosts"}<button class="primary" onclick={openHost}>Add host</button>{/if}
         {#if active === "Instances"}<button class="primary" onclick={openInstance} disabled={!hosts.length}>Create instance</button>{/if}
         {#if active === "Devices"}
-          <button class="secondary" onclick={refreshRemoteCredentials} disabled={!selectedInstanceId}>Refresh devices</button>
+          {#if selectedBackend?.capabilities.quick_credential_refresh}
+            <button class="secondary" onclick={refreshRemoteCredentials} disabled={!selectedInstanceId}>Refresh identities</button>
+          {/if}
           <button class="primary" onclick={openDevice} disabled={!instances.length}>Add device</button>
         {/if}
         {#if active === "DNS"}
           {#if activeDnsPanel === "Records"}
-            <button class="secondary" onclick={refreshRemoteDnsStore} disabled={!selectedInstanceId}>Refresh DNS store</button>
-            <button class="primary" onclick={openDns} disabled={!instances.length}>Add record</button>
+            <button class="secondary" onclick={refreshRemoteDnsStore} disabled={!selectedInstanceId || !selectedBackend?.capabilities.managed_dns}>Refresh DNS store</button>
+            <button class="primary" onclick={openDns} disabled={!instances.length || !selectedBackend?.capabilities.managed_dns}>Add record</button>
           {/if}
         {/if}
         {#if active === "Backups"}<button class="primary" onclick={() => makeBackup()} disabled={!selectedInstanceId}>Create backup</button>{/if}
@@ -761,7 +983,7 @@
           </div>
           <div class="checklist">
             <div><b>1</b><span><strong>SSH trust</strong><small>Explicit SHA-256 host-key approval</small></span></div>
-            <div><b>2</b><span><strong>Runtime inspection</strong><small>Linux, Docker, Compose, WireGuard</small></span></div>
+            <div><b>2</b><span><strong>Runtime inspection</strong><small>Linux, Docker, Compose, kernel support</small></span></div>
             <div><b>3</b><span><strong>Desired-state deploy</strong><small>Plan, backup, apply, verify</small></span></div>
           </div>
         </section>
@@ -814,10 +1036,10 @@
           <div class="rows instance-rows">
             {#each instances as instance}
               <article class:selected={instance.id === selectedInstanceId}>
-                <div class="status-icon">WG</div>
+                <div class="status-icon">{backendBadge(instance.backend)}</div>
                 <button class="row-main row-select" onclick={() => { selectedInstanceId = instance.id; refreshInstanceData(); }}>
                   <strong>{instance.display_name}</strong>
-                  <small>{instance.endpoint.host}:{instance.endpoint.port} · {instance.network.ipv4_subnet} · {instance.dns.zone}</small>
+                  <small>{backendDisplayName(instance.backend)} · {instance.endpoint.host}:{instance.endpoint.port}{instance.backend === "xray" ? "" : ` · ${instance.network.ipv4_subnet} · ${instance.dns.zone}`}</small>
                 </button>
                 <button class="secondary" onclick={() => instanceAction("start_instance", instance)}>Start</button>
                 <button class="secondary" onclick={() => instanceAction("stop_instance", instance)}>Stop</button>
@@ -829,12 +1051,12 @@
             {/each}
           </div>
         {:else}
-          <div class="empty"><h3>No VPN instances</h3><p>Create a WireGuard appliance after adding and approving a Docker host.</p></div>
+          <div class="empty"><h3>No VPN instances</h3><p>Create a WireGuard, AWG2, OpenVPN, IKEv2, or Xray appliance after approving a Docker host.</p></div>
         {/if}
       </section>
     {:else if active === "Devices"}
       <div class="toolbar">
-        <label>Instance<select bind:value={selectedInstanceId} onchange={refreshInstanceData}><option value="">Select…</option>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
+        <label>Instance<select value={selectedInstanceId} onchange={selectedInstanceChanged}><option value="">Select…</option>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
       </div>
       <section class="panel">
         <div class="panel-head"><h3>Device identities</h3><span>{instanceDevices.length} for selected instance</span></div>
@@ -843,23 +1065,31 @@
             {#each instanceDevices as device}
               <article>
                 <div class:disabled={!device.enabled} class="status-icon">{device.enabled ? "●" : "○"}</div>
-                <div class="row-main"><strong>{device.display_name}</strong><small>{device.ipv4_address}</small></div>
-                <button class="secondary" onclick={() => toggleDevice(device)}>{device.enabled ? "Disable" : "Enable"}</button>
-                <button class="secondary" onclick={() => replaceDeviceIdentity(device)}>Replace key</button>
-                <button class="secondary" onclick={() => showQr(device)}>QR</button>
+                <div class="row-main"><strong>{device.display_name}</strong><small>{device.ipv4_address ? `${device.ipv4_address} · ` : ""}{deviceIdentitySummary(device)}</small></div>
+                {#if backendOptions.find((option) => option.kind === device.backend)?.capabilities.certificate_authority && !device.enabled}
+                  <span class="revoked">Revoked</span>
+                {:else}
+                  <button class="secondary" onclick={() => toggleDevice(device)}>{backendOptions.find((option) => option.kind === device.backend)?.capabilities.certificate_authority ? "Revoke" : device.enabled ? "Disable" : "Enable"}</button>
+                {/if}
+                <button class="secondary" onclick={() => replaceDeviceIdentity(device)}>Replace identity</button>
+                {#if backendOptions.find((option) => option.kind === device.backend)?.capabilities.qr_export}
+                  <button class="secondary" onclick={() => showQr(device)}>QR</button>
+                {/if}
                 <button class="primary small" onclick={() => exportDevice(device)}>Export</button>
                 <button class="menu danger" onclick={() => removeDevice(device)}>Remove</button>
               </article>
             {/each}
           </div>
         {:else}
-          <div class="empty"><h3>No devices for this instance</h3><p>Private keys are generated locally and remain in the macOS Keychain.</p></div>
+          <div class="empty"><h3>No devices for this instance</h3><p>Client identities are generated in Rust; private material remains in the native credential store.</p></div>
         {/if}
       </section>
     {:else if active === "DNS"}
       <div class="toolbar">
-        <label>Instance<select bind:value={selectedInstanceId} onchange={refreshInstanceData}><option value="">Select…</option>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
-        {#if selectedInstance}<span>Zone {selectedInstance.dns.zone} - SOA {selectedInstance.dns.soa_serial}</span>{/if}
+        <label>Instance<select value={selectedInstanceId} onchange={selectedInstanceChanged}><option value="">Select…</option>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
+        {#if selectedInstance}
+          <span>{selectedBackend?.capabilities.managed_dns ? `Zone ${selectedInstance.dns.zone} - SOA ${selectedInstance.dns.soa_serial}` : `${backendDisplayName(selectedInstance.backend)} does not provide a routed private DNS zone`}</span>
+        {/if}
       </div>
       <div class="tabs" role="tablist" aria-label="DNS panels">
         {#each dnsPanels as panel}
@@ -869,7 +1099,9 @@
       {#if activeDnsPanel === "Records"}
       <section class="panel">
         <div class="panel-head"><h3>Private DNS records</h3><span>A · AAAA · CNAME · TXT · SRV</span></div>
-        {#if instanceRecords.length}
+        {#if selectedInstance && !selectedBackend?.capabilities.managed_dns}
+          <div class="empty"><h3>Private DNS is not applicable</h3><p>{backendDisplayName(selectedInstance.backend)} is a proxy backend and does not allocate routed client addresses or publish this private zone.</p></div>
+        {:else if instanceRecords.length}
           <div class="table">
             <div class="table-head"><span>Name</span><span>Type</span><span>Value</span><span>TTL</span><span></span></div>
             {#each instanceRecords as record}
@@ -908,7 +1140,7 @@
       {/if}
     {:else if active === "Backups"}
       <div class="toolbar">
-        <label>Instance<select bind:value={selectedInstanceId} onchange={refreshInstanceData}><option value="">Select…</option>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
+        <label>Instance<select value={selectedInstanceId} onchange={selectedInstanceChanged}><option value="">Select…</option>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
       </div>
       <section class="panel">
         <div class="panel-head"><h3>Deployment backups</h3><span>10 retained per instance</span></div>
@@ -975,27 +1207,101 @@
         {#if probe.state === "changed"}<label class="checkbox critical-text"><input type="checkbox" bind:checked={replaceChangedKey} /> I separately verified and intend to replace the approved key.</label>{/if}
         <div class="modal-actions"><button class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary" onclick={approveKey} disabled={fingerprintConfirmation !== probe.key.sha256_fingerprint || (probe.state === "changed" && !replaceChangedKey)}>Approve key</button></div>
       {:else if modal === "instance"}
-        <div class="modal-head"><div><p class="eyebrow">DESIRED STATE</p><h2>Create WireGuard instance</h2></div><button onclick={() => (modal = null)}>×</button></div>
+        <div class="modal-head"><div><p class="eyebrow">DESIRED STATE</p><h2>Create VPN instance</h2></div><button onclick={() => (modal = null)}>×</button></div>
         <form onsubmit={(event) => { event.preventDefault(); saveInstance(); }}>
           <label>Display name<input bind:value={instanceForm.display_name} required placeholder="Home VPN" /></label>
           <label>Docker host<select bind:value={instanceForm.host_id} required>{#each hosts as host}<option value={host.id}>{host.display_name}</option>{/each}</select></label>
-          <div class="form-grid"><label>Public endpoint<input bind:value={instanceForm.endpoint_host} required placeholder="vpn.example.com" /></label><label>UDP port<input type="number" bind:value={instanceForm.endpoint_port} min="1" max="65535" /></label></div>
-          <div class="form-grid"><label>Private IPv4 subnet<input bind:value={instanceForm.ipv4_subnet} required /></label><label>Private DNS zone<input bind:value={instanceForm.dns_zone} required /></label></div>
-          <label>Default routing<select bind:value={instanceForm.routing_mode}><option value="split_tunnel">Split tunnel</option><option value="full_tunnel">Full tunnel (IPv4)</option></select></label>
-          <p class="help">The gateway receives the first usable address. IPv6 is not advertised until an IPv6 tunnel address exists.</p>
+          <label>Protocol
+            <select value={instanceForm.backend} onchange={(event) => backendChanged((event.currentTarget as HTMLSelectElement).value as VpnBackendKind)}>
+              {#each backendOptions as option}<option value={option.kind}>{option.display_name}</option>{/each}
+            </select>
+          </label>
+          <div class="form-grid">
+            <label>Public endpoint<input bind:value={instanceForm.endpoint_host} required placeholder="vpn.example.com" /></label>
+            <label>{instanceForm.backend === "openvpn" ? instanceForm.openvpn_transport.toUpperCase() : instanceForm.backend === "xray" && instanceForm.xray_transport === "mkcp" ? "UDP" : instanceForm.backend === "xray" ? "TCP" : "UDP"} port
+              <input type="number" bind:value={instanceForm.endpoint_port} min="1" max="65535" disabled={instanceForm.backend === "ikev2"} required />
+            </label>
+          </div>
+          {#if instanceFormBackend?.capabilities.allocated_tunnel_addresses}
+            <div class="form-grid"><label>Private IPv4 subnet<input bind:value={instanceForm.ipv4_subnet} required /></label><label>Private DNS zone<input bind:value={instanceForm.dns_zone} required /></label></div>
+            <label>Default routing<select bind:value={instanceForm.routing_mode}><option value="split_tunnel">Split tunnel</option><option value="full_tunnel">Full tunnel (IPv4)</option></select></label>
+          {/if}
+
+          {#if instanceForm.backend === "wireguard"}
+            <label class="checkbox"><input type="checkbox" bind:checked={instanceForm.wireguard_userspace_fallback} /> Allow userspace fallback when the host kernel module is unavailable</label>
+          {:else if instanceForm.backend === "amnezia_wg"}
+            <details class="advanced-settings">
+              <summary>AWG2 obfuscation settings</summary>
+              <p class="help">Validated AWG2 defaults are prefilled. Change these only when every client will receive the matching profile.</p>
+              <div class="parameter-grid">
+                <label>Jc<input type="number" bind:value={instanceForm.awg_jc} min="0" max="128" required /></label>
+                <label>Jmin<input type="number" bind:value={instanceForm.awg_jmin} min="0" max="1280" required /></label>
+                <label>Jmax<input type="number" bind:value={instanceForm.awg_jmax} min="0" max="1280" required /></label>
+                <label>S1<input type="number" bind:value={instanceForm.awg_s1} min="0" max="65535" required /></label>
+                <label>S2<input type="number" bind:value={instanceForm.awg_s2} min="0" max="65535" required /></label>
+                <label>S3<input type="number" bind:value={instanceForm.awg_s3} min="0" max="65535" required /></label>
+                <label>S4<input type="number" bind:value={instanceForm.awg_s4} min="0" max="65535" required /></label>
+              </div>
+              <div class="range-grid">
+                <span>Magic header</span><span>Minimum</span><span>Maximum</span>
+                <b>H1</b><input aria-label="H1 minimum" type="number" bind:value={instanceForm.awg_h1_min} required /><input aria-label="H1 maximum" type="number" bind:value={instanceForm.awg_h1_max} required />
+                <b>H2</b><input aria-label="H2 minimum" type="number" bind:value={instanceForm.awg_h2_min} required /><input aria-label="H2 maximum" type="number" bind:value={instanceForm.awg_h2_max} required />
+                <b>H3</b><input aria-label="H3 minimum" type="number" bind:value={instanceForm.awg_h3_min} required /><input aria-label="H3 maximum" type="number" bind:value={instanceForm.awg_h3_max} required />
+                <b>H4</b><input aria-label="H4 minimum" type="number" bind:value={instanceForm.awg_h4_min} required /><input aria-label="H4 maximum" type="number" bind:value={instanceForm.awg_h4_max} required />
+              </div>
+            </details>
+          {:else if instanceForm.backend === "openvpn"}
+            <div class="form-grid equal">
+              <label>Transport<select bind:value={instanceForm.openvpn_transport}><option value="udp">UDP</option><option value="tcp">TCP</option></select></label>
+              <label>Data cipher<select bind:value={instanceForm.openvpn_cipher}><option value="aes256-gcm">AES-256-GCM</option><option value="chacha20-poly1305">ChaCha20-Poly1305</option></select></label>
+            </div>
+            <div class="form-grid equal">
+              <label>TLS control protection<select bind:value={instanceForm.openvpn_tls_protection}><option value="tls_crypt">tls-crypt</option><option value="none">None</option></select></label>
+              <label>Client certificate lifetime (days)<input type="number" bind:value={instanceForm.openvpn_certificate_lifetime_days} min="1" max="825" required /></label>
+            </div>
+          {:else if instanceForm.backend === "ikev2"}
+            <div class="form-grid equal">
+              <label>Server certificate identity<input bind:value={instanceForm.ikev2_server_identity} required placeholder={instanceForm.endpoint_host || "vpn.example.com"} /></label>
+              <label>Client certificate lifetime (days)<input type="number" bind:value={instanceForm.ikev2_certificate_lifetime_days} min="1" max="825" required /></label>
+            </div>
+            <p class="help">IKEv2 always reserves UDP 500 and 4500. Client exports are password-protected PKCS#12 credentials.</p>
+          {:else if instanceForm.backend === "xray"}
+            <div class="form-grid equal">
+              <label>Security<select bind:value={instanceForm.xray_security}><option value="reality">REALITY</option><option disabled>TLS requires certificate import</option></select></label>
+              <label>Transport<select bind:value={instanceForm.xray_transport}><option value="tcp">TCP</option><option value="xhttp">XHTTP</option><option disabled>mKCP requires TLS</option></select></label>
+            </div>
+            <div class="form-grid equal">
+              <label>SNI / camouflage host<input bind:value={instanceForm.xray_server_name} required placeholder="www.example.com" /></label>
+              <label>Client fingerprint<select bind:value={instanceForm.xray_fingerprint}><option value="chrome">Chrome</option><option value="firefox">Firefox</option><option value="safari">Safari</option><option value="edge">Edge</option><option value="randomized">Randomized</option></select></label>
+            </div>
+            {#if instanceForm.xray_transport === "xhttp"}<label>XHTTP path<input bind:value={instanceForm.xray_xhttp_path} required placeholder="/" /></label>{/if}
+            <p class="help">REALITY private material is generated remotely during verified deployment. Only its public key and short ID are retained in desired state.</p>
+          {/if}
+
+          <p class="help">{instanceForm.backend === "xray" ? "Xray creates VLESS proxy identities without tunnel addresses or managed private DNS." : "The gateway receives the first usable address. IPv6 is not advertised until an IPv6 tunnel address exists."}</p>
           <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary">Create instance</button></div>
         </form>
       {:else if modal === "device"}
-        <div class="modal-head"><div><p class="eyebrow">LOCAL KEY GENERATION</p><h2>Add device</h2></div><button onclick={() => (modal = null)}>×</button></div>
+        <div class="modal-head"><div><p class="eyebrow">CLIENT IDENTITY</p><h2>Add device</h2></div><button onclick={() => (modal = null)}>×</button></div>
         <form onsubmit={(event) => { event.preventDefault(); saveDevice(); }}>
           <label>Instance<select bind:value={deviceForm.instance_id} required>{#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}</select></label>
           <label>Device name<input bind:value={deviceForm.display_name} required placeholder="Main PC" /></label>
-          <label>DNS name <span class="optional">optional</span><input bind:value={deviceForm.dns_name} placeholder="mainpc" /></label>
-          {#if deviceFormInstance}
-            <p class="help">Enter a short name like mainpc; it will be saved as {deviceDnsPreview || `mainpc.${deviceFormInstance.dns.zone}`}.</p>
+          {#if deviceFormBackend?.capabilities.managed_dns}
+            <label>DNS name <span class="optional">optional</span><input bind:value={deviceForm.dns_name} placeholder="mainpc" /></label>
+            {#if deviceFormInstance}
+              <p class="help">Enter a short name like mainpc; it will be saved as {deviceDnsPreview || `mainpc.${deviceFormInstance.dns.zone}`}.</p>
+            {/if}
+            <label class="checkbox"><input type="checkbox" bind:checked={deviceForm.create_dns_record} /> Create a managed DNS A record</label>
           {/if}
-          <label class="checkbox"><input type="checkbox" bind:checked={deviceForm.preshared_key} /> Generate a preshared key (recommended)</label>
-          <label class="checkbox"><input type="checkbox" bind:checked={deviceForm.create_dns_record} /> Create a managed DNS A record</label>
+          {#if deviceFormInstance?.backend === "wireguard"}
+            <label class="checkbox"><input type="checkbox" bind:checked={deviceForm.preshared_key} /> Generate a unique preshared key (recommended)</label>
+          {:else if deviceFormInstance?.backend === "amnezia_wg"}
+            <p class="help">AWG2 always generates a unique mandatory preshared key for this device.</p>
+          {:else if deviceFormInstance?.backend === "openvpn" || deviceFormInstance?.backend === "ikev2"}
+            <p class="help">The private key is generated locally. The CSR is signed by this instance's remote authority over verified SSH; private key material never leaves the native credential store.</p>
+          {:else if deviceFormInstance?.backend === "xray"}
+            <p class="help">A unique VLESS UUID and label will be generated. Xray identities do not receive tunnel IP or private DNS records.</p>
+          {/if}
           <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary">Generate identity</button></div>
         </form>
       {:else if modal === "dns"}
@@ -1029,7 +1335,7 @@
         <div class="hash">Desired state <code>{plan.desired_state_hash}</code></div>
         <div class="modal-actions"><button class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary" onclick={applyPlan} disabled={!plan.operations.length}>Apply these changes</button></div>
       {:else if modal === "qr"}
-        <div class="modal-head"><div><p class="eyebrow">PRIVATE CONFIGURATION</p><h2>WireGuard QR code</h2></div><button onclick={() => { modal = null; qrSvg = ""; }}>×</button></div>
+        <div class="modal-head"><div><p class="eyebrow">PRIVATE CONFIGURATION</p><h2>{selectedInstance ? backendDisplayName(selectedInstance.backend) : "Client"} QR code</h2></div><button onclick={() => { modal = null; qrSvg = ""; }}>×</button></div>
         <div class="qr">{@html qrSvg}</div>
         <p class="help centered">This SVG exists only in the current desktop view. Close it when the device has imported the configuration.</p>
       {/if}

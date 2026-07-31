@@ -3949,3 +3949,147 @@ After diagnostics, `cargo tree -i aws-lc-rs -e features` confirmed the restored
 default russh/AWS-LC graph, and `git diff -- Cargo.toml Cargo.lock` was empty.
 The normal native AWS-LC build remains blocked only by the already documented
 missing NASM prerequisite.
+
+Commit:
+
+- `3d75741 feat: expose generic backend workflows`;
+- verified good EDDSA signature from William Jones' configured YubiKey-backed
+  key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### 9B implementation
+
+#### Secret-free external views
+
+The final boundary review found that returning the core `VpnInstance` could
+serialize Xray TLS certificate/private-key references even though the frontend
+did not need them. Unit 9B therefore completes the external-view model:
+
+- `BackendSettingsInput` is a strongly typed creation/public-settings enum
+  whose Serde representation matches the core backend discriminator but whose
+  Xray variant has no TLS secret-reference fields;
+- `PublicXraySettings` contains only security/transport, SNI/camouflage host,
+  fingerprint, XHTTP path, and REALITY public key/short ID;
+- converting public Xray settings to core settings always initializes both TLS
+  references to `None`;
+- `InstanceView` carries all non-secret instance/network/DNS fields and converts
+  core backend settings to the public enum, deliberately dropping any existing
+  Xray TLS references;
+- Tauri and routine CLI create/list commands use `InstanceView`;
+- the unused raw `update_instance(VpnInstance)` Tauri command was removed
+  rather than leave a frontend path that could submit internal settings;
+- Tauri device commands now accept `UpdateDeviceInput` and return `DeviceView`
+  for create/update/list/replacement.
+
+The CLI still exercises the same application service, but its routine JSON
+output now uses the same public instance/device views as the desktop. Secret
+material remains available only through explicit file export, and opaque
+secret reference UUIDs are absent from routine frontend and CLI payloads.
+
+#### Capability-driven desktop
+
+Tauri exposes the application backend catalog through one thin
+`backend_options` command. Svelte loads it alongside instances and derives:
+
+- the backend's display name and default listener port;
+- whether device addresses and routed controls apply;
+- whether managed DNS controls apply;
+- whether a quick credential refresh button is valid;
+- whether QR export is supported;
+- whether disable means reversible identity disable or irreversible
+  certificate revocation.
+
+Instance rows now show WG, AWG, OVPN, IKE, or XRAY badges and backend names.
+Xray rows omit misleading subnet/private-zone summaries. Device rows show a
+public-key, certificate Common Name, IKE identity, or VLESS email label rather
+than assuming every device is a WireGuard peer. Disabled certificate
+identities are shown as revoked and cannot present a misleading Enable action;
+replacement is the recovery workflow already enforced by the application.
+
+Health presentation uses the generic readiness contract:
+
+- Compose project;
+- gateway container;
+- backend readiness;
+- listener readiness;
+- client desired-state match;
+- DNS container and resolution only when `dns_required` is true.
+
+Legacy WireGuard/watchtower health fields remain in the TypeScript response
+shape for compatibility but no longer distort the required-check summary.
+
+#### Conditional instance and device forms
+
+The instance modal retains the existing visual language and exposes:
+
+- WireGuard userspace fallback, routed subnet/DNS, routing mode, endpoint, and
+  UDP listener;
+- AWG2 routed controls plus collapsible Jc/Jmin/Jmax, S1-S4, and H1-H4
+  validated default ranges;
+- OpenVPN UDP/TCP transport, custom port, AES-256-GCM or
+  ChaCha20-Poly1305, tls-crypt policy, certificate lifetime, routing, and DNS;
+- IKEv2 server certificate identity, bounded client certificate lifetime,
+  fixed UDP 500/4500 explanation, routing, and DNS;
+- Xray REALITY, TCP/XHTTP, custom listener, SNI/camouflage host, browser
+  fingerprint, and conditional XHTTP path, without routed-address/DNS fields.
+
+The backend selection handler reads the selected value directly before deriving
+the port. Instance toolbar handlers similarly store the selected instance
+before refreshing dependent data; this avoids Svelte's event-before-binding
+ordering from refreshing the previously selected instance.
+
+Xray TLS/mKCP are displayed as unavailable choices rather than pretending they
+can be provisioned securely. The backend supports TLS only with certificate and
+private-key references, but no reviewed file-import command currently moves
+those secrets directly from local files into the native store. Enabling TLS in
+Svelte would either expose PEM material or accept arbitrary reference IDs, so
+REALITY is the supported desktop creation path until that separate secure
+import workflow exists. REALITY private material is still generated only on
+the verified remote host; the UI receives only public discovery values after
+deployment.
+
+The device modal follows capabilities:
+
+- WireGuard offers a unique per-device PSK;
+- AWG2 explains its mandatory unique PSK;
+- OpenVPN/IKEv2 explain local private-key generation plus verified-SSH CSR
+  signing;
+- Xray explains UUID identity and hides address/DNS/PSK controls;
+- managed DNS inputs appear only for routed backends.
+
+Export dialogs select `.conf`, `.ovpn`, protected `.p12`, or `.vless.txt`
+according to the public backend kind. QR appears only when the backend declares
+that capability. Messages distinguish local desired-state revocation from
+immediate certificate revocation.
+
+### 9B validation
+
+Passing exact-current gates:
+
+- 20 application tests, including a synthetic Xray TLS instance proving its
+  public JSON contains neither reference field name nor reference UUID;
+- 3 CLI tests;
+- Tauri library/binary compilation and doc tests;
+- strict Clippy for application, CLI, and Tauri, all targets, with
+  `-D warnings`;
+- `svelte-check`: 0 errors and 0 warnings;
+- Vitest: 2/2 tests;
+- Vite production build: 113 modules transformed and a complete `dist` bundle;
+- formatting and `git diff --check`.
+
+The root pnpm wrapper first stopped at
+`ERR_PNPM_ABORTED_REMOVE_MODULES_DIR_NO_TTY`. Direct installed
+`svelte-check`, Vitest, and Vite initially encountered sandbox-only `EPERM`
+reads of pnpm-linked modules, then passed unchanged outside that restricted
+read sandbox. No dependency install or module purge occurred.
+
+The Rust gates again used the temporary Ring diagnostic after the native
+AWS-LC path stopped on missing NASM. `Cargo.toml` and `Cargo.lock` are restored;
+`cargo tree -i aws-lc-rs -e features` confirms the delivered default
+russh/AWS-LC graph.
+
+A localhost production preview was started for visual smoke testing, but the
+in-app browser runtime itself exited before navigation with a Windows sandbox
+`EPERM` while resolving `C:\Users\william\AppData`. The exact preview process
+was stopped. No visual-interaction result is claimed; the successful Svelte
+diagnostics and production bundle are the available frontend proof in this
+environment.

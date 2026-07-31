@@ -3,10 +3,11 @@ use std::{path::PathBuf, sync::Arc};
 use tauri::{Manager, State};
 use uuid::Uuid;
 use vam_application::{
-    ApplicationService, CreateDeviceInput, CreateDnsHostlistInput, CreateDnsRecordInput,
-    CreateHostInput, CreateInstanceInput, DnsHostlist,
+    ApplicationService, BackendOptionView, CreateDeviceInput, CreateDnsHostlistInput,
+    CreateDnsRecordInput, CreateHostInput, CreateInstanceInput, DeviceView, DnsHostlist,
+    InstanceView, UpdateDeviceInput,
 };
-use vam_core::{Device, DnsRecord, DockerHost, User, VpnInstance};
+use vam_core::{DnsRecord, DockerHost, User};
 use vam_protocol::{
     AppError, BackupInfo, DeploymentPlan, DeploymentProgress, DeploymentResult, DeploymentSummary,
     HostInspection, HostKeyInfo, HostKeyProbe, InstanceHealth, RenderedFile,
@@ -90,24 +91,21 @@ async fn inspect_host(
 async fn create_instance(
     state: State<'_, AppState>,
     input: CreateInstanceInput,
-) -> Result<VpnInstance, AppError> {
-    state.0.create_instance(input).await
-}
-
-#[tauri::command]
-async fn update_instance(
-    state: State<'_, AppState>,
-    instance: VpnInstance,
-) -> Result<VpnInstance, AppError> {
-    state.0.update_instance(instance).await
+) -> Result<InstanceView, AppError> {
+    state.0.create_instance_view(input).await
 }
 
 #[tauri::command]
 async fn list_instances(
     state: State<'_, AppState>,
     host_id: Option<Uuid>,
-) -> Result<Vec<VpnInstance>, AppError> {
-    state.0.list_instances(host_id).await
+) -> Result<Vec<InstanceView>, AppError> {
+    state.0.list_instance_views(host_id).await
+}
+
+#[tauri::command]
+fn backend_options(state: State<'_, AppState>) -> Vec<BackendOptionView> {
+    state.0.backend_options()
 }
 
 #[tauri::command]
@@ -192,21 +190,24 @@ async fn delete_user(state: State<'_, AppState>, user_id: Uuid) -> Result<(), Ap
 async fn create_device(
     state: State<'_, AppState>,
     input: CreateDeviceInput,
-) -> Result<Device, AppError> {
-    state.0.create_device(input).await
+) -> Result<DeviceView, AppError> {
+    state.0.create_device_view(input).await
 }
 
 #[tauri::command]
-async fn update_device(state: State<'_, AppState>, device: Device) -> Result<Device, AppError> {
-    state.0.update_device(device).await
+async fn update_device(
+    state: State<'_, AppState>,
+    input: UpdateDeviceInput,
+) -> Result<DeviceView, AppError> {
+    state.0.update_device_metadata(input).await
 }
 
 #[tauri::command]
 async fn list_devices(
     state: State<'_, AppState>,
     instance_id: Uuid,
-) -> Result<Vec<Device>, AppError> {
-    state.0.list_devices(instance_id).await
+) -> Result<Vec<DeviceView>, AppError> {
+    state.0.list_device_views(instance_id).await
 }
 
 #[tauri::command]
@@ -218,8 +219,8 @@ async fn delete_device(state: State<'_, AppState>, device_id: Uuid) -> Result<()
 async fn replace_device_identity(
     state: State<'_, AppState>,
     device_id: Uuid,
-) -> Result<Device, AppError> {
-    state.0.replace_device_identity(device_id).await
+) -> Result<DeviceView, AppError> {
+    state.0.replace_device_identity_view(device_id).await
 }
 
 #[tauri::command]
@@ -395,8 +396,8 @@ pub fn run() {
             approve_host_key,
             inspect_host,
             create_instance,
-            update_instance,
             list_instances,
+            backend_options,
             render_instance,
             plan_instance,
             apply_instance,

@@ -31,11 +31,87 @@ export interface DockerHost {
   updated_at: string;
 }
 
+export type VpnBackendKind =
+  | "wireguard"
+  | "amnezia_wg"
+  | "openvpn"
+  | "ikev2"
+  | "xray";
+
+export type BackendSettings =
+  | {
+      backend: "wireguard";
+      settings: { userspace_fallback: boolean };
+    }
+  | {
+      backend: "amnezia_wg";
+      settings: {
+        generation: "awg2";
+        jc: number;
+        jmin: number;
+        jmax: number;
+        s1: number;
+        s2: number;
+        s3: number;
+        s4: number;
+        h1: { min: number; max: number };
+        h2: { min: number; max: number };
+        h3: { min: number; max: number };
+        h4: { min: number; max: number };
+      };
+    }
+  | {
+      backend: "openvpn";
+      settings: {
+        transport: "tcp" | "udp";
+        cipher: "aes256-gcm" | "chacha20-poly1305";
+        tls_protection: "tls_crypt" | "none";
+        certificate_lifetime_days: number;
+      };
+    }
+  | {
+      backend: "ikev2";
+      settings: {
+        server_identity: string;
+        certificate_lifetime_days: number;
+      };
+    }
+  | {
+      backend: "xray";
+      settings: {
+        security: "tls" | "reality";
+        transport: "tcp" | "xhttp" | "mkcp";
+        server_name: string;
+        fingerprint: string;
+        xhttp_path: string;
+        reality_public_key?: string | null;
+        reality_short_id?: string | null;
+      };
+    };
+
+export interface BackendCapabilities {
+  allocated_tunnel_addresses: boolean;
+  managed_dns: boolean;
+  quick_credential_refresh: boolean;
+  live_identity_updates: boolean;
+  qr_export: boolean;
+  traffic_statistics: boolean;
+  certificate_authority: boolean;
+}
+
+export interface BackendOption {
+  kind: VpnBackendKind;
+  display_name: string;
+  default_port: number;
+  capabilities: BackendCapabilities;
+}
+
 export interface VpnInstance {
   id: UUID;
   host_id: UUID;
   display_name: string;
-  backend: "wire_guard";
+  backend: VpnBackendKind;
+  backend_settings: BackendSettings;
   endpoint: { host: string; port: number };
   network: {
     ipv4_subnet: string;
@@ -61,19 +137,41 @@ export interface Device {
   instance_id: UUID;
   user_id?: UUID;
   display_name: string;
-  ipv4_address: string;
+  ipv4_address?: string | null;
   ipv6_address?: string;
   dns_name?: string;
   enabled: boolean;
-  backend_data: {
-    backend: "wire_guard";
-    data: {
-      public_key: string;
-      private_key_ref: UUID;
-      preshared_key_ref?: UUID | null;
-    };
-  };
+  backend: VpnBackendKind;
+  public_identity:
+    | {
+        backend: "wireguard";
+        identity: { public_key: string; preshared_key: boolean };
+      }
+    | {
+        backend: "amnezia_wg";
+        identity: { public_key: string };
+      }
+    | {
+        backend: "openvpn";
+        identity: { common_name: string; certificate_serial?: string | null };
+      }
+    | {
+        backend: "ikev2";
+        identity: { identity: string; certificate_serial?: string | null };
+      }
+    | {
+        backend: "xray";
+        identity: { client_id: UUID; email: string; flow?: string | null };
+      };
   created_at: string;
+}
+
+export interface UpdateDeviceInput {
+  id: UUID;
+  user_id?: UUID | null;
+  display_name: string;
+  dns_name?: string | null;
+  enabled: boolean;
 }
 
 export type DnsRecordType = "A" | "AAAA" | "CNAME" | "TXT" | "SRV";
@@ -134,6 +232,10 @@ export interface DeploymentPlan {
 export interface InstanceHealth {
   compose_project_exists: boolean;
   gateway_running: boolean;
+  backend_ready: boolean;
+  listeners_ready: boolean;
+  client_state_matches: boolean;
+  dns_required: boolean;
   dns_running: boolean;
   watchtower_running: boolean;
   private_dns_resolves: boolean;

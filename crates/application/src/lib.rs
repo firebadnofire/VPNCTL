@@ -31,12 +31,13 @@ use vam_backend_xray::{REALITY_PUBLIC_KEY_PATH, REALITY_SHORT_ID_PATH, XrayBacke
 #[cfg(test)]
 use vam_core::DEFAULT_PORT;
 use vam_core::{
-    AmneziaWgDeviceData, BackendSettings, DEFAULT_DNS_ZONE, DEFAULT_KEEPALIVE, DEFAULT_SUBNET,
-    DesiredState, Device, DeviceBackendData, DnsConfig, DnsRecord, DnsRecordType, DockerHost,
-    EndpointConfig, Ikev2DeviceData, ListenerPort, NetworkConfig, OpenVpnDeviceData,
-    OpenVpnTlsProtection, RoutingMode, SecretReference, SshConnectionConfig, TransportProtocol,
-    User, VpnBackendKind, VpnInstance, WireGuardDeviceData, XraySecurity, allocate_next_ipv4,
-    first_usable, validate_host_instances, validate_instance,
+    AmneziaWgDeviceData, AmneziaWgSettings, BackendSettings, DEFAULT_DNS_ZONE, DEFAULT_KEEPALIVE,
+    DEFAULT_SUBNET, DesiredState, Device, DeviceBackendData, DnsConfig, DnsRecord, DnsRecordType,
+    DockerHost, EndpointConfig, Ikev2DeviceData, Ikev2Settings, ListenerPort, NetworkConfig,
+    OpenVpnDeviceData, OpenVpnSettings, OpenVpnTlsProtection, RoutingMode, SecretReference,
+    SshConnectionConfig, TransportProtocol, User, VpnBackendKind, VpnInstance, WireGuardDeviceData,
+    WireGuardSettings, XraySecurity, XrayTransport, allocate_next_ipv4, first_usable,
+    validate_host_instances, validate_instance,
 };
 use vam_deployment::{
     COREDNS_IMAGE, DeploymentExecutor, DeploymentPlanner, RemoteManifest, build_manifest,
@@ -112,7 +113,7 @@ pub struct CreateInstanceInput {
     #[serde(default = "default_backend")]
     pub backend: VpnBackendKind,
     #[serde(default)]
-    pub backend_settings: Option<BackendSettings>,
+    pub backend_settings: Option<BackendSettingsInput>,
     #[serde(default)]
     pub endpoint_port: Option<u16>,
     #[serde(default = "default_subnet")]
@@ -121,6 +122,129 @@ pub struct CreateInstanceInput {
     pub dns_zone: String,
     #[serde(default)]
     pub routing_mode: Option<RoutingMode>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "backend", content = "settings")]
+pub enum BackendSettingsInput {
+    #[serde(rename = "wireguard")]
+    WireGuard(WireGuardSettings),
+    #[serde(rename = "amnezia_wg")]
+    AmneziaWg(AmneziaWgSettings),
+    #[serde(rename = "openvpn")]
+    OpenVpn(OpenVpnSettings),
+    #[serde(rename = "ikev2")]
+    Ikev2(Ikev2Settings),
+    #[serde(rename = "xray")]
+    Xray(PublicXraySettings),
+}
+
+impl BackendSettingsInput {
+    #[must_use]
+    pub const fn kind(&self) -> VpnBackendKind {
+        match self {
+            Self::WireGuard(_) => VpnBackendKind::WireGuard,
+            Self::AmneziaWg(_) => VpnBackendKind::AmneziaWg,
+            Self::OpenVpn(_) => VpnBackendKind::OpenVpn,
+            Self::Ikev2(_) => VpnBackendKind::Ikev2,
+            Self::Xray(_) => VpnBackendKind::Xray,
+        }
+    }
+
+    #[must_use]
+    pub fn into_backend_settings(self) -> BackendSettings {
+        match self {
+            Self::WireGuard(settings) => BackendSettings::WireGuard(settings),
+            Self::AmneziaWg(settings) => BackendSettings::AmneziaWg(settings),
+            Self::OpenVpn(settings) => BackendSettings::OpenVpn(settings),
+            Self::Ikev2(settings) => BackendSettings::Ikev2(settings),
+            Self::Xray(settings) => BackendSettings::Xray(settings.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PublicXraySettings {
+    pub security: XraySecurity,
+    pub transport: XrayTransport,
+    pub server_name: String,
+    pub fingerprint: String,
+    pub xhttp_path: String,
+    #[serde(default)]
+    pub reality_public_key: Option<String>,
+    #[serde(default)]
+    pub reality_short_id: Option<String>,
+}
+
+impl From<PublicXraySettings> for vam_core::XraySettings {
+    fn from(settings: PublicXraySettings) -> Self {
+        Self {
+            security: settings.security,
+            transport: settings.transport,
+            server_name: settings.server_name,
+            fingerprint: settings.fingerprint,
+            xhttp_path: settings.xhttp_path,
+            reality_public_key: settings.reality_public_key,
+            reality_short_id: settings.reality_short_id,
+            tls_certificate_ref: None,
+            tls_private_key_ref: None,
+        }
+    }
+}
+
+impl From<&BackendSettings> for BackendSettingsInput {
+    fn from(settings: &BackendSettings) -> Self {
+        match settings {
+            BackendSettings::WireGuard(settings) => Self::WireGuard(*settings),
+            BackendSettings::AmneziaWg(settings) => Self::AmneziaWg(settings.clone()),
+            BackendSettings::OpenVpn(settings) => Self::OpenVpn(settings.clone()),
+            BackendSettings::Ikev2(settings) => Self::Ikev2(settings.clone()),
+            BackendSettings::Xray(settings) => Self::Xray(PublicXraySettings {
+                security: settings.security,
+                transport: settings.transport,
+                server_name: settings.server_name.clone(),
+                fingerprint: settings.fingerprint.clone(),
+                xhttp_path: settings.xhttp_path.clone(),
+                reality_public_key: settings.reality_public_key.clone(),
+                reality_short_id: settings.reality_short_id.clone(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstanceView {
+    pub id: Uuid,
+    pub host_id: Uuid,
+    pub display_name: String,
+    pub backend: VpnBackendKind,
+    pub backend_settings: BackendSettingsInput,
+    pub endpoint: EndpointConfig,
+    pub network: NetworkConfig,
+    pub dns: DnsConfig,
+    pub routing_mode: RoutingMode,
+    pub persistent_keepalive: u16,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+impl From<&VpnInstance> for InstanceView {
+    fn from(instance: &VpnInstance) -> Self {
+        Self {
+            id: instance.id,
+            host_id: instance.host_id,
+            display_name: instance.display_name.clone(),
+            backend: instance.backend,
+            backend_settings: BackendSettingsInput::from(&instance.backend_settings),
+            endpoint: instance.endpoint.clone(),
+            network: instance.network.clone(),
+            dns: instance.dns.clone(),
+            routing_mode: instance.routing_mode,
+            persistent_keepalive: instance.persistent_keepalive,
+            created_at: instance.created_at,
+            updated_at: instance.updated_at,
+        }
+    }
 }
 
 const fn default_backend() -> VpnBackendKind {
@@ -788,14 +912,15 @@ fi
             .await
             .map_err(storage_error)?;
         let endpoint_host = input.endpoint_host.trim().to_owned();
-        let backend_settings = input
-            .backend_settings
-            .unwrap_or_else(|| BackendSettings::defaults_for(input.backend, &endpoint_host));
-        if backend_settings.kind() != input.backend {
-            return Err(validation_error(
-                "Backend settings do not match the selected backend.",
-            ));
-        }
+        let backend_settings = match input.backend_settings {
+            Some(settings) if settings.kind() == input.backend => settings.into_backend_settings(),
+            Some(_) => {
+                return Err(validation_error(
+                    "Backend settings do not match the selected backend.",
+                ));
+            }
+            None => BackendSettings::defaults_for(input.backend, &endpoint_host),
+        };
         let subnet: Ipv4Net = input
             .ipv4_subnet
             .parse()
@@ -892,6 +1017,26 @@ fi
             .list_instances(host_id)
             .await
             .map_err(storage_error)
+    }
+
+    pub async fn create_instance_view(
+        &self,
+        input: CreateInstanceInput,
+    ) -> Result<InstanceView, AppError> {
+        let instance = self.create_instance(input).await?;
+        Ok(InstanceView::from(&instance))
+    }
+
+    pub async fn list_instance_views(
+        &self,
+        host_id: Option<Uuid>,
+    ) -> Result<Vec<InstanceView>, AppError> {
+        Ok(self
+            .list_instances(host_id)
+            .await?
+            .iter()
+            .map(InstanceView::from)
+            .collect())
     }
 
     pub fn backend_options(&self) -> Vec<BackendOptionView> {
@@ -6050,7 +6195,9 @@ mod tests {
                 display_name: "mismatch".into(),
                 endpoint_host: "vpn.example.test".into(),
                 backend: VpnBackendKind::OpenVpn,
-                backend_settings: Some(BackendSettings::default()),
+                backend_settings: Some(BackendSettingsInput::WireGuard(
+                    WireGuardSettings::default(),
+                )),
                 endpoint_port: None,
                 ipv4_subnet: "10.65.0.0/24".into(),
                 dns_zone: "mismatch.internal".into(),
@@ -6141,6 +6288,27 @@ mod tests {
         );
         let after = service.storage.get_device(view.id).await.unwrap();
         assert_eq!(after.backend_data, raw.backend_data);
+    }
+
+    #[test]
+    fn public_instance_view_omits_xray_tls_secret_references() {
+        let mut instance = command_state(VpnBackendKind::Xray).instance;
+        let certificate_ref = SecretReference(Uuid::new_v4());
+        let private_key_ref = SecretReference(Uuid::new_v4());
+        let BackendSettings::Xray(settings) = &mut instance.backend_settings else {
+            panic!("expected Xray settings");
+        };
+        settings.security = XraySecurity::Tls;
+        settings.reality_public_key = None;
+        settings.reality_short_id = None;
+        settings.tls_certificate_ref = Some(certificate_ref.clone());
+        settings.tls_private_key_ref = Some(private_key_ref.clone());
+
+        let json = serde_json::to_string(&InstanceView::from(&instance)).unwrap();
+        assert!(!json.contains("tls_certificate_ref"));
+        assert!(!json.contains("tls_private_key_ref"));
+        assert!(!json.contains(&certificate_ref.0.to_string()));
+        assert!(!json.contains(&private_key_ref.0.to_string()));
     }
 
     #[tokio::test]

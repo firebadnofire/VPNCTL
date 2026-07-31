@@ -270,7 +270,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::InstanceAdd(args) => {
             print_json(
                 &service
-                    .create_instance(CreateInstanceInput {
+                    .create_instance_view(CreateInstanceInput {
                         host_id: args.host_id,
                         display_name: args.name,
                         endpoint_host: args.endpoint,
@@ -285,7 +285,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
         }
         Command::InstanceList { host_id } => {
-            print_json(&service.list_instances(host_id).await?)?;
+            print_json(&service.list_instance_views(host_id).await?)?;
         }
         Command::Render { instance_id } => {
             let mut files = service.render_instance(instance_id).await?;
