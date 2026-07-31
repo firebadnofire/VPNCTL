@@ -10,7 +10,7 @@ use vam_application::{
 use vam_core::{DnsRecord, DockerHost, User};
 use vam_protocol::{
     AppError, BackupInfo, DeploymentPlan, DeploymentProgress, DeploymentResult, DeploymentSummary,
-    HostInspection, HostKeyInfo, HostKeyProbe, InstanceHealth, RenderedFile,
+    HostInspection, HostKeyInfo, HostKeyProbe, HostProvisioningPlan, InstanceHealth, RenderedFile,
 };
 use vam_secrets::KeychainSecretStore;
 use vam_storage::Storage;
@@ -85,6 +85,26 @@ async fn inspect_host(
     host_id: Uuid,
 ) -> Result<HostInspection, AppError> {
     state.0.inspect_host(host_id).await
+}
+
+#[tauri::command]
+async fn plan_host_provisioning(
+    state: State<'_, AppState>,
+    host_id: Uuid,
+) -> Result<HostProvisioningPlan, AppError> {
+    state.0.plan_host_provisioning(host_id).await
+}
+
+#[tauri::command]
+async fn apply_host_provisioning(
+    state: State<'_, AppState>,
+    host_id: Uuid,
+    expected_state_hash: String,
+) -> Result<HostInspection, AppError> {
+    state
+        .0
+        .apply_host_provisioning(host_id, &expected_state_hash)
+        .await
 }
 
 #[tauri::command]
@@ -395,6 +415,8 @@ pub fn run() {
             probe_host_key,
             approve_host_key,
             inspect_host,
+            plan_host_provisioning,
+            apply_host_provisioning,
             create_instance,
             list_instances,
             backend_options,

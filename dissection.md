@@ -4240,3 +4240,91 @@ because this machine lacks NASM for AWS-LC. The manifest was restored after the
 gates, and `cargo tree -i aws-lc-rs -e features` confirms the delivered default
 russh/AWS-LC graph. The intentional lockfile change only adds the existing
 workspace-pinned `sha2` crate to `vam-application`.
+
+Commit:
+
+- `00933dc feat: provision fresh Docker hosts safely`;
+- verified good EDDSA signature from William Jones' configured YubiKey-backed
+  key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### 10B plan
+
+The client exposure remains deliberately thin:
+
+1. Add `host-provision-plan` and `host-provision-apply` developer CLI commands.
+   Apply requires `--expected-state-hash`; there is no force or bypass flag.
+2. Add matching Tauri commands returning the protocol plan/inspection types,
+   and register them in the single invoke handler.
+3. Extend TypeScript types with the closed package-manager and operation
+   shapes. The frontend will render human descriptions from operation
+   discriminators but will never receive or construct a shell script.
+4. Add a Review setup action beside host inspection when deployment
+   prerequisites are not ready. The action obtains a fresh Rust plan and opens
+   a dedicated modal containing manager, ordered operations, warnings,
+   root/sudo authority, and the root-equivalent Docker-group warning. Apply
+   sends only host ID plus the exact state hash, then replaces the visible
+   inspection with the post-apply inspection returned by Rust.
+5. Validate CLI parsing/dispatch, Tauri compilation, Svelte diagnostics,
+   frontend tests, production bundling, formatting, and patch sanity before a
+   separate signed commit.
+
+### 10B implementation
+
+The developer CLI now has two deliberately separate commands:
+
+- `host-provision-plan <host-id>` performs verified inspection and prints the
+  typed plan;
+- `host-provision-apply <host-id> --expected-state-hash <hash>` re-plans,
+  rejects stale state, applies the fixed setup, and prints the post-apply
+  inspection.
+
+There is no force switch, raw-command argument, package override, or way to
+skip the state hash. Tauri exposes the same two application methods as thin
+commands and registers them beside host inspection.
+
+The TypeScript boundary mirrors the protocol's closed package-manager and
+operation discriminators. It does not define or receive a script field. The
+desktop translates only those discriminators into operator-facing descriptions
+such as “Install Docker Compose v2 from the distribution repository.”
+
+Host inspection now presents separate status for:
+
+- Docker CLI/Engine installation;
+- direct Docker access by the SSH user;
+- privileged Docker daemon access;
+- actual Compose v2 readiness rather than any nonempty Compose string;
+- detected package manager;
+- root or noninteractive-sudo setup authority;
+- WireGuard kernel availability and `/opt` bootstrap access.
+
+Selecting another host clears the previous inspection and setup plan, avoiding
+an inspection/action mismatch. When prerequisites are incomplete, an explicit
+Review setup call asks Rust for a fresh plan. The modal shows package manager,
+authority, ordered operations, warnings, and the full observed-state hash. The
+Docker-group operation is written as root-equivalent access in both the
+application warning and visible operation label.
+
+Apply sends only the plan's host ID and expected state hash. The modal remains
+available if Rust rejects or fails the operation; on success, it is replaced by
+the post-apply inspection returned after the fresh SSH check. Normal deploy
+preview remains a separate workflow and cannot trigger package installation.
+
+### 10B validation
+
+Passing gates:
+
+- 4 CLI parser tests, including rejection of host setup Apply without
+  `--expected-state-hash`;
+- Tauri library and binary test compilation;
+- strict Clippy for CLI and Tauri, all targets, with `-D warnings`;
+- `svelte-check`: 0 errors and 0 warnings;
+- Vitest: 2/2 tests;
+- Vite production build: 113 modules transformed and a complete bundle;
+- formatting and `git diff --check`.
+
+The Rust gates used the temporary Ring diagnostic and then restored the
+workspace manifest. `cargo tree -i aws-lc-rs -e features` again confirms the
+delivered default russh/AWS-LC graph. The frontend tools ran directly from the
+installed workspace binaries outside the restricted read sandbox because
+pnpm-linked dependencies under the user profile otherwise raise `EPERM`; no
+packages were installed or changed.

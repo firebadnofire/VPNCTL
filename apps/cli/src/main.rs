@@ -37,6 +37,14 @@ enum Command {
     HostInspect {
         host_id: Uuid,
     },
+    HostProvisionPlan {
+        host_id: Uuid,
+    },
+    HostProvisionApply {
+        host_id: Uuid,
+        #[arg(long)]
+        expected_state_hash: String,
+    },
     InstanceAdd(InstanceAdd),
     InstanceList {
         #[arg(long)]
@@ -267,6 +275,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("Host key approved.");
         }
         Command::HostInspect { host_id } => print_json(&service.inspect_host(host_id).await?)?,
+        Command::HostProvisionPlan { host_id } => {
+            print_json(&service.plan_host_provisioning(host_id).await?)?;
+        }
+        Command::HostProvisionApply {
+            host_id,
+            expected_state_hash,
+        } => {
+            print_json(
+                &service
+                    .apply_host_provisioning(host_id, &expected_state_hash)
+                    .await?,
+            )?;
+        }
         Command::InstanceAdd(args) => {
             print_json(
                 &service
@@ -463,5 +484,27 @@ mod tests {
             VpnBackendKind::WireGuard
         );
         assert_eq!(args.port, None);
+    }
+
+    #[test]
+    fn host_provision_apply_requires_an_expected_state_hash() {
+        let host_id = Uuid::nil().to_string();
+        assert!(Cli::try_parse_from(["vam-dev", "host-provision-apply", &host_id]).is_err());
+        let cli = Cli::try_parse_from([
+            "vam-dev",
+            "host-provision-apply",
+            &host_id,
+            "--expected-state-hash",
+            "reviewed-hash",
+        ])
+        .expect("hash-bound host provisioning should parse");
+        let Command::HostProvisionApply {
+            expected_state_hash,
+            ..
+        } = cli.command
+        else {
+            panic!("expected host-provision-apply");
+        };
+        assert_eq!(expected_state_hash, "reviewed-hash");
     }
 }

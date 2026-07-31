@@ -18,6 +18,8 @@
     DockerHost,
     HostInspection,
     HostKeyProbe,
+    HostProvisioningOperation,
+    HostProvisioningPlan,
     InstanceHealth,
     UpdateDeviceInput,
     VpnBackendKind,
@@ -33,6 +35,7 @@
     | "device"
     | "dns"
     | "hostlist"
+    | "host-setup"
     | "plan"
     | "qr"
     | null;
@@ -158,6 +161,7 @@
   let noticeHealth: InstanceHealth | null = null;
   let error: AppError | null = null;
   let inspection: HostInspection | null = null;
+  let hostSetupPlan: HostProvisioningPlan | null = null;
   let probe: HostKeyProbe | null = null;
   let defaultSshUsername = "";
   let fingerprintConfirmation = "";
@@ -359,10 +363,67 @@
 
   async function inspect(host: DockerHost) {
     selectedHostId = host.id;
+    inspection = null;
+    hostSetupPlan = null;
     const result = await task("Inspecting host", () =>
       call<HostInspection>("inspect_host", { hostId: host.id }),
     );
     if (result) inspection = result;
+  }
+
+  function composeV2Available(value?: string) {
+    const major = value?.trim().replace(/^v/, "").split(".")[0];
+    return Boolean(major && Number.parseInt(major, 10) >= 2);
+  }
+
+  function hostPrerequisitesReady(value: HostInspection) {
+    return (
+      value.operating_system === "Linux" &&
+      value.docker_installed &&
+      value.docker_accessible &&
+      composeV2Available(value.compose_version)
+    );
+  }
+
+  function hostSetupOperationLabel(operation: HostProvisioningOperation) {
+    switch (operation.operation) {
+      case "install_docker_engine":
+        return "Install Docker Engine from the distribution repository";
+      case "install_compose_plugin":
+        return "Install Docker Compose v2 from the distribution repository";
+      case "enable_docker_service":
+        return "Enable and start the Docker service";
+      case "grant_docker_access":
+        return "Add the SSH user to the Docker group (root-equivalent access)";
+      case "verify_prerequisites":
+        return "Reconnect and verify direct Docker and Compose v2 access";
+    }
+  }
+
+  async function reviewHostSetup(host: DockerHost) {
+    selectedHostId = host.id;
+    const result = await task("Calculating host setup plan", () =>
+      call<HostProvisioningPlan>("plan_host_provisioning", { hostId: host.id }),
+    );
+    if (!result) return;
+    hostSetupPlan = result;
+    modal = "host-setup";
+  }
+
+  async function applyHostSetup() {
+    if (!hostSetupPlan) return;
+    const pendingPlan = hostSetupPlan;
+    const result = await task("Applying and verifying host setup", () =>
+      call<HostInspection>("apply_host_provisioning", {
+        hostId: pendingPlan.host_id,
+        expectedStateHash: pendingPlan.expected_state_hash,
+      }),
+    );
+    if (!result) return;
+    inspection = result;
+    hostSetupPlan = null;
+    modal = null;
+    notice = "Host setup succeeded. Docker and Compose v2 are directly accessible over a fresh verified SSH session.";
   }
 
   async function removeHost(host: DockerHost) {
@@ -378,6 +439,7 @@
     if (selectedHostId === host.id) {
       selectedHostId = "";
       inspection = null;
+      hostSetupPlan = null;
       probe = null;
     }
     await refresh();
@@ -995,7 +1057,7 @@
             {#each hosts as host}
               <article class:selected={host.id === selectedHostId}>
                 <div class="status-icon">⌁</div>
-                <button class="row-main row-select" onclick={() => (selectedHostId = host.id)}>
+                <button class="row-main row-select" onclick={() => { selectedHostId = host.id; inspection = null; hostSetupPlan = null; }}>
                   <strong>{host.display_name}</strong>
                   <small>{host.ssh.username}@{host.ssh.hostname}:{host.ssh.port}</small>
                 </button>
@@ -1013,14 +1075,23 @@
         <section class="panel compact">
           <div class="panel-head"><h3>{selectedHost.display_name} inspection</h3><span>{inspection.operating_system} · {inspection.architecture}</span></div>
           <div class="checks">
-            <div class:pass={inspection.docker_accessible}><b>Docker</b><span>{inspection.docker_version || "Not found"}</span></div>
-            <div class:pass={Boolean(inspection.compose_version)}><b>Compose plugin</b><span>{inspection.compose_version || "Not found"}</span></div>
+            <div class:pass={inspection.docker_installed}><b>Docker Engine</b><span>{inspection.docker_version || (inspection.docker_installed ? "Installed; daemon unavailable" : "Not found")}</span></div>
+            <div class:pass={inspection.docker_accessible}><b>Direct Docker access</b><span>{inspection.docker_accessible ? "Available" : inspection.docker_privileged_accessible ? "Privilege works; user access blocked" : "Daemon unavailable"}</span></div>
+            <div class:pass={composeV2Available(inspection.compose_version)}><b>Compose v2</b><span>{inspection.compose_version || "Not found"}</span></div>
+            <div class:pass={Boolean(inspection.package_manager) || hostPrerequisitesReady(inspection)}><b>Package manager</b><span>{inspection.package_manager?.toUpperCase() || (hostPrerequisitesReady(inspection) ? "Not needed" : "Unsupported")}</span></div>
             <div class:pass={inspection.wireguard_kernel_available}><b>WireGuard</b><span>{inspection.wireguard_kernel_available ? "Available" : "Userspace fallback via container"}</span></div>
+            <div class:pass={inspection.effective_user_is_root || inspection.sudo_bootstrap_available}><b>Setup authority</b><span>{inspection.effective_user_is_root ? "Root session" : inspection.sudo_bootstrap_available ? "sudo -n available" : "Manual setup required"}</span></div>
             <div class:pass={inspection.application_root_writable || inspection.sudo_bootstrap_available}><b>/opt bootstrap</b><span>{inspection.application_root_writable ? "Writable" : inspection.sudo_bootstrap_available ? "sudo -n available" : "Blocked"}</span></div>
           </div>
           {#if inspection.warnings.length}
             <div class="warning-list">
               {#each inspection.warnings as warning}<div class="warning">{warning}</div>{/each}
+            </div>
+          {/if}
+          {#if !hostPrerequisitesReady(inspection)}
+            <div class="host-setup-cta">
+              <div><strong>Prerequisites need attention</strong><span>Review the exact package, service, and access changes before anything is installed.</span></div>
+              <button class="primary" onclick={() => reviewHostSetup(selectedHost)}>Review setup</button>
             </div>
           {/if}
         </section>
@@ -1325,6 +1396,23 @@
           <p class="help">Saved hostlists are fetched over HTTPS while rendering deployments. The app starts with no built-in hostlists.</p>
           <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary">{hostlistForm.id ? "Save changes" : "Add hostlist"}</button></div>
         </form>
+      {:else if modal === "host-setup" && hostSetupPlan}
+        <div class="modal-head"><div><p class="eyebrow">HOST SETUP PREVIEW</p><h2>Prepare Docker prerequisites</h2></div><button onclick={() => (modal = null)}>Close</button></div>
+        <p class="help">This preview is bound to the current verified inspection. Apply will re-inspect first and stop if the host state or plan has changed.</p>
+        <div class="setup-facts">
+          <div><span>Package manager</span><strong>{hostSetupPlan.package_manager?.toUpperCase() || "Not required"}</strong></div>
+          <div><span>Authority</span><strong>{inspection?.effective_user_is_root ? "Root session" : inspection?.sudo_bootstrap_available ? "Noninteractive sudo" : "Unavailable"}</strong></div>
+        </div>
+        {#if hostSetupPlan.operations.length}
+          <ol class="operations">
+            {#each hostSetupPlan.operations as operation}<li>{hostSetupOperationLabel(operation)}</li>{/each}
+          </ol>
+        {:else}
+          <div class="empty small-empty"><h3>No setup changes</h3><p>Docker and Compose v2 are already ready.</p></div>
+        {/if}
+        {#each hostSetupPlan.warnings as warning}<div class="warning">{warning}</div>{/each}
+        <div class="hash">Observed host state <code>{hostSetupPlan.expected_state_hash}</code></div>
+        <div class="modal-actions"><button class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary" onclick={applyHostSetup} disabled={!hostSetupPlan.operations.length || Boolean(busy)}>Apply host setup</button></div>
       {:else if modal === "plan" && plan}
         <div class="modal-head"><div><p class="eyebrow">DEPLOYMENT PREVIEW</p><h2>Preview remote changes</h2></div><button onclick={() => (modal = null)}>×</button></div>
         <p class="help">This preview shows what Apply will change on the verified SSH host. Nothing is changed until you apply it.</p>

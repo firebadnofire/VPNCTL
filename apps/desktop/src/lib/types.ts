@@ -212,13 +212,35 @@ export interface HostKeyProbe {
 export interface HostInspection {
   operating_system: string;
   architecture: string;
+  package_manager?: "apt" | "dnf" | "yum" | "zypper" | "pacman";
+  effective_user_is_root: boolean;
+  docker_installed: boolean;
   docker_version?: string;
   compose_version?: string;
   docker_accessible: boolean;
+  docker_privileged_accessible: boolean;
+  docker_group_member: boolean;
   wireguard_kernel_available: boolean;
   application_root_writable: boolean;
   sudo_bootstrap_available: boolean;
   warnings: string[];
+}
+
+export type HostProvisioningOperation = {
+  operation:
+    | "install_docker_engine"
+    | "install_compose_plugin"
+    | "enable_docker_service"
+    | "grant_docker_access"
+    | "verify_prerequisites";
+};
+
+export interface HostProvisioningPlan {
+  host_id: UUID;
+  package_manager?: "apt" | "dnf" | "yum" | "zypper" | "pacman";
+  operations: HostProvisioningOperation[];
+  warnings: string[];
+  expected_state_hash: string;
 }
 
 export interface DeploymentPlan {
