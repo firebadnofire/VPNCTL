@@ -5825,3 +5825,108 @@ signature).
 
 Planned signed commit:
 `fix: secure Xray deployment state lifecycle`.
+
+### 12R. Consolidated five-backend live deployment and Windows release validation (2026-07-31)
+
+This unit consolidates the evidence for the requested real-host deployment
+matrix. The target was the explicitly disposable Linode development VM at
+`172.239.63.147`. Its pinned ED25519 host-key identity was verified as
+`SHA256:npTb+VUM22DNWCFWU/7USfv3bjQf7MKQFnBXUAjl8po` before privileged work.
+The application transport authenticated with the supplied PuTTY PPK through
+the same russh path used by the desktop application. The supplied OpenSSH PEM
+also authenticated through the system client from an ACL-restricted temporary
+copy; the original key was not changed and the temporary copy was removed.
+
+One explicit host inspection produced the shared facts consumed by all backend
+readiness evaluations: Linux x86_64, Docker 29.6.2, Compose 5.3.1, directly
+accessible Docker, `/dev/net/tun`, WireGuard kernel support, manageable UFW,
+writable application root, and sudo bootstrap authority. No render-time probe
+or per-backend inspection loop was introduced.
+
+The live matrix used an isolated local database at
+`C:\Users\william\AppData\Local\Temp\vam-live-matrix-20260731-134342\state.sqlite`
+and distinct ports/subnets so it did not collide with unrelated remote state.
+Exports were written only beneath that temporary test directory. Their sizes
+and formats were checked, but their private keys, passwords, UUIDs, certificate
+contents, and complete URI/configuration text were never printed.
+
+| Backend | Server activation | Real client state | Export | Final explicit health |
+| --- | --- | --- | --- | --- |
+| WireGuard | `c00b105d-f3c3-41de-bbb7-f062b8be0d13` | `1c432881-b05f-4e27-9507-51d4cea0477b` | 317-byte WireGuard configuration | Compose, gateway, listener, peer set, managed DNS, and resolution passed |
+| AmneziaWG 2 | `f3267943-07d9-4563-9a2c-e474e070bcb4` | `ba1c961a-d5c4-4517-a12e-ac2538758f06` | 431-byte AWG configuration | Compose, gateway, listener, peer set, managed DNS, and resolution passed |
+| OpenVPN | `d2e67959-c890-40f5-8aeb-5d94bd7647ec` | `94c6085f-31f2-48c5-85b7-d4df8ca4f231` | 2,888-byte `.ovpn` profile | Compose, gateway, OpenVPN configuration, listener, certificate state, managed DNS, and resolution passed |
+| IKEv2 | `f4464d73-7737-493a-8535-bad1f4e2507d` | `cf9e0d9b-6b18-4a6d-be9c-5d81b23c786f` | 1,988-byte protected PKCS#12 bundle | Compose, gateway, strongSwan/VICI readiness, UDP 500/4500 listeners, certificate state, managed DNS, and resolution passed |
+| Xray | `9b9ff575-8e05-480b-af4c-e14f806bac0a` | `d9679999-20d4-4a89-b9fb-a92060984aea` | 260-byte VLESS URI | Compose, non-root gateway, Xray self-test, TCP listener, and exact client state passed; DNS is correctly not applicable |
+
+The matrix exposed defects that isolated unit tests could not fully reproduce:
+
+- OpenVPN and IKEv2 used unsupported command-line-only validation modes; both
+  now use isolated bounded daemon startup probes with no published listeners;
+- certificate authority and issued-client artifacts created in root containers
+  were not consistently normalized for the application SSH user;
+- Windows Credential Manager could not hold larger OpenVPN/PKCS#12 values in a
+  single generic credential, so large values now use integrity-checked,
+  transactional chunks while retaining legacy reads;
+- IKEv2 Compose restarts could consume a stale VICI socket, and changes to
+  startup scripts copied into images were incorrectly planned as restarts;
+- Xray needed a protected root bootstrap followed by a direct UID-10001 exec,
+  sensitivity-specific REALITY permissions, explicit non-root health commands,
+  and root-in-container backup copies that preserve numeric ownership; and
+- deleting a never-deployed instance incorrectly required SSH and failed while
+  changing into a remote directory that could not exist. Undeployed deletion is
+  now local-only, while deployed cleanup remains remote and idempotently accepts
+  an already absent instance directory.
+
+Every failed live apply either rolled back successfully or failed before remote
+mutation. The Xray manual backup
+`2026-07-31T19-03-25Z-manual-d9679999-20d4-4a89-b9fb-a92060984aea`
+also proved the corrected numeric-ownership copy path. Test deployments remain
+on the explicitly disposable VM for inspection; no unrelated instance paths,
+containers, or ports were changed, and no remote cleanup was inferred from the
+deployment-test request.
+
+Final validation and environment result:
+
+- `.\build-helpers\windows\build.ps1 -SkipToolInstall` completed successfully;
+- Visual Studio C++ tools, Node 24.18.0, WebView2, NASM 3.02, Rust 1.97.1 with
+  rustfmt/Clippy, pnpm 11.9.0, and NSIS were already available; no missing
+  prerequisite or host package installation was required;
+- the helper's frozen pnpm install reported the workspace already up to date;
+- `pnpm verify` passed `cargo fmt --all -- --check`, strict workspace Clippy for
+  all targets, the complete Rust workspace tests, Svelte diagnostics, all 28
+  frontend tests, and the production web build;
+- the Rust workspace included 42 application, 5 AWG, 8 IKEv2, 9 OpenVPN, 4
+  WireGuard, 11 Xray, 9 core, 14 deployment, 4 CLI, 8 DNS, 2 protocol, 2
+  secrets, 4 SSH, and 14 storage tests, with the remaining binary/contract and
+  documentation targets also passing;
+- `svelte-check` reported zero errors and zero warnings;
+- Vitest reported 4/4 files and 28/28 tests passing;
+- the production Tauri build succeeded and NSIS produced
+  `target/release/bundle/nsis/VPN Appliance Manager_0.1.0_x64-setup.exe`
+  (6,679,294 bytes);
+- GNU Make is not installed in this Windows environment, so the literal
+  `make frontend-check`, `make frontend-test`, `make frontend-build`, `make
+  test`, and `make verify` wrappers could not run. Their underlying commands
+  were all executed successfully by the authoritative Windows helper, and Make
+  was not installed solely to add a wrapper layer;
+- final `git diff --check`, signed-commit verification, and clean-worktree
+  checks are performed immediately after this documentation update.
+
+Signed implementation commits, in order:
+
+- `71f0b7e fix: clarify instance settings workspace`;
+- `cff0e8e fix: show creation errors in active dialog`;
+- `94066c6 fix: allow longer OpenVPN certificate lifetimes`;
+- `ca41f09 fix: harden OpenVPN validation and undeployed deletion`;
+- `29be8e7 fix: complete certificate backend deployment lifecycle`;
+- `5de3ab2 fix: make IKEv2 deployment validation restart-safe`;
+- `06c53b9 fix: secure Xray deployment state lifecycle`.
+
+Each implementation commit was verified with a good EDDSA signature from key
+`7D6EF134D851C8DA0862D97494F31AF374E2EE3C`. No commit was pushed.
+
+Previous signed commit:
+`06c53b9 fix: secure Xray deployment state lifecycle` (good EDDSA signature).
+
+Planned signed commit:
+`docs: record live backend deployment validation`.
