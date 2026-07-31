@@ -1481,4 +1481,281 @@ Remaining validation before OpenVPN can be called provisionable:
 
 Commit:
 
-- pending staged-diff validation and signed commit.
+- `96ec7a9 feat: add OpenVPN certificate backend`;
+- created with `git commit -S`;
+- `git verify-commit HEAD` reported a good EDDSA signature from William Jones
+  using key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### Unit 4 plan: IKEv2 certificate backend
+
+Status: implementation plan complete. No IKEv2 code is changed in this planning
+unit.
+
+#### Reference findings
+
+The adjacent Amnezia implementation uses a Libreswan-derived mutable
+`amneziavpn/ipsec-server:latest` image, starts the container privileged, and
+combines three different products in one script:
+
+- certificate-authenticated IKEv2;
+- L2TP/IPsec with a shared secret;
+- XAuth/PSK.
+
+It generates a 3,072-bit RSA CA, server certificate, and client certificates
+inside the container's NSS database. The configurator then exports each client
+private key in a PKCS#12 bundle with an empty password. Its proposals include
+SHA-1 compatibility branches, its Apple profile disables revocation checking,
+and the examined client-management path has no complete certificate revocation
+flow.
+
+Only the useful protocol behavior will be retained:
+
+- fixed UDP listeners 500 and 4500;
+- a persistent server CA and server certificate;
+- certificate-authenticated IKEv2;
+- client certificate issue and export;
+- address-pool and DNS configuration;
+- NAT traversal;
+- certificate revocation.
+
+L2TP, XAuth, shared-password authentication, passwordless PKCS#12 export,
+mutable images, privileged mode, SHA-1 proposals, and disabled revocation are
+explicitly out of scope.
+
+#### Server implementation choice
+
+Use strongSwan with its current `swanctl`/VICI configuration model instead of
+Amnezia's Libreswan/NSS script. The planned deterministic local image is:
+
+- the same digest-pinned Alpine 3.23.5 base used by OpenVPN;
+- `strongswan=5.9.14-r3` from Alpine 3.23;
+- `iptables=1.8.11-r1`;
+- no unverified downloads;
+- no mutable image tag.
+
+Alpine's strongSwan package includes `charon`, `swanctl`, and `pki`. The image
+will run the IKE daemon directly, wait for the VICI socket, load declarative
+credentials/connections with `swanctl --load-all --noprompt`, and track the
+real foreground daemon. It will not start systemd, OpenRC, or a legacy
+`ipsec.conf` starter inside the container.
+
+The runtime should require only:
+
+- `NET_ADMIN`;
+- fixed UDP 500 and 4500 publication;
+- a writable per-instance `ikev2` mount at `/etc/swanctl`;
+- container-scoped IPv4 forwarding.
+
+It should not require `--privileged`, `/dev/ppp`, `/dev/net/tun`, a host
+`/lib/modules` mount, IKEv1 kernel modules, or unrelated host sysctls. NAT-T
+will be forced so ESP remains encapsulated in UDP 4500 through the Docker
+publication boundary.
+
+This is a design assumption until a disposable Linux Docker fixture proves
+the complete IKE/XFRM data path. If the fixture demonstrates that a Docker
+bridge cannot preserve the required IKEv2/NAT-T behavior on supported hosts,
+the correction must be an explicit backend runtime/network mode with a
+documented port-conflict model, not a silent move to privileged host
+networking.
+
+#### PKI and client identity
+
+Use an online, instance-scoped strongSwan CA retained only in durable remote
+storage and covered by backup/rollback. This is a pragmatic appliance design:
+an offline root plus online intermediate is stronger, but would require an
+external CA workflow beyond this product's self-provisioning scope. The remote
+CA key must never enter SQLite, application logs, client exports, or the
+frontend.
+
+Use ECDSA P-384 with SHA-384 for:
+
+- the remote CA;
+- the remote server certificate;
+- locally generated client private keys and CSRs.
+
+P-384 is accepted by current Windows IKEv2 clients and meets strongSwan's
+preferred ECDSA strength. Every server certificate must include:
+
+- `serverAuth`;
+- the IKE intermediate EKU where supported;
+- the configured server identity as a subject alternative name;
+- both DNS-name and IP-address SAN forms when the configured identity is an IP
+  address, because Windows matches IP endpoints through a DNS SAN while other
+  clients use the IP SAN.
+
+Every locally generated client CSR must include:
+
+- a strict instance-unique identity as common name;
+- the same value as a DNS SAN so native Windows identity matching succeeds;
+- `DigitalSignature`;
+- `ClientAuth`.
+
+Client private keys stay local. Only a CSR secret reference is uploaded for
+signing. The native secret store retains opaque references for the local
+private key and CSR, downloaded client and CA certificates, and the generated
+PKCS#12 password. The password-protected bundle itself is generated only for
+an explicit export and is held transiently in zeroizing binary memory.
+
+#### Binary secret export boundary
+
+The existing `ClientArtifact.contents: String` can represent WireGuard,
+AmneziaWG, and OpenVPN text but cannot safely represent a binary PKCS#12
+bundle. Before the backend, change the internal artifact payload into a closed
+text-or-binary type:
+
+- text held by `Zeroizing<String>`;
+- binary held by `Zeroizing<Vec<u8>>`;
+- redacted `Debug`;
+- skipped entirely during Serde serialization;
+- explicit `as_text` and `as_bytes` accessors.
+
+QR generation must reject binary artifacts even if called incorrectly.
+Direct file export must write either variant as bytes with the existing
+private-file permissions. The payload and password must never be serialized
+through Tauri.
+
+Use the pure-Rust `p12-keystore` crate rather than adding an OpenSSL system
+dependency that would differ across Windows, macOS, and Linux. The planned
+bundle contains the PKCS#8 P-384 client key, issued client certificate, and CA
+certificate. It will use:
+
+- PBES2/PBKDF2-HMAC-SHA-256 with AES-256;
+- HMAC-SHA-256 integrity;
+- 600,000 encryption KDF iterations;
+- 600,000 MAC KDF iterations;
+- a non-empty high-entropy generated password.
+
+The iteration count follows the current OWASP PBKDF2-HMAC-SHA-256 work factor
+and must be profiled locally. It is an export-time cost, not a server login
+cost.
+
+StrongSwan documents that some Apple and Android importers require legacy 3DES
+PKCS#12 encryption. The secure default will not silently downgrade for that
+compatibility. If testing proves a supported client requires legacy export,
+that must become a separately named, explicit compatibility choice with a
+warning and test coverage.
+
+The current artifact interface has no safe way to disclose a generated bundle
+password to a person without moving it through Svelte. The backend unit will
+retain the password only by secret reference and prove protected bundle
+generation. The later application/export unit must design an explicit native
+export/recovery path—such as a separately confirmed private sidecar or
+OS-native secret interaction—before the desktop claims end-to-end IKEv2
+export. It must not place the password in a normal DTO or log.
+
+#### Fixed per-device virtual addresses
+
+The common product model assigns a private IPv4 address to routed devices and
+uses it for managed DNS. A single dynamic strongSwan pool would break that
+invariant because a certificate could receive a different address after
+reconnect.
+
+Render one IKEv2 connection and one single-address pool per enabled device:
+
+- remote certificate identity is fixed to the device identity;
+- the pool contains exactly the core-allocated device IPv4 address;
+- the pool pushes the instance CoreDNS gateway;
+- disabled/deleted identities are absent from desired configuration.
+
+This retains deterministic address allocation and per-device DNS without an
+additional SQL lease database. The disposable integration fixture must prove
+that strongSwan selects the identity-specific connection after certificate
+authentication and assigns the one-address pool. If it does not, the
+alternative is a typed strongSwan SQL lease store covered by backup—not a
+return to untracked dynamic addresses.
+
+#### StrongSwan policy
+
+Render only IKEv2 (`version = 2`) with certificate authentication. Planned
+defaults:
+
+- ECDSA SHA-384 authentication;
+- AES-256-GCM IKE and ESP proposals with SHA-384 PRF and ECP-384;
+- an AES-256/SHA-384/ECP-384 non-AEAD fallback only where the proposal syntax
+  requires it;
+- no DES, 3DES, RC4, NULL, MD5, SHA-1, MODP-1024, PSK, EAP-password, XAuth,
+  or IKEv1;
+- PFS for child-SA rekeys;
+- fragmentation, MOBIKE, DPD, and forced UDP encapsulation;
+- strict local CRL enforcement.
+
+Full tunnel uses `0.0.0.0/0` as local traffic selectors. Split tunnel uses the
+instance VPN subnet. IPv6 is not advertised by this first backend and client
+metadata must state that IPv6 is not routed.
+
+The entrypoint firewall will add only checked, backend-owned rules for:
+
+- policy-decapsulated traffic from the instance subnet;
+- established policy traffic back to the subnet;
+- masquerade for subnet traffic not leaving under an IPsec policy.
+
+Every rule will use `iptables -C` before insertion and be removed on shutdown.
+The script must not flush tables, append a host-wide final DROP, or alter ICMP.
+
+#### Typed credential lifecycle
+
+Extend `CredentialOperation`, without adding raw shell strings, for:
+
+- idempotent IKEv2 CA/server/empty-CRL initialization;
+- signing a validated client CSR;
+- revoking a certificate by validated serial while atomically extending the
+  retained CRL;
+- reloading strongSwan credentials/connections;
+- terminating active SAs for a revoked identity.
+
+Issue plan:
+
+1. upload only the CSR reference at mode `0600`;
+2. sign it with clientAuth, its identity SAN, P-384/SHA-384, and the configured
+   lifetime;
+3. download the issued certificate into its secret reference;
+4. download the CA certificate into its secret reference;
+5. read the certificate serial.
+
+Revoke plan:
+
+1. require an issued certificate serial;
+2. extend and atomically replace the CRL;
+3. reload credentials/connections;
+4. terminate active SAs for the identity after the new CRL is active.
+
+Replacement must issue and retrieve the new credential before revoking the
+old serial. `CredentialAction::Replace` therefore needs optional previous
+certificate-serial metadata in addition to the previous identity string.
+OpenVPN will continue to use only the identity; IKEv2 will require both.
+
+#### Planned validation and functional units
+
+Unit 4a:
+
+- zeroizing binary/text artifact payload;
+- QR rejection and byte-safe application export;
+- expanded backward-compatible IKEv2 secret-reference model;
+- typed IKEv2 credential operations and replacement serial;
+- secret-retention and regression tests;
+- signed commit.
+
+Unit 4b:
+
+- `crates/backend-ikev2`;
+- local P-384 key/CSR and high-entropy password generation;
+- deterministic pinned runtime, strongSwan config, fixed pools, firewall
+  entrypoint;
+- issue/revoke/replace plans;
+- protected PKCS#12 creation and wrong-password tests;
+- validation/change-impact tests;
+- full workspace checks and signed commit.
+
+Later integration units:
+
+- translate every typed IKEv2 operation into fixed verified-SSH execution;
+- build/run on a disposable Linux Docker host;
+- prove UDP 500/4500, XFRM, NAT-T, custom host constraints, full/split routing,
+  fixed address selection, DNS, CRL rejection, active-SA termination,
+  persistence, image update, backup, and rollback;
+- add explicit password recovery/export UX without exposing it to Svelte;
+- add CLI and desktop capability-aware flows.
+
+Commit:
+
+- pending staged-diff validation and signed planning commit.
