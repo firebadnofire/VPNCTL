@@ -5606,3 +5606,104 @@ signature).
 
 Planned signed commit:
 `fix: complete certificate backend deployment lifecycle`.
+
+### 12P. IKEv2 validation, restart safety, and local-image inputs (2026-07-31)
+
+The first live IKEv2 deployment stopped in pre-activation validation even though
+its generated authority and configuration were valid. The validator ran
+`swanctl --version` in a container without charon. strongSwan 5.9.14 attempts to
+connect to its VICI socket for that command, printed the version plus usage, and
+exited 2 with `No such file or directory`. Treating that nonzero status as
+authoritative was correct; the check itself did not test deployability.
+
+Validation now starts the selected, locally built pinned IKEv2 image as an
+isolated detached probe. It publishes no host ports, grants only the runtime's
+declared `NET_ADMIN` capability and IPv4-forwarding sysctl, mounts the staged
+swanctl authority tree read-only, waits for the container to remain running,
+and requires both a charon PID and a successful `swanctl --list-conns`. Early
+exit or load failure emits the probe logs, and an exit/signal trap always removes
+the container. The exact candidate passed twice against the failed live stage,
+including with the authority mount read-only.
+
+The corrected server deployment succeeded, but applying the newly issued client
+state exposed a separate restart defect. Health observed the gateway in a
+restart loop and automatically restored the pre-client snapshot. The failed
+configuration itself remained healthy in an eight-second isolated replay,
+loading one pool and one connection, so the generated config and certificate
+state were not the cause. An exact `docker compose restart gateway` reproduction
+against the otherwise healthy rollback tree produced the same failure and
+retained the decisive logs:
+
+- the container writable layer retained `/var/run/charon.vici` across restart;
+- the entrypoint saw the stale socket path and treated it as readiness;
+- `swanctl --load-all` connected before a new VICI listener existed, received
+  `Connection refused`, and exited;
+- the `unless-stopped` policy repeated that sequence.
+
+The IKEv2 entrypoint now removes only the stale runtime socket immediately before
+starting charon. It does not remove authority data, configuration, certificates,
+or other runtime state. The existing bounded wait then observes a socket created
+by the new daemon. A full Compose down/up recovery was performed immediately
+after the diagnostic reproduction, and explicit application health confirmed
+the prior server snapshot was healthy before continuing.
+
+The first plan after changing the entrypoint revealed a third planning issue:
+the rendered `start-ikev2.sh` was marked for replacement but only a Compose
+restart was planned. The file is a Docker build input copied into the image, so
+replacing it on the host cannot affect an existing image. `ContainerImage::Build`
+now declares its non-Dockerfile input paths. OpenVPN, IKEv2, and Xray each name
+their rendered startup script. The deployment planner treats a change to either
+the Dockerfile or any declared build input as structural, adding `ComposeBuild`
+and `ComposeUp` rather than `ComposeRestart`. Runtime configuration files in the
+same mounted directory do not trigger unnecessary rebuilds unless explicitly
+declared as image inputs.
+
+Two identical client-state attempts made before the entrypoint correction both
+failed health and both reported successful rollback. After the runtime and
+planner fixes, the reviewed plan visibly contained `compose_build` and
+`compose_up`. Deployment `cf9e0d9b-6b18-4a6d-be9c-5d81b23c786f` then succeeded.
+The final explicit health check reported Compose, gateway, strongSwan readiness,
+fixed UDP 500/4500 listeners, client-state agreement, DNS, and private/public DNS
+resolution healthy. The real client exported as a protected 1,988-byte PKCS#12
+bundle; no bundle contents or password were printed.
+
+Files changed:
+
+- `crates/application/src/lib.rs`: isolated IKEv2 daemon/config validation and
+  its command-contract regression test;
+- `crates/backend-ikev2/src/lib.rs`: stale VICI socket removal before daemon
+  launch, ordering assertion, and declared startup-script build input;
+- `crates/backend/src/lib.rs`: typed local-image input-path metadata;
+- `crates/deployment/src/lib.rs`: rebuild/recreate classification for declared
+  image inputs and a regression test that forbids restart-only handling;
+- `crates/backend-openvpn/src/lib.rs` and `crates/backend-xray/src/lib.rs`:
+  complete build-input metadata for their existing copied startup scripts.
+
+Validation:
+
+- live old `swanctl --version` failure reproduced with exit 2;
+- live replacement validation passed with no published ports and a read-only
+  authority mount;
+- the focused IKEv2 validation-command test passed;
+- deterministic Compose restart-loop reproduction captured `Connection refused`
+  and was followed by an automatic scoped full-up recovery;
+- `cargo test -p vam-deployment -p vam-backend-ikev2
+  -p vam-backend-openvpn -p vam-backend-xray -p vam-application -j 1` passed:
+  14 deployment, 8 IKEv2, 9 OpenVPN, 11 Xray, and 41 application tests;
+- strict Clippy for those five crates with all targets and `-D warnings` passed;
+- the developer harness rebuilt successfully with one Cargo job and the existing
+  portable NASM path;
+- Rust formatting and `git diff --check` passed;
+- live IKEv2 initial deployment, real certificate issuance, corrected
+  rebuild/recreate deployment, protected export, and explicit health all passed.
+
+No unrelated containers, ports, or instance paths were modified. Diagnostic
+mutations were limited to the test IKEv2 Compose project and were restored before
+the successful deployment. No package or prerequisite was installed.
+
+Previous signed commit:
+`29be8e7 fix: complete certificate backend deployment lifecycle` (good EDDSA
+signature).
+
+Planned signed commit:
+`fix: make IKEv2 deployment validation restart-safe`.

@@ -470,14 +470,21 @@ pub fn plan(
                         .is_some_and(|suffix| suffix.starts_with('/'))
             })
         });
-        let dockerfile_changed = match runtime.image {
+        let build_input_changed = match runtime.image {
             ContainerImage::Build {
-                dockerfile_path, ..
-            } => changed_paths.contains(&dockerfile_path),
+                dockerfile_path,
+                input_paths,
+                ..
+            } => {
+                changed_paths.contains(&dockerfile_path)
+                    || input_paths
+                        .iter()
+                        .any(|input| changed_paths.contains(input))
+            }
             ContainerImage::Pull(_) => false,
         };
         let structural_change =
-            remote.is_none() || changed_paths.contains(&"compose.yaml") || dockerfile_changed;
+            remote.is_none() || changed_paths.contains(&"compose.yaml") || build_input_changed;
         operations.extend([
             DeploymentOperation::ValidateConfiguration,
             DeploymentOperation::CreateBackup {
@@ -873,6 +880,56 @@ mod tests {
                 DeploymentOperation::HealthCheck { service } if service == "dns"
             )
         }));
+    }
+
+    #[test]
+    fn changed_local_image_input_rebuilds_and_recreates_the_service() {
+        let state = state_for(VpnBackendKind::Ikev2);
+        let backend = Ikev2Backend;
+        let runtime = runtime_for(&backend, &state);
+        let files = vec![
+            RenderedFile {
+                path: "ikev2/Dockerfile".into(),
+                contents: "FROM pinned\nCOPY start-ikev2.sh /start\n".into(),
+                mode: 0o644,
+                sensitive: false,
+            },
+            RenderedFile {
+                path: "ikev2/start-ikev2.sh".into(),
+                contents: "#!/bin/sh\nnew startup\n".into(),
+                mode: 0o700,
+                sensitive: false,
+            },
+        ];
+        let mut remote = build_manifest(&files);
+        remote
+            .files
+            .insert("ikev2/start-ikev2.sh".into(), "old startup hash".into());
+
+        let plan = plan(
+            &state,
+            &runtime,
+            backend.capabilities(),
+            &files,
+            Some(&remote),
+        )
+        .unwrap();
+
+        assert!(
+            plan.operations
+                .iter()
+                .any(|operation| matches!(operation, DeploymentOperation::ComposeBuild))
+        );
+        assert!(
+            plan.operations
+                .iter()
+                .any(|operation| matches!(operation, DeploymentOperation::ComposeUp))
+        );
+        assert!(
+            !plan.operations.iter().any(|operation| {
+                matches!(operation, DeploymentOperation::ComposeRestart { .. })
+            })
+        );
     }
 
     #[test]

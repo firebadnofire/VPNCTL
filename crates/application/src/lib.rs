@@ -6707,10 +6707,12 @@ fn validation_command(stage: &str, runtime: &BackendRuntimeSpec, managed_dns: bo
             .expect("writing to a String cannot fail");
         }
         BackendValidation::Ikev2 => {
+            let mount_value = format!("{stage}/ikev2:/etc/swanctl:ro");
             write!(
                 command,
-                "; test -s {}; docker run --rm --entrypoint swanctl {} --version >/dev/null",
+                "; test -s {}; ikev2_probe=\"$(docker run -d --cap-add NET_ADMIN --sysctl net.ipv4.ip_forward=1 -v {} {})\"; cleanup_ikev2_probe() {{ docker rm -f \"$ikev2_probe\" >/dev/null 2>&1 || true; }}; trap cleanup_ikev2_probe EXIT INT TERM HUP; sleep 2; ikev2_running=\"$(docker inspect --format '{{{{.State.Running}}}}' \"$ikev2_probe\" 2>/dev/null || printf false)\"; if test \"$ikev2_running\" != true; then docker logs \"$ikev2_probe\" >&2 || true; exit 1; fi; if ! docker exec \"$ikev2_probe\" sh -c 'pidof charon >/dev/null && swanctl --list-conns >/dev/null'; then docker logs \"$ikev2_probe\" >&2 || true; exit 1; fi; cleanup_ikev2_probe; trap - EXIT INT TERM HUP",
                 shell_quote(&format!("{stage}/ikev2/swanctl.conf")),
+                shell_quote(&mount_value),
                 image
             )
             .expect("writing to a String cannot fail");
@@ -9064,6 +9066,28 @@ mod tests {
         assert!(validation.contains("trap cleanup_openvpn_probe EXIT INT TERM HUP"));
         assert!(!validation.contains("--test-crypto"));
         assert!(!validation.contains("/safe/stage/vpn:/etc/openvpn:ro"));
+    }
+
+    #[test]
+    fn ikev2_validation_starts_an_isolated_daemon_probe_and_always_removes_it() {
+        let state = command_state(VpnBackendKind::Ikev2);
+        let runtime = Ikev2Backend
+            .runtime(&state.instance.backend_settings)
+            .unwrap();
+
+        let validation = validation_command("/safe/stage", &runtime, true);
+
+        assert!(validation.contains("docker run -d"));
+        assert!(validation.contains("--cap-add NET_ADMIN"));
+        assert!(validation.contains("--sysctl net.ipv4.ip_forward=1"));
+        assert!(validation.contains("'/safe/stage/ikev2:/etc/swanctl:ro'"));
+        assert!(validation.contains("docker inspect --format '{{.State.Running}}'"));
+        assert!(validation.contains("pidof charon"));
+        assert!(validation.contains("swanctl --list-conns"));
+        assert!(validation.contains("docker logs \"$ikev2_probe\""));
+        assert!(validation.contains("docker rm -f \"$ikev2_probe\""));
+        assert!(validation.contains("trap cleanup_ikev2_probe EXIT INT TERM HUP"));
+        assert!(!validation.contains("swanctl --version"));
     }
 
     #[tokio::test]

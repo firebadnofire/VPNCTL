@@ -160,6 +160,7 @@ impl VpnBackend for Ikev2Backend {
             image: ContainerImage::Build {
                 tag: IKEV2_LOCAL_IMAGE,
                 dockerfile_path: IKEV2_DOCKERFILE_PATH,
+                input_paths: &["ikev2/start-ikev2.sh"],
             },
             container_listeners: ikev2_listeners(),
             capabilities: vec![ContainerCapability::NetAdmin],
@@ -768,6 +769,7 @@ shutdown() {{
 trap shutdown INT TERM HUP
 
 add_rules
+rm -f /var/run/charon.vici
 /usr/lib/strongswan/charon &
 daemon_pid=$!
 
@@ -1079,6 +1081,7 @@ mod tests {
             ContainerImage::Build {
                 tag: IKEV2_LOCAL_IMAGE,
                 dockerfile_path: IKEV2_DOCKERFILE_PATH,
+                input_paths: &["ikev2/start-ikev2.sh"],
             }
         );
         assert_eq!(runtime.container_listeners, ikev2_listeners());
@@ -1117,6 +1120,15 @@ mod tests {
         assert!(start.contents.contains("--pol ipsec"));
         assert!(start.contents.contains("delete_rules"));
         assert!(start.contents.contains("swanctl --load-all --noprompt"));
+        let stale_socket_cleanup = start
+            .contents
+            .find("rm -f /var/run/charon.vici")
+            .expect("the restart path must remove a stale VICI socket");
+        let daemon_start = start
+            .contents
+            .find("/usr/lib/strongswan/charon &")
+            .expect("the startup script must launch charon");
+        assert!(stale_socket_cleanup < daemon_start);
         assert!(!start.contents.contains("iptables -F"));
         assert!(!start.contents.contains("--privileged"));
     }

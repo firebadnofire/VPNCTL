@@ -157,6 +157,7 @@ impl VpnBackend for OpenVpnBackend {
             image: ContainerImage::Build {
                 tag: OPENVPN_LOCAL_IMAGE,
                 dockerfile_path: OPENVPN_DOCKERFILE_PATH,
+                input_paths: &["vpn/start-openvpn.sh"],
             },
             container_listeners: vec![ListenerPort {
                 port: OPENVPN_CONTAINER_PORT,
@@ -1108,6 +1109,7 @@ mod tests {
             ContainerImage::Build {
                 tag: OPENVPN_LOCAL_IMAGE,
                 dockerfile_path: OPENVPN_DOCKERFILE_PATH,
+                input_paths: &["vpn/start-openvpn.sh"],
             }
         );
         assert_eq!(

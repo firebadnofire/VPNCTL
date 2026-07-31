@@ -270,6 +270,7 @@ impl VpnBackend for XrayBackend {
             image: ContainerImage::Build {
                 tag: XRAY_LOCAL_IMAGE,
                 dockerfile_path: XRAY_DOCKERFILE_PATH,
+                input_paths: &["xray/start-xray.sh"],
             },
             container_listeners: vec![ListenerPort {
                 port: XRAY_CONTAINER_PORT,
@@ -1261,7 +1262,8 @@ mod tests {
             runtime.image,
             ContainerImage::Build {
                 tag: XRAY_LOCAL_IMAGE,
-                dockerfile_path: XRAY_DOCKERFILE_PATH
+                dockerfile_path: XRAY_DOCKERFILE_PATH,
+                input_paths: &["xray/start-xray.sh"]
             }
         ));
         assert!(runtime.capabilities.is_empty());

@@ -163,6 +163,7 @@ pub enum ContainerImage {
     Build {
         tag: &'static str,
         dockerfile_path: &'static str,
+        input_paths: &'static [&'static str],
     },
 }
 
