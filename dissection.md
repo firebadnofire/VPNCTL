@@ -2145,4 +2145,309 @@ Still unvalidated because the necessary runtime is unavailable:
 
 Commit:
 
-- pending staged-patch inspection and signed commit.
+- `3975881 feat: add secure IKEv2 certificate backend`;
+- created with `git commit -S`;
+- `git verify-commit HEAD` reported a good EDDSA signature from William Jones
+  using key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### Unit 5 plan: Xray/VLESS backend
+
+Status: implementation plan complete. No Xray model or backend code is changed
+in this planning sub-unit.
+
+#### Reference behavior and deliberate differences
+
+The adjacent Amnezia checkout provisions Xray by:
+
+- building a custom Alpine image;
+- downloading Xray-core `v25.8.3`;
+- running the container privileged with `NET_ADMIN`;
+- publishing the selected server TCP port;
+- creating a TUN character device even though its VLESS proxy configuration
+  does not use a TUN inbound;
+- generating one UUID, an X25519 REALITY keypair, and a random short ID inside
+  the container;
+- writing the server JSON with a shell heredoc;
+- reading public REALITY material back over SSH for client export;
+- parsing and structurally changing server JSON for user addition/removal, then
+  restarting the container.
+
+The current Amnezia configurator is materially better than its original shell
+template: Qt JSON objects preserve existing REALITY private material, add or
+remove UUID users structurally, build raw/XHTTP/mKCP stream settings, read
+public key files, and produce native client JSON/VLESS links. However, the
+checked-in image and scripts still contain behaviors this project must not
+copy:
+
+- the Xray ZIP is downloaded without digest verification;
+- the Alpine base is old and unpinned by digest;
+- the image runs privileged even though this VLESS proxy needs neither TUN nor
+  network administration;
+- container INPUT rules are hard-coded to ports 80 and 443 while Docker may
+  publish an arbitrary selected port;
+- the entrypoint applies broad DROP policies, kills processes, and tails
+  forever instead of making Xray the supervised process;
+- unrelated host/container TCP and sysctl tuning is applied;
+- initial JSON is composed by unescaped shell interpolation.
+
+VPN Appliance Manager will reuse the useful behavioral model—remote-only
+REALITY identity, UUID users, structured JSON, explicit restart, public-material
+retrieval—but implement it through deterministic Rust rendering and the
+existing verified-SSH/deployment boundaries.
+
+#### Frozen server software and integrity policy
+
+The first backend will deliberately pin the exact Xray-core version used by
+the inspected adjacent checkout, `v25.8.3`, rather than silently adopting a
+newer protocol/configuration schema during the refactor.
+
+Official GitHub release metadata reports:
+
+- `Xray-linux-64.zip` SHA-256
+  `f3f69cdccdf3443f25248f65bec0f621a7bd05c9d6fbbd5d9f064a8fce70f0fc`;
+- `Xray-linux-arm64-v8a.zip` SHA-256
+  `7bcc35d375398c0df4b53ee004fb5b42402fcc0d331db5f2e6ac86cfc12b6a33`.
+
+The local image will use the already-reviewed Alpine 3.23.5 base digest, select
+only `amd64` or `arm64` from Docker's `TARGETARCH`, download the corresponding
+asset over HTTPS, verify its fixed SHA-256 before extraction, and reject every
+other architecture. Build-only download/extraction packages will be removed
+from the final layer. Runtime JSON materialization will use pinned `jq`; it
+will not use textual substitution.
+
+This version pin is an intentional compatibility baseline, not an automatic
+update channel. A later explicit upgrade operation must change the version and
+both digests together, validate the new schema/configuration, and classify
+client/server identity impact before apply.
+
+#### Runtime and privilege boundary
+
+The container will listen on a fixed unprivileged internal port, `8443`, with
+the configured host listener published to it. This permits custom host ports
+without changing an internal firewall and avoids root-only port binding.
+
+The runtime will request:
+
+- no `privileged` mode;
+- no Linux capabilities;
+- no TUN or other devices;
+- no forwarding sysctls;
+- one read-only rendered-config mount;
+- one writable durable identity/runtime-state mount.
+
+Raw TCP and XHTTP listeners use TCP. mKCP uses UDP. Host firewall rules continue
+to derive from the backend listener declaration, so a custom host port and its
+actual transport remain aligned.
+
+The image will run as a fixed non-root UID/GID. The generic deployment unit
+must create/normalize the durable state directory for that identity before
+container start; this is a Linux fixture requirement. Xray itself will be the
+final `exec` process, so Docker observes its real exit status and signals it
+directly.
+
+#### Supported security/transport matrix
+
+The model retains strongly typed `XraySecurity::{Reality,Tls}` and
+`XrayTransport::{Tcp,Xhttp,Mkcp}` values. The backend will enforce:
+
+| Security | raw TCP | XHTTP | mKCP |
+| --- | --- | --- | --- |
+| REALITY | supported | supported | rejected |
+| TLS 1.3 | supported | supported | supported |
+
+Current upstream documentation says REALITY is valid only with RAW, XHTTP, and
+gRPC; mKCP is therefore rejected with a structured validation error rather
+than producing a configuration that Xray cannot honor. TLS supports all three
+selected transports.
+
+VLESS itself uses `decryption: "none"`, so a protective transport-security
+layer is mandatory. The backend will not add a plain/`none` security mode.
+TLS client configuration will use normal certificate and name validation; it
+will never render `allowInsecure`, disable system roots, or bypass certificate
+verification. The server will set both minimum and maximum TLS version to 1.3.
+
+`xtls-rprx-vision` flow is supported only with raw TCP plus TLS or REALITY,
+matching current upstream flow constraints. XHTTP and mKCP devices must omit
+flow. No historical `xtls-rprx-vision-udp443` alias will be accepted.
+
+#### Typed settings extension
+
+`XraySettings` will gain backward-compatible optional fields:
+
+- `reality_public_key`, public base64url metadata retrieved from the remote
+  durable identity;
+- `reality_short_id`, public client-selection metadata mirrored from remote
+  state;
+- `tls_certificate_ref`, an opaque native-secret-store reference to a
+  PEM certificate/full chain;
+- `tls_private_key_ref`, an opaque native-secret-store reference to the
+  matching PEM private key.
+
+The REALITY private key is intentionally absent. It exists only in the
+instance's remote durable state and backups. The public key and short ID are
+not secrets, but they remain behind the Rust application boundary as part of
+typed instance state and are emitted only by explicit client export.
+
+TLS secret values remain in native secure storage and explicit sensitive
+rendered files. SQLite stores only their UUID references. TLS validation
+requires both references together; REALITY rejects TLS references to prevent
+stale ambiguous identity state.
+
+The existing server-name, fingerprint, and XHTTP path fields remain. Validation
+will restrict them to a real DNS name, an allowlisted browser fingerprint, and
+a bounded absolute path without control/query/fragment characters.
+
+#### Remote-only REALITY identity
+
+The rendered server template contains no REALITY private key or short ID.
+On startup, a fail-fast script will:
+
+1. set a restrictive umask;
+2. inspect the durable identity directory;
+3. if all REALITY files are absent, run the pinned `xray x25519`, strictly
+   parse and validate one private and one public base64url value, create a
+   16-hex-character short ID from the kernel RNG, and atomically install all
+   three files at mode `0600`;
+4. if only part of the identity exists, fail rather than rotate or guess;
+5. use `jq --arg` to inject the private key and short ID into the exact
+   structured JSON paths;
+6. write the materialized config atomically into durable runtime state;
+7. run `xray run -test` against that config;
+8. `exec` Xray only after validation succeeds.
+
+Normal restarts and image updates reuse all durable files. The public key and
+short ID can be retrieved later through fixed typed SSH discovery, populating
+the mirrored settings needed for export. The private key must never be
+downloaded, logged, placed in SQLite, or returned to Tauri.
+
+The parser will accept only the pinned release's labeled key lines and the
+known later `Password` label as the public/client half, while still validating
+the exact base64url shape. It will not assume that any arbitrary second output
+line is a key.
+
+#### Structured server rendering
+
+Rust `serde_json` values will render the complete server template. There will
+be no raw expert JSON field and no token/string replacement.
+
+The server config will include:
+
+- error-only logs with no access log containing user destinations;
+- one VLESS inbound on internal port 8443;
+- sorted enabled clients containing UUID, validated email/label, and permitted
+  flow only;
+- `decryption: "none"`;
+- one `freedom` outbound;
+- typed stream settings for raw TCP, XHTTP, or mKCP;
+- REALITY target/server names and an empty private-key slot for structured
+  runtime injection; or
+- TLS 1.3 certificate/key file paths and strict SNI rejection.
+
+XHTTP initially renders a bounded path and conservative `auto` mode. The
+backend will not expose Amnezia's large unstable XHTTP padding/xmux surface
+until each option has a typed model, bounds, client/server parity tests, and an
+upstream-version compatibility decision. mKCP initially uses pinned conservative
+values rather than raw user strings.
+
+Enabled clients are sorted by UUID, making add, disable, revoke, and regenerate
+ordinary desired-state reconciliation. Disabled/revoked UUIDs disappear from
+the next server JSON. No remote JSON is read, edited, or used as the source of
+truth.
+
+#### Device lifecycle and export
+
+Xray devices remain addressless UUID identities with:
+
+- random UUIDv4 client ID;
+- bounded validated email/label metadata;
+- optional exact `xtls-rprx-vision` flow.
+
+Creation and regeneration happen locally. Disable, revoke, and replacement are
+model changes followed by deterministic server render and a validated service
+restart. Because no client private key exists, there is no native secret-store
+entry for a device. UUIDs are credential-bearing metadata and still must not
+appear in ordinary Tauri responses or logs.
+
+The explicit client artifact is a standards-compatible VLESS URI built with a
+URL serializer:
+
+- endpoint host and selected host port;
+- UUID and `encryption=none`;
+- exact security and transport;
+- SNI and allowlisted fingerprint;
+- REALITY public key and short ID when applicable;
+- typed XHTTP/mKCP parameters;
+- flow only for raw TCP;
+- percent-encoded display label.
+
+The artifact is zeroizing text, QR-capable, and written only by explicit export.
+REALITY export fails until verified-SSH discovery has mirrored public material.
+TLS export fails unless certificate references exist and configuration
+validation has succeeded, although the certificate private key is server-only
+and never embedded in the URI.
+
+Xray is a proxy rather than an allocated-IP tunnel. Its capabilities therefore
+declare no tunnel address, managed private DNS, peer handshake/transfer
+statistics, certificate authority, or quick peer refresh. QR export is
+supported. Identity reconciliation requires a service restart until a typed,
+authenticated Xray API lifecycle is implemented and tested.
+
+#### Settings-change impact
+
+- unchanged settings: no backend change;
+- fingerprint-only change: live client-export metadata update;
+- XHTTP path or transport change: service restart and client re-export;
+- server-name change: service restart and client re-export;
+- security-mode, REALITY key/short-ID mirror, or TLS certificate/key reference
+  change: destructive/reinstall-class identity change, surfaced before apply.
+
+Changing images later is an explicit upgrade, not part of settings
+classification. Ordinary restart/update must preserve remote REALITY state and
+TLS references.
+
+#### Validation and functional split
+
+Unit 5a:
+
+- backward-compatible typed Xray public/TLS settings;
+- transport-aware listener reservations;
+- TLS secret-reference retention tests;
+- signed commit if the model change is nontrivial.
+
+Unit 5b:
+
+- `crates/backend-xray`;
+- pinned multi-architecture verified-download Dockerfile;
+- non-root/no-capability runtime contract;
+- deterministic structured server JSON;
+- remote-only REALITY initialization script;
+- strict validation/security matrix;
+- deterministic VLESS URI client export and QR eligibility;
+- add/disable/revoke/regenerate reconciliation tests;
+- change-impact tests;
+- full workspace checks and signed commit.
+
+Later generic integration:
+
+- register the backend;
+- normalize remote state ownership;
+- retrieve and validate only public REALITY material over verified SSH;
+- persist mirrored public values without exposing them to Svelte;
+- ensure initial install is followed by public-material discovery before
+  export;
+- render/build/publish the selected TCP or UDP listener;
+- validate config, restart, health, backup, rollback, and identity persistence
+  on a disposable Linux Docker host;
+- add backend-aware CLI and desktop workflows.
+
+Runtime claims intentionally deferred until that fixture:
+
+- image build for both architectures;
+- pinned ZIP extraction and Xray executable behavior;
+- key-output parsing;
+- non-root bind-mount ownership;
+- `xray run -test`;
+- raw TCP, XHTTP, mKCP, REALITY, and TLS interoperability;
+- custom listener publishing;
+- UUID removal/replacement;
+- REALITY identity survival across restart/image update/rollback.
