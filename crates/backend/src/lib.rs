@@ -202,8 +202,8 @@ pub enum CredentialOperation {
         certificate_serial: String,
         crl_lifetime_days: u16,
     },
-    TerminateIkev2Identity {
-        identity: String,
+    TerminateIkev2Connection {
+        connection_name: String,
     },
     ReloadGateway,
 }

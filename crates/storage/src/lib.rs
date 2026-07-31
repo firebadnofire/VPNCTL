@@ -466,6 +466,126 @@ impl Storage {
         Ok(())
     }
 
+    pub async fn save_new_device_with_secret_references(
+        &self,
+        device: &Device,
+        secret_references: &[(Uuid, String)],
+        dns_record: Option<&DnsRecord>,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO devices
+             (id, instance_id, user_id, display_name, ipv4_address, enabled,
+              model_json, created_at, deleted_at, identity_schema_version, backend)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(device.id.to_string())
+        .bind(device.instance_id.to_string())
+        .bind(device.user_id.map(|id| id.to_string()))
+        .bind(&device.display_name)
+        .bind(
+            device
+                .ipv4_address
+                .map_or_else(String::new, |address| address.to_string()),
+        )
+        .bind(device.enabled)
+        .bind(serde_json::to_string(device)?)
+        .bind(device.created_at.to_rfc3339())
+        .bind(device.deleted_at.map(|value| value.to_rfc3339()))
+        .bind(i64::from(CURRENT_DEVICE_SCHEMA_VERSION))
+        .bind(device.backend_data.kind().as_str())
+        .execute(&mut *transaction)
+        .await?;
+        for (reference, purpose) in secret_references {
+            sqlx::query(
+                "INSERT INTO secret_references
+                 (id, purpose, owner_id, created_at, pending_delete_at)
+                 VALUES (?, ?, ?, ?, NULL)",
+            )
+            .bind(reference.to_string())
+            .bind(purpose)
+            .bind(device.id.to_string())
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        if let Some(record) = dns_record {
+            sqlx::query(
+                "INSERT INTO dns_records
+                 (id, instance_id, name, record_type, value, ttl, enabled,
+                  managed_by_device_id, model_json)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(record.id.to_string())
+            .bind(record.instance_id.to_string())
+            .bind(&record.name)
+            .bind(format!("{:?}", record.record_type).to_ascii_uppercase())
+            .bind(&record.value)
+            .bind(i64::from(record.ttl))
+            .bind(record.enabled)
+            .bind(record.managed_by_device_id.map(|id| id.to_string()))
+            .bind(serde_json::to_string(record)?)
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
+    pub async fn replace_device_identity_and_retire_secrets(
+        &self,
+        device: &Device,
+        new_secret_references: &[(Uuid, String)],
+    ) -> Result<(), StorageError> {
+        let mut transaction = self.pool.begin().await?;
+        sqlx::query(
+            "UPDATE secret_references SET pending_delete_at=?
+             WHERE owner_id=? AND pending_delete_at IS NULL",
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(device.id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        let updated = sqlx::query(
+            "UPDATE devices SET user_id=?, display_name=?, ipv4_address=?,
+             enabled=?, model_json=?, deleted_at=?, identity_schema_version=?, backend=?
+             WHERE id=? AND deleted_at IS NULL",
+        )
+        .bind(device.user_id.map(|id| id.to_string()))
+        .bind(&device.display_name)
+        .bind(
+            device
+                .ipv4_address
+                .map_or_else(String::new, |address| address.to_string()),
+        )
+        .bind(device.enabled)
+        .bind(serde_json::to_string(device)?)
+        .bind(device.deleted_at.map(|value| value.to_rfc3339()))
+        .bind(i64::from(CURRENT_DEVICE_SCHEMA_VERSION))
+        .bind(device.backend_data.kind().as_str())
+        .bind(device.id.to_string())
+        .execute(&mut *transaction)
+        .await?;
+        if updated.rows_affected() != 1 {
+            return Err(StorageError::NotFound);
+        }
+        for (reference, purpose) in new_secret_references {
+            sqlx::query(
+                "INSERT INTO secret_references
+                 (id, purpose, owner_id, created_at, pending_delete_at)
+                 VALUES (?, ?, ?, ?, NULL)",
+            )
+            .bind(reference.to_string())
+            .bind(purpose)
+            .bind(device.id.to_string())
+            .bind(Utc::now().to_rfc3339())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+        Ok(())
+    }
+
     pub async fn save_device_and_sync_managed_dns(
         &self,
         device: &Device,
@@ -548,6 +668,14 @@ impl Storage {
             .bind(id.to_string())
             .execute(&mut *transaction)
             .await?;
+        sqlx::query(
+            "UPDATE secret_references SET pending_delete_at=?
+             WHERE owner_id=? AND pending_delete_at IS NULL",
+        )
+        .bind(deleted_at.to_rfc3339())
+        .bind(id.to_string())
+        .execute(&mut *transaction)
+        .await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -1229,6 +1357,97 @@ mod tests {
                 .await,
             Err(StorageError::Database(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn device_identity_metadata_and_secret_references_commit_atomically() {
+        let storage = Storage::in_memory().await.unwrap();
+        let host = host();
+        storage.save_host(&host).await.unwrap();
+        let instance = instance(host.id, Uuid::new_v4(), 51_820);
+        storage.save_instance(&instance).await.unwrap();
+        let first_secret = SecretReference(Uuid::new_v4());
+        let mut device = Device {
+            id: Uuid::new_v4(),
+            instance_id: instance.id,
+            user_id: None,
+            display_name: "peer".into(),
+            ipv4_address: Some("10.64.0.2".parse().unwrap()),
+            ipv6_address: None,
+            dns_name: Some("peer.vpn.internal".into()),
+            enabled: true,
+            backend_data: DeviceBackendData::WireGuard(WireGuardDeviceData {
+                public_key: "first-public".into(),
+                private_key_ref: first_secret.clone(),
+                preshared_key_ref: None,
+            }),
+            created_at: Utc::now(),
+            deleted_at: None,
+        };
+        let record = DnsRecord {
+            id: Uuid::new_v4(),
+            instance_id: instance.id,
+            name: "peer.vpn.internal".into(),
+            record_type: DnsRecordType::A,
+            value: "10.64.0.2".into(),
+            ttl: 300,
+            enabled: true,
+            managed_by_device_id: Some(device.id),
+        };
+        storage
+            .save_new_device_with_secret_references(
+                &device,
+                &[(first_secret.0, "wireguard_private_key".into())],
+                Some(&record),
+            )
+            .await
+            .unwrap();
+        assert_eq!(row_count(&storage, "devices").await, 1);
+        assert_eq!(row_count(&storage, "dns_records").await, 1);
+        assert_eq!(row_count(&storage, "secret_references").await, 1);
+
+        let replacement = SecretReference(Uuid::new_v4());
+        device.backend_data = DeviceBackendData::WireGuard(WireGuardDeviceData {
+            public_key: "second-public".into(),
+            private_key_ref: replacement.clone(),
+            preshared_key_ref: None,
+        });
+        storage
+            .replace_device_identity_and_retire_secrets(
+                &device,
+                &[(replacement.0, "wireguard_private_key".into())],
+            )
+            .await
+            .unwrap();
+        let retired: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM secret_references
+             WHERE owner_id=? AND pending_delete_at IS NOT NULL",
+        )
+        .bind(device.id.to_string())
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(retired, 1);
+        assert_eq!(storage.get_device(device.id).await.unwrap(), device);
+
+        storage
+            .soft_delete_device(device.id, Utc::now())
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage.get_device(device.id).await,
+            Err(StorageError::NotFound)
+        ));
+        assert_eq!(row_count(&storage, "dns_records").await, 0);
+        let retired: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM secret_references
+             WHERE owner_id=? AND pending_delete_at IS NOT NULL",
+        )
+        .bind(device.id.to_string())
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+        assert_eq!(retired, 2);
     }
 
     #[tokio::test]

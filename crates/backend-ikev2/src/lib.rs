@@ -34,7 +34,7 @@ pub const PKCS12_KDF_ITERATIONS: u32 = 600_000;
 
 const CA_LIFETIME_DAYS: u16 = 3_650;
 const CRL_LIFETIME_DAYS: u16 = 3_650;
-const CA_CERTIFICATE_PATH: &str = "x509ca/vam-ca.pem";
+const CA_CERTIFICATE_PATH: &str = "ikev2/x509ca/vam-ca.pem";
 const CLIENT_KEY_ALGORITHM: CertificateKeyAlgorithm = CertificateKeyAlgorithm::EcdsaP384Sha384;
 const IKEV2_DOCKERFILE: &str = r#"FROM alpine:3.23.5@sha256:fd791d74b68913cbb027c6546007b3f0d3bc45125f797758156952bc2d6daf40
 RUN apk add --no-cache \
@@ -135,6 +135,7 @@ impl VpnBackend for Ikev2Backend {
                     "ikev2/x509crl",
                     "ikev2/requests",
                     "ikev2/issued",
+                    "ikev2/revoked",
                 ],
             },
             validation: BackendValidation::Ikev2,
@@ -232,7 +233,9 @@ impl VpnBackend for Ikev2Backend {
                 sensitive: false,
             },
         ];
-        for directory in ["private", "x509", "x509ca", "x509crl", "requests", "issued"] {
+        for directory in [
+            "private", "x509", "x509ca", "x509crl", "requests", "issued", "revoked",
+        ] {
             files.push(RenderedFile {
                 path: format!("ikev2/{directory}/.keep"),
                 contents: String::new(),
@@ -313,12 +316,14 @@ impl VpnBackend for Ikev2Backend {
                 }]
             }
             CredentialAction::Issue => {
-                let data = ikev2_device_required(device, self.kind())?;
+                let device = device.ok_or(BackendError::MissingCredentialDevice(self.kind()))?;
+                let data = ikev2_device(device, self.kind())?;
                 issue_operations(settings, data)?
             }
             CredentialAction::Revoke => {
-                let data = ikev2_device_required(device, self.kind())?;
-                revoke_operations(data)?
+                let device = device.ok_or(BackendError::MissingCredentialDevice(self.kind()))?;
+                let data = ikev2_device(device, self.kind())?;
+                revoke_operations(device, data)?
             }
             CredentialAction::Replace {
                 previous_identity,
@@ -333,7 +338,8 @@ impl VpnBackend for Ikev2Backend {
                             .into(),
                     })?;
                 validate_certificate_serial(&previous_certificate_serial)?;
-                let data = ikev2_device_required(device, self.kind())?;
+                let device = device.ok_or(BackendError::MissingCredentialDevice(self.kind()))?;
+                let data = ikev2_device(device, self.kind())?;
                 let mut operations = issue_operations(settings, data)?;
                 operations.extend([
                     CredentialOperation::RevokeIkev2Client {
@@ -342,8 +348,8 @@ impl VpnBackend for Ikev2Backend {
                         crl_lifetime_days: CRL_LIFETIME_DAYS,
                     },
                     CredentialOperation::ReloadGateway,
-                    CredentialOperation::TerminateIkev2Identity {
-                        identity: previous_identity,
+                    CredentialOperation::TerminateIkev2Connection {
+                        connection_name: connection_name(device),
                     },
                 ]);
                 operations
@@ -530,16 +536,6 @@ fn ikev2_device(
     Ok(data)
 }
 
-fn ikev2_device_required(
-    device: Option<&Device>,
-    backend: VpnBackendKind,
-) -> Result<&Ikev2DeviceData, BackendError> {
-    ikev2_device(
-        device.ok_or(BackendError::MissingCredentialDevice(backend))?,
-        backend,
-    )
-}
-
 fn issue_operations(
     settings: &Ikev2Settings,
     data: &Ikev2DeviceData,
@@ -548,8 +544,8 @@ fn issue_operations(
     let certificate_ref = required_reference(data.certificate_ref.as_ref(), VpnBackendKind::Ikev2)?;
     let ca_certificate_ref =
         required_reference(data.ca_certificate_ref.as_ref(), VpnBackendKind::Ikev2)?;
-    let request_path = format!("requests/{}.pem", data.identity);
-    let certificate_path = format!("issued/{}.pem", data.identity);
+    let request_path = format!("ikev2/requests/{}.pem", data.identity);
+    let certificate_path = format!("ikev2/issued/{}.pem", data.identity);
     Ok(vec![
         CredentialOperation::UploadSecret {
             reference: csr_ref.clone(),
@@ -578,7 +574,10 @@ fn issue_operations(
     ])
 }
 
-fn revoke_operations(data: &Ikev2DeviceData) -> Result<Vec<CredentialOperation>, BackendError> {
+fn revoke_operations(
+    device: &Device,
+    data: &Ikev2DeviceData,
+) -> Result<Vec<CredentialOperation>, BackendError> {
     let serial = data
         .certificate_serial
         .as_ref()
@@ -595,10 +594,14 @@ fn revoke_operations(data: &Ikev2DeviceData) -> Result<Vec<CredentialOperation>,
             crl_lifetime_days: CRL_LIFETIME_DAYS,
         },
         CredentialOperation::ReloadGateway,
-        CredentialOperation::TerminateIkev2Identity {
-            identity: data.identity.clone(),
+        CredentialOperation::TerminateIkev2Connection {
+            connection_name: connection_name(device),
         },
     ])
+}
+
+fn connection_name(device: &Device) -> String {
+    format!("client-{}", device.id.simple())
 }
 
 fn render_swanctl_config(state: &DesiredState) -> String {
@@ -1135,7 +1138,7 @@ mod tests {
             [
                 CredentialOperation::RevokeIkev2Client { .. },
                 CredentialOperation::ReloadGateway,
-                CredentialOperation::TerminateIkev2Identity { .. }
+                CredentialOperation::TerminateIkev2Connection { .. }
             ]
         ));
 
@@ -1164,8 +1167,8 @@ mod tests {
         assert!(sign_index < revoke_index);
         assert!(matches!(
             replacement.operations.last(),
-            Some(CredentialOperation::TerminateIkev2Identity { identity })
-                if identity == "retired-client-01"
+            Some(CredentialOperation::TerminateIkev2Connection { connection_name })
+                if connection_name.starts_with("client-")
         ));
     }
 

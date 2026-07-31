@@ -28,11 +28,12 @@ use vam_backend_openvpn::OpenVpnBackend;
 use vam_backend_wireguard::WireGuardBackend;
 use vam_backend_xray::{REALITY_PUBLIC_KEY_PATH, REALITY_SHORT_ID_PATH, XrayBackend};
 use vam_core::{
-    BackendSettings, DEFAULT_DNS_ZONE, DEFAULT_KEEPALIVE, DEFAULT_PORT, DEFAULT_SUBNET,
-    DesiredState, Device, DeviceBackendData, DnsConfig, DnsRecord, DnsRecordType, DockerHost,
-    EndpointConfig, ListenerPort, NetworkConfig, RoutingMode, SecretReference, SshConnectionConfig,
-    TransportProtocol, User, VpnBackendKind, VpnInstance, WireGuardDeviceData, XraySecurity,
-    allocate_next_ipv4, first_usable, validate_host_instances, validate_instance,
+    AmneziaWgDeviceData, BackendSettings, DEFAULT_DNS_ZONE, DEFAULT_KEEPALIVE, DEFAULT_PORT,
+    DEFAULT_SUBNET, DesiredState, Device, DeviceBackendData, DnsConfig, DnsRecord, DnsRecordType,
+    DockerHost, EndpointConfig, Ikev2DeviceData, ListenerPort, NetworkConfig, OpenVpnDeviceData,
+    OpenVpnTlsProtection, RoutingMode, SecretReference, SshConnectionConfig, TransportProtocol,
+    User, VpnBackendKind, VpnInstance, WireGuardDeviceData, XraySecurity, allocate_next_ipv4,
+    first_usable, validate_host_instances, validate_instance,
 };
 use vam_deployment::{
     COREDNS_IMAGE, DeploymentExecutor, DeploymentPlanner, RemoteManifest, build_manifest,
@@ -139,8 +140,222 @@ pub struct CreateDeviceInput {
     pub dns_name: Option<String>,
 }
 
+struct PendingSecret {
+    reference: SecretReference,
+    value: Zeroizing<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct CredentialExecutionOutcome {
+    certificate_serial: Option<String>,
+    backup_path: Option<String>,
+}
+
 const fn default_true() -> bool {
     true
+}
+
+fn pending_text_secret(reference: SecretReference, value: &Zeroizing<String>) -> PendingSecret {
+    PendingSecret {
+        reference,
+        value: Zeroizing::new(value.as_bytes().to_vec()),
+    }
+}
+
+fn generate_device_identity(
+    instance: &VpnInstance,
+    display_name: &str,
+    device_id: Uuid,
+    preshared_key: bool,
+) -> Result<(DeviceBackendData, Vec<PendingSecret>), BackendError> {
+    match instance.backend {
+        VpnBackendKind::WireGuard => {
+            let (private, public) = WireGuardBackend::generate_device_keys();
+            let private_key_ref = SecretReference(Uuid::new_v4());
+            let mut secrets = vec![pending_text_secret(private_key_ref.clone(), &private)];
+            let preshared_key_ref = if preshared_key {
+                let reference = SecretReference(Uuid::new_v4());
+                let psk = WireGuardBackend::generate_preshared_key();
+                secrets.push(pending_text_secret(reference.clone(), &psk));
+                Some(reference)
+            } else {
+                None
+            };
+            Ok((
+                DeviceBackendData::WireGuard(WireGuardDeviceData {
+                    public_key: public,
+                    private_key_ref,
+                    preshared_key_ref,
+                }),
+                secrets,
+            ))
+        }
+        VpnBackendKind::AmneziaWg => {
+            let (private, public) = AmneziaWgBackend::generate_device_keys();
+            let private_key_ref = SecretReference(Uuid::new_v4());
+            let preshared_key_ref = SecretReference(Uuid::new_v4());
+            let psk = AmneziaWgBackend::generate_preshared_key();
+            Ok((
+                DeviceBackendData::AmneziaWg(AmneziaWgDeviceData {
+                    public_key: public,
+                    private_key_ref: private_key_ref.clone(),
+                    preshared_key_ref: preshared_key_ref.clone(),
+                }),
+                vec![
+                    pending_text_secret(private_key_ref, &private),
+                    pending_text_secret(preshared_key_ref, &psk),
+                ],
+            ))
+        }
+        VpnBackendKind::OpenVpn => {
+            let generated = OpenVpnBackend::generate_identity(display_name, device_id)?;
+            let private_key_ref = SecretReference(Uuid::new_v4());
+            let csr_ref = SecretReference(Uuid::new_v4());
+            let certificate_ref = SecretReference(Uuid::new_v4());
+            let ca_certificate_ref = SecretReference(Uuid::new_v4());
+            let tls_crypt_key_ref = match &instance.backend_settings {
+                BackendSettings::OpenVpn(settings)
+                    if settings.tls_protection == OpenVpnTlsProtection::TlsCrypt =>
+                {
+                    Some(SecretReference(Uuid::new_v4()))
+                }
+                BackendSettings::OpenVpn(_) => None,
+                _ => return Err(BackendError::BackendMismatch(instance.backend)),
+            };
+            Ok((
+                DeviceBackendData::OpenVpn(OpenVpnDeviceData {
+                    common_name: generated.common_name,
+                    private_key_ref: private_key_ref.clone(),
+                    csr_ref: csr_ref.clone(),
+                    certificate_ref,
+                    ca_certificate_ref,
+                    tls_crypt_key_ref,
+                    certificate_serial: None,
+                }),
+                vec![
+                    pending_text_secret(private_key_ref, &generated.private_key),
+                    pending_text_secret(csr_ref, &generated.csr),
+                ],
+            ))
+        }
+        VpnBackendKind::Ikev2 => {
+            let generated = Ikev2Backend::generate_identity(display_name, device_id)?;
+            let private_key_ref = SecretReference(Uuid::new_v4());
+            let csr_ref = SecretReference(Uuid::new_v4());
+            let certificate_ref = SecretReference(Uuid::new_v4());
+            let ca_certificate_ref = SecretReference(Uuid::new_v4());
+            let bundle_password_ref = SecretReference(Uuid::new_v4());
+            Ok((
+                DeviceBackendData::Ikev2(Ikev2DeviceData {
+                    identity: generated.identity,
+                    private_key_ref: Some(private_key_ref.clone()),
+                    csr_ref: Some(csr_ref.clone()),
+                    certificate_ref: Some(certificate_ref),
+                    ca_certificate_ref: Some(ca_certificate_ref),
+                    bundle_password_ref: bundle_password_ref.clone(),
+                    certificate_serial: None,
+                }),
+                vec![
+                    pending_text_secret(private_key_ref, &generated.private_key),
+                    pending_text_secret(csr_ref, &generated.csr),
+                    pending_text_secret(bundle_password_ref, &generated.bundle_password),
+                ],
+            ))
+        }
+        VpnBackendKind::Xray => {
+            let BackendSettings::Xray(settings) = &instance.backend_settings else {
+                return Err(BackendError::BackendMismatch(instance.backend));
+            };
+            Ok((
+                DeviceBackendData::Xray(XrayBackend::generate_identity(
+                    display_name,
+                    device_id,
+                    settings.transport,
+                )),
+                Vec::new(),
+            ))
+        }
+    }
+}
+
+fn device_secret_registrations(device: &Device) -> Vec<(Uuid, String)> {
+    match &device.backend_data {
+        DeviceBackendData::WireGuard(data) => {
+            let mut values = vec![(data.private_key_ref.0, "wireguard_private_key".to_owned())];
+            values.extend(
+                data.preshared_key_ref
+                    .iter()
+                    .map(|reference| (reference.0, "wireguard_preshared_key".to_owned())),
+            );
+            values
+        }
+        DeviceBackendData::AmneziaWg(data) => vec![
+            (data.private_key_ref.0, "amneziawg_private_key".to_owned()),
+            (
+                data.preshared_key_ref.0,
+                "amneziawg_preshared_key".to_owned(),
+            ),
+        ],
+        DeviceBackendData::OpenVpn(data) => {
+            let mut values = vec![
+                (data.private_key_ref.0, "openvpn_private_key".to_owned()),
+                (data.csr_ref.0, "openvpn_csr".to_owned()),
+                (data.certificate_ref.0, "openvpn_certificate".to_owned()),
+                (
+                    data.ca_certificate_ref.0,
+                    "openvpn_ca_certificate".to_owned(),
+                ),
+            ];
+            values.extend(
+                data.tls_crypt_key_ref
+                    .iter()
+                    .map(|reference| (reference.0, "openvpn_tls_crypt_key".to_owned())),
+            );
+            values
+        }
+        DeviceBackendData::Ikev2(data) => {
+            let mut values = vec![(
+                data.bundle_password_ref.0,
+                "ikev2_pkcs12_password".to_owned(),
+            )];
+            values.extend(
+                data.private_key_ref
+                    .iter()
+                    .map(|reference| (reference.0, "ikev2_private_key".to_owned())),
+            );
+            values.extend(
+                data.csr_ref
+                    .iter()
+                    .map(|reference| (reference.0, "ikev2_csr".to_owned())),
+            );
+            values.extend(
+                data.certificate_ref
+                    .iter()
+                    .map(|reference| (reference.0, "ikev2_certificate".to_owned())),
+            );
+            values.extend(
+                data.ca_certificate_ref
+                    .iter()
+                    .map(|reference| (reference.0, "ikev2_ca_certificate".to_owned())),
+            );
+            values
+        }
+        DeviceBackendData::Xray(_) => Vec::new(),
+    }
+}
+
+fn certificate_identity_metadata(
+    device: &Device,
+) -> Result<(String, Option<String>), BackendError> {
+    match &device.backend_data {
+        DeviceBackendData::OpenVpn(data) => {
+            Ok((data.common_name.clone(), data.certificate_serial.clone()))
+        }
+        DeviceBackendData::Ikev2(data) => {
+            Ok((data.identity.clone(), data.certificate_serial.clone()))
+        }
+        data => Err(BackendError::BackendMismatch(data.kind())),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -571,78 +786,99 @@ fi
         if input.display_name.trim().is_empty() {
             return Err(validation_error("Device name is required."));
         }
+        let lock = self.instance_lock(input.instance_id).await;
+        let _guard = lock.lock().await;
         let instance = self
             .storage
             .get_instance(input.instance_id)
             .await
             .map_err(storage_error)?;
+        let backend = self.backends.get(instance.backend).map_err(backend_error)?;
+        let capabilities = backend.capabilities();
         let devices = self
             .storage
             .list_devices(input.instance_id)
             .await
             .map_err(storage_error)?;
-        let address = allocate_next_ipv4(
-            instance.network.ipv4_subnet,
-            instance.network.gateway_ipv4,
-            &devices,
-        )
-        .map_err(|error| validation_error(&error.to_string()))?;
-        let dns_name = input
-            .dns_name
-            .as_deref()
-            .map(|value| normalize_dns_owner(value, &instance.dns.zone))
-            .transpose()
-            .map_err(|error| validation_error(&error))?
-            .flatten();
-        let (private, public) = WireGuardBackend::generate_device_keys();
-        let private_ref = SecretReference(Uuid::new_v4());
-        self.secrets
-            .put(&private_ref, private.as_bytes())
-            .await
-            .map_err(secret_error)?;
-        let psk_ref = if input.preshared_key {
-            let reference = SecretReference(Uuid::new_v4());
-            let psk = WireGuardBackend::generate_preshared_key();
-            self.secrets
-                .put(&reference, psk.as_bytes())
-                .await
-                .map_err(secret_error)?;
-            Some(reference)
+        let address = if capabilities.allocated_tunnel_addresses {
+            Some(
+                allocate_next_ipv4(
+                    instance.network.ipv4_subnet,
+                    instance.network.gateway_ipv4,
+                    &devices,
+                )
+                .map_err(|error| validation_error(&error.to_string()))?,
+            )
         } else {
             None
         };
-        let device = Device {
-            id: Uuid::new_v4(),
+        let dns_name = if capabilities.managed_dns {
+            input
+                .dns_name
+                .as_deref()
+                .map(|value| normalize_dns_owner(value, &instance.dns.zone))
+                .transpose()
+                .map_err(|error| validation_error(&error))?
+                .flatten()
+        } else {
+            None
+        };
+        let device_id = Uuid::new_v4();
+        let (backend_data, pending_secrets) = generate_device_identity(
+            &instance,
+            input.display_name.trim(),
+            device_id,
+            input.preshared_key,
+        )
+        .map_err(backend_error)?;
+        let mut device = Device {
+            id: device_id,
             instance_id: input.instance_id,
             user_id: input.user_id,
             display_name: input.display_name.trim().into(),
-            ipv4_address: Some(address),
+            ipv4_address: address,
             ipv6_address: None,
             dns_name,
             enabled: true,
-            backend_data: DeviceBackendData::WireGuard(WireGuardDeviceData {
-                public_key: public,
-                private_key_ref: private_ref.clone(),
-                preshared_key_ref: psk_ref.clone(),
-            }),
+            backend_data,
             created_at: Utc::now(),
             deleted_at: None,
         };
-        self.storage
-            .save_device(&device)
-            .await
-            .map_err(storage_error)?;
-        self.storage
-            .register_secret_reference(private_ref.0, "wireguard_private_key", device.id)
-            .await
-            .map_err(storage_error)?;
-        if let Some(reference) = psk_ref {
-            self.storage
-                .register_secret_reference(reference.0, "wireguard_preshared_key", device.id)
+        let mut candidate_state = self.desired_state(instance.id).await?;
+        candidate_state.devices.push(device.clone());
+        backend.validate(&candidate_state).map_err(backend_error)?;
+        self.store_pending_secrets(&pending_secrets).await?;
+        let credential_outcome = if capabilities.certificate_authority {
+            let outcome = match self
+                .issue_certificate_device(&candidate_state, &mut device)
                 .await
-                .map_err(storage_error)?;
-        }
-        if input.create_dns_record {
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.delete_device_secrets(&device).await;
+                    return Err(error);
+                }
+            };
+            candidate_state.devices.pop();
+            candidate_state.devices.push(device.clone());
+            if let Err(error) = self
+                .validate_certificate_client(&candidate_state, &device)
+                .await
+            {
+                let _ = self
+                    .restore_credential_outcome(&candidate_state, &outcome)
+                    .await;
+                self.delete_device_secrets(&device).await;
+                return Err(error);
+            }
+            Some(outcome)
+        } else {
+            None
+        };
+        let dns_record = if input.create_dns_record && capabilities.managed_dns {
+            let address = device.ipv4_address.ok_or_else(|| {
+                validation_error("This backend cannot create a managed tunnel-address record.")
+            })?;
             let name = device
                 .dns_name
                 .clone()
@@ -657,25 +893,109 @@ fi
                 enabled: true,
                 managed_by_device_id: Some(device.id),
             };
-            self.validate_and_save_record(record).await?;
+            let mut records = candidate_state.dns_records.clone();
+            records.push(record.clone());
+            validate_records(&instance.dns.zone, &records)
+                .map_err(|error| validation_error(&error.to_string()))?;
+            Some(record)
+        } else {
+            None
+        };
+        let registrations = device_secret_registrations(&device);
+        if let Err(error) = self
+            .storage
+            .save_new_device_with_secret_references(&device, &registrations, dns_record.as_ref())
+            .await
+        {
+            let mut app_error = storage_error(error);
+            if let Some(outcome) = &credential_outcome {
+                app_error.remote_state_changed = true;
+                app_error.rollback_succeeded = Some(
+                    self.restore_credential_outcome(&candidate_state, outcome)
+                        .await
+                        .is_ok(),
+                );
+            }
+            self.delete_device_secrets(&device).await;
+            return Err(app_error);
+        }
+        if dns_record.is_some() {
+            self.bump_soa(device.instance_id).await?;
         }
         Ok(device)
     }
 
     pub async fn update_device(&self, device: Device) -> Result<Device, AppError> {
+        let lock = self.instance_lock(device.instance_id).await;
+        let _guard = lock.lock().await;
+        let previous = self
+            .storage
+            .get_device(device.id)
+            .await
+            .map_err(storage_error)?;
+        if previous.instance_id != device.instance_id
+            || previous.backend_data != device.backend_data
+        {
+            return Err(validation_error(
+                "Device identity metadata is immutable; use Replace identity.",
+            ));
+        }
         let mut state = self.desired_state(device.instance_id).await?;
         state.devices.retain(|existing| existing.id != device.id);
         state.devices.push(device.clone());
-        self.backends
+        let backend = self
+            .backends
             .get(state.instance.backend)
-            .map_err(backend_error)?
+            .map_err(backend_error)?;
+        backend
             .validate(&state)
             .map_err(|error| validation_error(&error.to_string()))?;
-        let dns_changed = self
-            .storage
-            .save_device_and_sync_managed_dns(&device)
-            .await
-            .map_err(storage_error)?;
+        let credential_outcome = if backend.capabilities().certificate_authority {
+            match (previous.enabled, device.enabled) {
+                (true, false) => Some(
+                    self.execute_device_credential_action(
+                        &state,
+                        &previous,
+                        CredentialAction::Revoke,
+                    )
+                    .await?,
+                ),
+                (false, true) => {
+                    return Err(AppError {
+                        code: "certificate_identity_revoked".into(),
+                        message:
+                            "A revoked certificate device cannot be re-enabled with the same identity."
+                                .into(),
+                        scope: Some(device.id.to_string()),
+                        remote_state_changed: false,
+                        rollback_succeeded: None,
+                        remediation: Some(
+                            "Replace the device identity to issue a new certificate.".into(),
+                        ),
+                        technical_detail: None,
+                    });
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let dns_changed = self.storage.save_device_and_sync_managed_dns(&device).await;
+        let dns_changed = match dns_changed {
+            Ok(changed) => changed,
+            Err(error) => {
+                let mut error = storage_error(error);
+                if let Some(outcome) = &credential_outcome {
+                    error.remote_state_changed = true;
+                    error.rollback_succeeded = Some(
+                        self.restore_credential_outcome(&state, outcome)
+                            .await
+                            .is_ok(),
+                    );
+                }
+                return Err(error);
+            }
+        };
         if dns_changed {
             self.bump_soa(device.instance_id).await?;
         }
@@ -684,53 +1004,133 @@ fi
 
     pub async fn delete_device(&self, id: Uuid) -> Result<(), AppError> {
         let device = self.storage.get_device(id).await.map_err(storage_error)?;
+        let lock = self.instance_lock(device.instance_id).await;
+        let _guard = lock.lock().await;
+        let device = self.storage.get_device(id).await.map_err(storage_error)?;
+        let state = self.desired_state(device.instance_id).await?;
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
+        let credential_outcome = if backend.capabilities().certificate_authority {
+            Some(
+                self.execute_device_credential_action(&state, &device, CredentialAction::Revoke)
+                    .await?,
+            )
+        } else {
+            None
+        };
         let now = Utc::now();
-        self.storage
-            .soft_delete_device(id, now)
-            .await
-            .map_err(storage_error)?;
-        self.storage
-            .mark_secrets_pending_delete(id)
-            .await
-            .map_err(storage_error)?;
+        if let Err(error) = self.storage.soft_delete_device(id, now).await {
+            let mut error = storage_error(error);
+            if let Some(outcome) = &credential_outcome {
+                error.remote_state_changed = true;
+                error.rollback_succeeded = Some(
+                    self.restore_credential_outcome(&state, outcome)
+                        .await
+                        .is_ok(),
+                );
+            }
+            return Err(error);
+        }
         self.bump_soa(device.instance_id).await
     }
 
     pub async fn replace_device_identity(&self, id: Uuid) -> Result<Device, AppError> {
         let mut device = self.storage.get_device(id).await.map_err(storage_error)?;
-        let (private, public) = WireGuardBackend::generate_device_keys();
-        let private_ref = SecretReference(Uuid::new_v4());
-        let psk_ref = SecretReference(Uuid::new_v4());
-        let psk = WireGuardBackend::generate_preshared_key();
-        self.secrets
-            .put(&private_ref, private.as_bytes())
-            .await
-            .map_err(secret_error)?;
-        self.secrets
-            .put(&psk_ref, psk.as_bytes())
-            .await
-            .map_err(secret_error)?;
-        device.backend_data = DeviceBackendData::WireGuard(WireGuardDeviceData {
-            public_key: public,
-            private_key_ref: private_ref.clone(),
-            preshared_key_ref: Some(psk_ref.clone()),
-        });
-        self.storage
-            .save_device(&device)
-            .await
-            .map_err(storage_error)?;
-        self.storage
-            .mark_secrets_pending_delete(device.id)
-            .await
-            .map_err(storage_error)?;
-        for (reference, purpose) in [
-            (private_ref, "wireguard_private_key"),
-            (psk_ref, "wireguard_preshared_key"),
-        ] {
-            self.storage
-                .register_secret_reference(reference.0, purpose, device.id)
+        let lock = self.instance_lock(device.instance_id).await;
+        let _guard = lock.lock().await;
+        device = self.storage.get_device(id).await.map_err(storage_error)?;
+        let previous = device.clone();
+        let mut state = self.desired_state(device.instance_id).await?;
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
+        let (backend_data, pending_secrets) =
+            generate_device_identity(&state.instance, &device.display_name, Uuid::new_v4(), true)
+                .map_err(backend_error)?;
+        device.backend_data = backend_data;
+        device.enabled = true;
+        state.devices.retain(|candidate| candidate.id != device.id);
+        state.devices.push(device.clone());
+        backend.validate(&state).map_err(backend_error)?;
+        self.store_pending_secrets(&pending_secrets).await?;
+        let credential_outcome = if backend.capabilities().certificate_authority {
+            let (previous_identity, previous_certificate_serial) =
+                certificate_identity_metadata(&previous).map_err(backend_error)?;
+            let outcome = match self
+                .execute_device_credential_action(
+                    &state,
+                    &device,
+                    CredentialAction::Replace {
+                        previous_identity,
+                        previous_certificate_serial,
+                    },
+                )
                 .await
-                .map_err(storage_error)?;
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.delete_device_secrets(&device).await;
+                    return Err(error);
+                }
+            };
+            match &mut device.backend_data {
+                DeviceBackendData::OpenVpn(data) => {
+                    data.certificate_serial
+                        .clone_from(&outcome.certificate_serial);
+                }
+                DeviceBackendData::Ikev2(data) => {
+                    data.certificate_serial
+                        .clone_from(&outcome.certificate_serial);
+                }
+                _ => unreachable!("capability identifies certificate backends"),
+            }
+            if outcome.certificate_serial.is_none() {
+                let rollback_succeeded = self
+                    .restore_credential_outcome(&state, &outcome)
+                    .await
+                    .is_ok();
+                self.delete_device_secrets(&device).await;
+                return Err(AppError {
+                    code: "certificate_serial_missing".into(),
+                    message: "The replacement certificate has no valid serial.".into(),
+                    scope: Some(device.id.to_string()),
+                    remote_state_changed: true,
+                    rollback_succeeded: Some(rollback_succeeded),
+                    remediation: Some("Inspect the remote certificate authority state.".into()),
+                    technical_detail: None,
+                });
+            }
+            state.devices.pop();
+            state.devices.push(device.clone());
+            if let Err(error) = self.validate_certificate_client(&state, &device).await {
+                let _ = self.restore_credential_outcome(&state, &outcome).await;
+                self.delete_device_secrets(&device).await;
+                return Err(error);
+            }
+            Some(outcome)
+        } else {
+            None
+        };
+        let registrations = device_secret_registrations(&device);
+        if let Err(error) = self
+            .storage
+            .replace_device_identity_and_retire_secrets(&device, &registrations)
+            .await
+        {
+            let mut error = storage_error(error);
+            if let Some(outcome) = &credential_outcome {
+                error.remote_state_changed = true;
+                error.rollback_succeeded = Some(
+                    self.restore_credential_outcome(&state, outcome)
+                        .await
+                        .is_ok(),
+                );
+            }
+            self.delete_device_secrets(&device).await;
+            return Err(error);
         }
         Ok(device)
     }
@@ -740,6 +1140,370 @@ fi
             .list_devices(instance_id)
             .await
             .map_err(storage_error)
+    }
+
+    async fn store_pending_secrets(&self, secrets: &[PendingSecret]) -> Result<(), AppError> {
+        let mut stored = Vec::new();
+        for secret in secrets {
+            if let Err(error) = self
+                .secrets
+                .put(&secret.reference, secret.value.as_slice())
+                .await
+            {
+                for reference in stored {
+                    let _ = self.secrets.delete(&reference).await;
+                }
+                return Err(secret_error(error));
+            }
+            stored.push(secret.reference.clone());
+        }
+        Ok(())
+    }
+
+    async fn delete_device_secrets(&self, device: &Device) {
+        for reference in device.backend_data.secret_references() {
+            let _ = self.secrets.delete(reference).await;
+        }
+    }
+
+    async fn validate_certificate_client(
+        &self,
+        state: &DesiredState,
+        device: &Device,
+    ) -> Result<(), AppError> {
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
+        let secrets = self.device_secret_map(state, device).await?;
+        backend
+            .render_client(state, device, &secrets)
+            .map(|_| ())
+            .map_err(backend_error)
+    }
+
+    async fn issue_certificate_device(
+        &self,
+        state: &DesiredState,
+        device: &mut Device,
+    ) -> Result<CredentialExecutionOutcome, AppError> {
+        let initialized = self
+            .storage
+            .get_setting::<bool>(&certificate_authority_setting(state.instance.id))
+            .await
+            .map_err(storage_error)?
+            .unwrap_or(false);
+        let deployed = self
+            .storage
+            .last_successful_deployment(state.instance.id)
+            .await
+            .map_err(storage_error)?
+            .is_some();
+        if !initialized || !deployed {
+            return Err(AppError {
+                code: "certificate_authority_not_deployed".into(),
+                message: format!(
+                    "Deploy the {} instance successfully before issuing client certificates.",
+                    state.instance.backend
+                ),
+                scope: Some(state.instance.id.to_string()),
+                remote_state_changed: false,
+                rollback_succeeded: None,
+                remediation: Some(
+                    "Review and apply the instance plan to initialize its persistent authority."
+                        .into(),
+                ),
+                technical_detail: None,
+            });
+        }
+        let outcome = self
+            .execute_device_credential_action(state, device, CredentialAction::Issue)
+            .await?;
+        match &mut device.backend_data {
+            DeviceBackendData::OpenVpn(data) => {
+                data.certificate_serial
+                    .clone_from(&outcome.certificate_serial);
+            }
+            DeviceBackendData::Ikev2(data) => {
+                data.certificate_serial
+                    .clone_from(&outcome.certificate_serial);
+            }
+            _ => {
+                return Err(validation_error(
+                    "Only certificate backends can issue a certificate device.",
+                ));
+            }
+        }
+        if matches!(
+            &device.backend_data,
+            DeviceBackendData::OpenVpn(OpenVpnDeviceData {
+                certificate_serial: None,
+                ..
+            }) | DeviceBackendData::Ikev2(Ikev2DeviceData {
+                certificate_serial: None,
+                ..
+            })
+        ) {
+            let rollback_succeeded = self
+                .restore_credential_outcome(state, &outcome)
+                .await
+                .is_ok();
+            return Err(AppError {
+                code: "certificate_serial_missing".into(),
+                message: "The remote authority did not return an issued certificate serial.".into(),
+                scope: Some(device.id.to_string()),
+                remote_state_changed: true,
+                rollback_succeeded: Some(rollback_succeeded),
+                remediation: Some("Inspect the remote certificate authority state.".into()),
+                technical_detail: None,
+            });
+        }
+        Ok(outcome)
+    }
+
+    async fn execute_device_credential_action(
+        &self,
+        state: &DesiredState,
+        device: &Device,
+        action: CredentialAction,
+    ) -> Result<CredentialExecutionOutcome, AppError> {
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
+        if !backend.capabilities().certificate_authority {
+            return Err(validation_error(
+                "This backend does not use certificate credential operations.",
+            ));
+        }
+        let runtime = backend
+            .runtime(&state.instance.backend_settings)
+            .map_err(backend_error)?;
+        let plan = backend
+            .plan_credentials(state, Some(device), action)
+            .map_err(backend_error)?;
+        let (host, trusted, passphrase) = self.trusted_host(state.instance.host_id).await?;
+        let cancellation = CancellationToken::new();
+        let current = state.instance.remote_path();
+        let backup_name = format!(
+            "{}-credential-{}",
+            Utc::now().format("%Y-%m-%dT%H-%M-%SZ"),
+            Uuid::new_v4()
+        );
+        let backup = backup_path(state.instance.id, &backup_name);
+        let validate_identity = validate_persistent_identity_command(&current, &runtime)
+            .ok_or_else(|| {
+                validation_error(
+                    "The certificate backend has no persistent identity validation command.",
+                )
+            })?;
+        self.checked_execute(
+            &host,
+            &trusted,
+            passphrase.as_ref(),
+            &validate_identity,
+            &cancellation,
+        )
+        .await?;
+        let backup_command = format!(
+            "set -eu; test -d {current}; install -d {parent}; test ! -e {backup} && test ! -L {backup}; cp -a -- {current} {backup}",
+            current = shell_quote(&current),
+            parent = shell_quote(&format!("{APP_ROOT}/backups/{}", state.instance.id)),
+            backup = shell_quote(&backup),
+        );
+        self.checked_execute(
+            &host,
+            &trusted,
+            passphrase.as_ref(),
+            &backup_command,
+            &cancellation,
+        )
+        .await?;
+
+        let mut outcome = CredentialExecutionOutcome::default();
+        let operation_result = async {
+            for operation in &plan.operations {
+                match operation {
+                    CredentialOperation::UploadSecret {
+                        reference,
+                        relative_path,
+                        mode,
+                    } => {
+                        if !safe_relative_path(relative_path)
+                            || !certificate_identity_paths(&runtime)
+                                .iter()
+                                .any(|path| path_is_within(relative_path, path))
+                        {
+                            return Err(validation_error(
+                                "The credential plan attempted an unsafe upload path.",
+                            ));
+                        }
+                        let value = self.secrets.get(reference).await.map_err(secret_error)?;
+                        self.transport
+                            .upload(UploadRequest {
+                                config: &host.ssh,
+                                trusted_key_base64: &trusted.public_key_base64,
+                                passphrase: passphrase.as_ref(),
+                                remote_path: &format!("{current}/{relative_path}"),
+                                contents: value.as_slice(),
+                                mode: *mode,
+                                cancellation: &cancellation,
+                            })
+                            .await
+                            .map_err(ssh_error)?;
+                    }
+                    CredentialOperation::DownloadToSecret {
+                        relative_path,
+                        reference,
+                        ..
+                    } => {
+                        if !safe_relative_path(relative_path)
+                            || !certificate_identity_paths(&runtime)
+                                .iter()
+                                .any(|path| path_is_within(relative_path, path))
+                        {
+                            return Err(validation_error(
+                                "The credential plan attempted an unsafe download path.",
+                            ));
+                        }
+                        let value = self
+                            .transport
+                            .download(vam_ssh::DownloadRequest {
+                                config: &host.ssh,
+                                trusted_key_base64: &trusted.public_key_base64,
+                                passphrase: passphrase.as_ref(),
+                                remote_path: &format!("{current}/{relative_path}"),
+                                max_bytes: 1024 * 1024,
+                                cancellation: &cancellation,
+                            })
+                            .await
+                            .map_err(ssh_error)?;
+                        self.secrets
+                            .put(reference, value.as_slice())
+                            .await
+                            .map_err(secret_error)?;
+                    }
+                    CredentialOperation::ReadCertificateSerial { .. } => {
+                        let command = credential_operation_command(
+                            &current,
+                            &runtime,
+                            state.instance.backend,
+                            operation,
+                        )
+                        .map_err(validation_error)?
+                        .ok_or_else(|| {
+                            validation_error(
+                                "The certificate serial operation produced no command.",
+                            )
+                        })?;
+                        let result = self
+                            .checked_execute(
+                                &host,
+                                &trusted,
+                                passphrase.as_ref(),
+                                &command,
+                                &cancellation,
+                            )
+                            .await?;
+                        outcome.certificate_serial =
+                            parse_certificate_serial(&result.stdout_text().map_err(ssh_error)?);
+                        if outcome.certificate_serial.is_none() {
+                            return Err(AppError {
+                                code: "certificate_serial_invalid".into(),
+                                message: "The remote authority returned an invalid serial.".into(),
+                                scope: Some(device.id.to_string()),
+                                remote_state_changed: true,
+                                rollback_succeeded: None,
+                                remediation: Some(
+                                    "Inspect the issued certificate and authority database.".into(),
+                                ),
+                                technical_detail: None,
+                            });
+                        }
+                    }
+                    CredentialOperation::InitializeOpenVpnAuthority { .. }
+                    | CredentialOperation::InitializeIkev2Authority { .. } => {
+                        return Err(validation_error(
+                            "Authority initialization is not a device credential operation.",
+                        ));
+                    }
+                    _ => {
+                        let command = credential_operation_command(
+                            &current,
+                            &runtime,
+                            state.instance.backend,
+                            operation,
+                        )
+                        .map_err(validation_error)?
+                        .ok_or_else(|| {
+                            validation_error(
+                                "The credential plan operation produced no remote command.",
+                            )
+                        })?;
+                        self.checked_execute(
+                            &host,
+                            &trusted,
+                            passphrase.as_ref(),
+                            &command,
+                            &cancellation,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            Ok::<(), AppError>(())
+        }
+        .await;
+
+        if let Err(mut error) = operation_result {
+            error.remote_state_changed = true;
+            error.rollback_succeeded = Some(
+                self.restore_backup(
+                    state,
+                    &host,
+                    &trusted,
+                    passphrase.as_ref(),
+                    Some(&backup),
+                    &cancellation,
+                )
+                .await
+                .is_ok(),
+            );
+            return Err(error);
+        }
+        let prune = prune_command(state.instance.id, BACKUP_RETENTION);
+        let _ = self
+            .checked_execute(&host, &trusted, passphrase.as_ref(), &prune, &cancellation)
+            .await;
+        outcome.backup_path = Some(backup);
+        Ok(outcome)
+    }
+
+    async fn restore_credential_outcome(
+        &self,
+        state: &DesiredState,
+        outcome: &CredentialExecutionOutcome,
+    ) -> Result<(), AppError> {
+        let backup = outcome.backup_path.as_deref().ok_or_else(|| {
+            validation_error("The credential operation has no restorable authority backup.")
+        })?;
+        let rollback_state = self
+            .storage
+            .last_successful_deployment(state.instance.id)
+            .await
+            .map_err(storage_error)?
+            .map_or_else(|| state.clone(), |deployment| deployment.desired_state);
+        let (host, trusted, passphrase) = self.trusted_host(state.instance.host_id).await?;
+        self.restore_backup(
+            &rollback_state,
+            &host,
+            &trusted,
+            passphrase.as_ref(),
+            Some(backup),
+            &CancellationToken::new(),
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn create_dns_record(
@@ -3111,6 +3875,37 @@ fi"#,
     Some(command)
 }
 
+fn validate_persistent_identity_command(
+    current: &str,
+    runtime: &BackendRuntimeSpec,
+) -> Option<String> {
+    let paths = certificate_identity_paths(runtime);
+    if paths.is_empty() {
+        return None;
+    }
+    let mut command = String::from("set -eu");
+    for path in paths {
+        debug_assert!(safe_relative_path(path));
+        let source = format!("{current}/{path}");
+        command.push_str(&format!(
+            r#"; if test -e {source} || test -L {source}; then
+  test ! -L {source}
+  if test -d {source}; then
+    if find {source} -type l -print -quit | grep -q .; then
+      echo "persistent identity contains a symbolic link: {label}" >&2
+      exit 1
+    fi
+  else
+    test -f {source}
+  fi
+fi"#,
+            source = shell_quote(&source),
+            label = path,
+        ));
+    }
+    Some(command)
+}
+
 fn authority_mount<'a>(
     stage: &str,
     runtime: &'a BackendRuntimeSpec,
@@ -3182,6 +3977,7 @@ trap cleanup EXIT INT TERM HUP
 export EASYRSA=/usr/share/easy-rsa
 export EASYRSA_BATCH=1
 export EASYRSA_PKI="$new"
+export EASYRSA_DN=cn_only
 export EASYRSA_ALGO=ec
 export EASYRSA_CURVE=prime256v1
 export EASYRSA_DIGEST=sha256
@@ -3290,6 +4086,231 @@ rm -rf -- "$new""#,
         mount = shell_quote(&mount),
         script = shell_quote(&script),
     ))
+}
+
+fn credential_container_command(
+    current: &str,
+    runtime: &BackendRuntimeSpec,
+    script: &str,
+) -> Result<String, &'static str> {
+    let (mount, _) = authority_mount(current, runtime)?;
+    Ok(format!(
+        "docker run --rm --user 0:0 --entrypoint /bin/sh -v {mount} {image} -c {script}",
+        mount = shell_quote(&mount),
+        image = shell_quote(runtime_image_reference(runtime)),
+        script = shell_quote(script),
+    ))
+}
+
+fn credential_operation_command(
+    current: &str,
+    runtime: &BackendRuntimeSpec,
+    backend: VpnBackendKind,
+    operation: &CredentialOperation,
+) -> Result<Option<String>, &'static str> {
+    let command = match operation {
+        CredentialOperation::ImportOpenVpnCsr {
+            common_name,
+            relative_path,
+        } => {
+            if backend != VpnBackendKind::OpenVpn {
+                return Err("An OpenVPN credential operation was assigned to another backend.");
+            }
+            let request = runtime_container_path(runtime, relative_path)
+                .ok_or("The OpenVPN request path is outside its declared mount.")?;
+            let script = format!(
+                r"set -eu
+export EASYRSA=/usr/share/easy-rsa
+export EASYRSA_BATCH=1
+export EASYRSA_PKI=/etc/openvpn/pki
+export EASYRSA_DN=cn_only
+easyrsa import-req {request} {common_name}",
+                request = shell_quote(&request),
+                common_name = shell_quote(common_name),
+            );
+            Some(credential_container_command(current, runtime, &script)?)
+        }
+        CredentialOperation::SignOpenVpnClient {
+            common_name,
+            certificate_lifetime_days,
+        } => {
+            if backend != VpnBackendKind::OpenVpn {
+                return Err("An OpenVPN credential operation was assigned to another backend.");
+            }
+            let script = format!(
+                r"set -eu
+export EASYRSA=/usr/share/easy-rsa
+export EASYRSA_BATCH=1
+export EASYRSA_PKI=/etc/openvpn/pki
+export EASYRSA_DN=cn_only
+EASYRSA_CERT_EXPIRE={certificate_lifetime_days} easyrsa sign-req client {common_name}
+openssl verify -CAfile /etc/openvpn/pki/ca.crt /etc/openvpn/pki/issued/{common_name}.crt",
+                common_name = shell_quote(common_name),
+            );
+            Some(credential_container_command(current, runtime, &script)?)
+        }
+        CredentialOperation::RevokeOpenVpnClient { common_name } => {
+            if backend != VpnBackendKind::OpenVpn {
+                return Err("An OpenVPN credential operation was assigned to another backend.");
+            }
+            let script = format!(
+                r#"set -eu
+export EASYRSA=/usr/share/easy-rsa
+export EASYRSA_BATCH=1
+export EASYRSA_PKI=/etc/openvpn/pki
+export EASYRSA_DN=cn_only
+common_name={common_name}
+if awk -F '	' -v subject="/CN=$common_name" '$1 == "R" && $6 == subject {{ found=1 }} END {{ exit !found }}' "$EASYRSA_PKI/index.txt"; then
+  :
+else
+  easyrsa revoke "$common_name"
+fi"#,
+                common_name = shell_quote(common_name),
+            );
+            Some(credential_container_command(current, runtime, &script)?)
+        }
+        CredentialOperation::RegenerateOpenVpnCrl { lifetime_days } => {
+            if backend != VpnBackendKind::OpenVpn {
+                return Err("An OpenVPN credential operation was assigned to another backend.");
+            }
+            let script = format!(
+                r#"set -eu
+export EASYRSA=/usr/share/easy-rsa
+export EASYRSA_BATCH=1
+export EASYRSA_PKI=/etc/openvpn/pki
+export EASYRSA_DN=cn_only
+EASYRSA_CRL_DAYS={lifetime_days} easyrsa gen-crl
+openssl crl -in "$EASYRSA_PKI/crl.pem" -noout"#,
+            );
+            Some(credential_container_command(current, runtime, &script)?)
+        }
+        CredentialOperation::SignIkev2Client {
+            identity,
+            relative_path,
+            certificate_lifetime_days,
+            key_algorithm,
+        } => {
+            if backend != VpnBackendKind::Ikev2 {
+                return Err("An IKEv2 credential operation was assigned to another backend.");
+            }
+            let request = runtime_container_path(runtime, relative_path)
+                .ok_or("The IKEv2 request path is outside its declared mount.")?;
+            let certificate_relative = format!("ikev2/issued/{identity}.pem");
+            let certificate = runtime_container_path(runtime, &certificate_relative)
+                .ok_or("The IKEv2 certificate path is outside its declared mount.")?;
+            let digest = match key_algorithm {
+                vam_backend::CertificateKeyAlgorithm::EcdsaP256Sha256 => "sha256",
+                vam_backend::CertificateKeyAlgorithm::EcdsaP384Sha384 => "sha384",
+            };
+            let script = format!(
+                r#"set -eu
+umask 077
+request={request}
+certificate={certificate}
+serial_file="$certificate.serial"
+serial="$(od -An -N16 -tx1 /dev/urandom | tr -d '[:space:]')"
+test "${{#serial}}" -eq 32
+test ! -e "$certificate" && test ! -L "$certificate"
+pki --issue --in "$request" --type pkcs10 --cacert /etc/swanctl/x509ca/vam-ca.pem --cakey /etc/swanctl/private/vam-ca-key.pem --flag clientAuth --serial "$serial" --lifetime {certificate_lifetime_days} --digest {digest} --outform pem > "$certificate"
+pki --verify --in "$certificate" --cacert /etc/swanctl/x509ca/vam-ca.pem
+printf '%s\n' "$serial" > "$serial_file"
+chmod 0644 "$certificate" "$serial_file""#,
+                request = shell_quote(&request),
+                certificate = shell_quote(&certificate),
+            );
+            Some(credential_container_command(current, runtime, &script)?)
+        }
+        CredentialOperation::RevokeIkev2Client {
+            certificate_serial,
+            crl_lifetime_days,
+            ..
+        } => {
+            if backend != VpnBackendKind::Ikev2 {
+                return Err("An IKEv2 credential operation was assigned to another backend.");
+            }
+            let script = format!(
+                r#"set -eu
+umask 077
+crl=/etc/swanctl/x509crl/vam-crl.pem
+new="$crl.vam-new"
+marker=/etc/swanctl/revoked/{certificate_serial}
+test -s "$crl"
+if test -f "$marker" && test ! -L "$marker"; then
+  exit 0
+fi
+test ! -e "$marker" && test ! -L "$marker"
+rm -f -- "$new"
+pki --signcrl --cacert /etc/swanctl/x509ca/vam-ca.pem --cakey /etc/swanctl/private/vam-ca-key.pem --lastcrl "$crl" --serial {certificate_serial} --reason superseded --lifetime {crl_lifetime_days} --digest sha384 --outform pem > "$new"
+pki --print --type crl --in "$new" >/dev/null
+chmod 0644 "$new"
+mv "$new" "$crl"
+install -m 0644 /dev/null "$marker""#,
+                certificate_serial = shell_quote(certificate_serial),
+            );
+            Some(credential_container_command(current, runtime, &script)?)
+        }
+        CredentialOperation::ReloadGateway => Some(match backend {
+            VpnBackendKind::OpenVpn => format!(
+                "set -eu; cd {}; docker compose restart gateway",
+                shell_quote(current)
+            ),
+            VpnBackendKind::Ikev2 => format!(
+                "set -eu; cd {}; docker compose exec -T gateway swanctl --load-all --noprompt",
+                shell_quote(current)
+            ),
+            _ => return Err("Only certificate backends can reload credential state."),
+        }),
+        CredentialOperation::TerminateIkev2Connection { connection_name } => {
+            if backend != VpnBackendKind::Ikev2 {
+                return Err("An IKEv2 credential operation was assigned to another backend.");
+            }
+            let script = format!(
+                r#"set -eu
+sas="$(swanctl --list-sas --ike {connection_name} --raw)"
+if test -n "$sas"; then
+  swanctl --terminate --ike {connection_name} --timeout 10
+fi"#,
+                connection_name = shell_quote(connection_name),
+            );
+            Some(format!(
+                "set -eu; cd {}; docker compose exec -T gateway /bin/sh -c {}",
+                shell_quote(current),
+                shell_quote(&script)
+            ))
+        }
+        CredentialOperation::ReadCertificateSerial { relative_path } => {
+            let certificate = runtime_container_path(runtime, relative_path)
+                .ok_or("The certificate path is outside its declared mount.")?;
+            let script = match backend {
+                VpnBackendKind::OpenVpn => format!(
+                    "set -eu; serial=\"$(openssl x509 -in {} -noout -serial | sed 's/^serial=//;s/^Serial=//')\"; printf 'certificate_serial=%s\\n' \"$serial\"",
+                    shell_quote(&certificate)
+                ),
+                VpnBackendKind::Ikev2 => format!(
+                    "set -eu; serial=\"$(cat {}.serial)\"; printf 'certificate_serial=%s\\n' \"$serial\"",
+                    shell_quote(&certificate)
+                ),
+                _ => return Err("Only certificate backends can read certificate serials."),
+            };
+            Some(credential_container_command(current, runtime, &script)?)
+        }
+        CredentialOperation::UploadSecret { .. }
+        | CredentialOperation::DownloadToSecret { .. }
+        | CredentialOperation::InitializeOpenVpnAuthority { .. }
+        | CredentialOperation::InitializeIkev2Authority { .. } => None,
+    };
+    Ok(command)
+}
+
+fn parse_certificate_serial(output: &str) -> Option<String> {
+    let values = parse_key_values(output);
+    values.get("certificate_serial").and_then(|serial| {
+        let normalized = serial.trim().to_ascii_uppercase();
+        (!normalized.is_empty()
+            && normalized.len() <= 64
+            && normalized.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(normalized)
+    })
 }
 
 fn activation_command(
@@ -4522,6 +5543,115 @@ mod tests {
     }
 
     #[test]
+    fn backend_device_identity_generation_matches_capabilities() {
+        let wireguard = command_state(VpnBackendKind::WireGuard);
+        let (data, secrets) =
+            generate_device_identity(&wireguard.instance, "Laptop", Uuid::from_u128(10), false)
+                .unwrap();
+        assert!(matches!(
+            data,
+            DeviceBackendData::WireGuard(WireGuardDeviceData {
+                preshared_key_ref: None,
+                ..
+            })
+        ));
+        assert_eq!(secrets.len(), 1);
+
+        let awg = command_state(VpnBackendKind::AmneziaWg);
+        let (data, secrets) =
+            generate_device_identity(&awg.instance, "Laptop", Uuid::from_u128(11), false).unwrap();
+        assert!(matches!(data, DeviceBackendData::AmneziaWg(_)));
+        assert_eq!(secrets.len(), 2);
+
+        let openvpn = command_state(VpnBackendKind::OpenVpn);
+        let (data, secrets) =
+            generate_device_identity(&openvpn.instance, "Laptop", Uuid::from_u128(12), true)
+                .unwrap();
+        let DeviceBackendData::OpenVpn(data) = data else {
+            panic!("expected OpenVPN identity");
+        };
+        assert!(data.certificate_serial.is_none());
+        assert!(data.tls_crypt_key_ref.is_some());
+        assert_eq!(secrets.len(), 2);
+
+        let ikev2 = command_state(VpnBackendKind::Ikev2);
+        let (data, secrets) =
+            generate_device_identity(&ikev2.instance, "Laptop", Uuid::from_u128(13), true).unwrap();
+        let DeviceBackendData::Ikev2(data) = data else {
+            panic!("expected IKEv2 identity");
+        };
+        assert!(data.private_key_ref.is_some());
+        assert!(data.certificate_ref.is_some());
+        assert_eq!(secrets.len(), 3);
+
+        let xray = command_state(VpnBackendKind::Xray);
+        let (data, secrets) =
+            generate_device_identity(&xray.instance, "Laptop", Uuid::from_u128(14), true).unwrap();
+        assert!(matches!(data, DeviceBackendData::Xray(_)));
+        assert!(secrets.is_empty());
+    }
+
+    #[test]
+    fn certificate_device_commands_are_typed_quoted_and_idempotent() {
+        let openvpn = command_state(VpnBackendKind::OpenVpn);
+        let runtime = OpenVpnBackend
+            .runtime(&openvpn.instance.backend_settings)
+            .unwrap();
+        let import = CredentialOperation::ImportOpenVpnCsr {
+            common_name: "laptop-1234".into(),
+            relative_path: "vpn/requests/laptop-1234.req".into(),
+        };
+        let command = credential_operation_command(
+            "/safe/current",
+            &runtime,
+            VpnBackendKind::OpenVpn,
+            &import,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(command.contains("easyrsa import-req"));
+        assert!(command.contains("EASYRSA_DN=cn_only"));
+        assert!(command.contains("'/safe/current/vpn:/etc/openvpn'"));
+
+        let revoke = CredentialOperation::RevokeOpenVpnClient {
+            common_name: "laptop-1234".into(),
+        };
+        let command = credential_operation_command(
+            "/safe/current",
+            &runtime,
+            VpnBackendKind::OpenVpn,
+            &revoke,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(command.contains("index.txt"));
+        assert!(command.contains("easyrsa revoke"));
+
+        let ikev2 = command_state(VpnBackendKind::Ikev2);
+        let runtime = Ikev2Backend
+            .runtime(&ikev2.instance.backend_settings)
+            .unwrap();
+        let revoke = CredentialOperation::RevokeIkev2Client {
+            identity: "laptop-1234".into(),
+            certificate_serial: "A1B2C3".into(),
+            crl_lifetime_days: 3650,
+        };
+        let command =
+            credential_operation_command("/safe/current", &runtime, VpnBackendKind::Ikev2, &revoke)
+                .unwrap()
+                .unwrap();
+        assert!(command.contains("--lastcrl"));
+        assert!(command.contains("--serial"));
+        assert!(command.contains("revoked"));
+        assert!(command.contains("test -f"));
+        assert_eq!(
+            parse_certificate_serial("certificate_serial=00a1b2\n").as_deref(),
+            Some("00A1B2")
+        );
+        assert!(parse_certificate_serial("certificate_serial=../../bad").is_none());
+    }
+
+    #[test]
     fn wireguard_like_identity_and_validation_are_backend_declared() {
         let state = command_state(VpnBackendKind::AmneziaWg);
         let runtime = AmneziaWgBackend
@@ -4589,6 +5719,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(service.list_instances(None).await.unwrap(), vec![instance]);
+    }
+
+    #[tokio::test]
+    async fn xray_device_creation_allocates_no_tunnel_address_dns_or_secret() {
+        let storage = Storage::in_memory().await.unwrap();
+        let secrets = Arc::new(MemorySecretStore::default());
+        let service = ApplicationService::with_transport(
+            storage,
+            secrets,
+            Arc::new(RusshTransport::default()),
+        );
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "192.0.2.1".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let mut instance = command_state(VpnBackendKind::Xray).instance;
+        instance.id = Uuid::new_v4();
+        instance.host_id = host.id;
+        service.storage.save_instance(&instance).await.unwrap();
+
+        let device = service
+            .create_device(CreateDeviceInput {
+                instance_id: instance.id,
+                user_id: None,
+                display_name: "Browser".into(),
+                preshared_key: true,
+                create_dns_record: true,
+                dns_name: Some("browser".into()),
+            })
+            .await
+            .unwrap();
+        assert!(device.ipv4_address.is_none());
+        assert!(device.dns_name.is_none());
+        assert!(matches!(device.backend_data, DeviceBackendData::Xray(_)));
+        assert!(
+            service
+                .list_dns_records(instance.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(device_secret_registrations(&device).is_empty());
     }
 
     #[tokio::test]

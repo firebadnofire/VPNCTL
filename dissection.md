@@ -3579,3 +3579,199 @@ The application proof again used the temporary ring-provider diagnostic; the
 manifest and lockfile are restored to AWS-LC. Docker is unavailable, so the
 exact pinned image builds and Easy-RSA/strongSwan command execution remain
 unverified locally and are not represented as runtime proof.
+
+Commit:
+
+- `a70ceb0 feat: bootstrap persistent certificate authorities`;
+- verified good EDDSA signature from William Jones' configured YubiKey-backed
+  key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### 8C implementation
+
+#### Backend-aware local identities
+
+The application device factory now dispatches through the instance backend:
+
+- WireGuard generates a unique local keypair and an optional per-device PSK;
+- AWG2 generates its own local keypair and always creates a unique mandatory
+  PSK, even if an old caller sends `preshared_key=false`;
+- OpenVPN calls the backend's EC key/PKCS#10 generator, creates opaque
+  references for the future certificate, CA certificate, and optional
+  TLS-crypt key, and stores only private key/CSR material initially;
+- IKEv2 calls the P-384 generator, creates references for certificate/CA
+  retrieval, and stores the private key, CSR, and 64-character PKCS#12
+  password;
+- Xray generates a fresh UUID and structured email/flow metadata, with no
+  secret reference.
+
+Address allocation and managed DNS now follow backend capabilities. Routed
+backends reserve the next safe tunnel address. Xray receives `None` for its
+address and DNS owner, creates no CoreDNS record even when an old CLI/UI caller
+passes its historical default, and writes no secret-reference row.
+
+Identity-bearing fields are immutable through ordinary `update_device`.
+Changing a public key, UUID, common name, identity, or secret reference must go
+through the explicit replacement workflow.
+
+#### Atomic local metadata
+
+Storage now provides transaction-specific methods instead of composing several
+independent writes:
+
+- new device row + every secret-reference row + optional managed DNS row;
+- replacement device row + marking every previous reference pending deletion
+  + every new reference;
+- soft deletion + managed DNS removal + secret retirement.
+
+If any statement fails, SQLite rolls the complete group back. Native secret
+values are written before the transaction and deleted if the transaction
+fails. Old values are only marked pending and remain recoverable while retained
+deployment snapshots reference them.
+
+#### Remote credential transaction
+
+Every certificate issue, revoke, or replacement is serialized by the existing
+per-instance lock and requires both:
+
+- the post-health local authority marker; and
+- at least one successful deployment snapshot.
+
+The operation still validates the real remote authority. Before the first
+mutation it copies the complete active instance into a unique credential
+backup under the normal instance backup root. A typed `CredentialPlan` then
+executes in order:
+
+Before that copy or any root-container mount, the generic application
+preflights every backend-declared persistent path: declared roots may be only
+regular files/directories, roots may not be symlinks, and directory trees may
+not contain symlinks. This prevents remote drift from redirecting an authority
+operation outside the isolated instance root.
+
+1. retrieve the locally generated CSR from native secure storage;
+2. upload it through verified SFTP to an exact declared persistent path at
+   mode 0600;
+3. run signing commands inside the selected pinned backend image;
+4. download only the certificate, CA certificate, and optional TLS-crypt key
+   through verified SFTP with a 1 MiB per-artifact limit;
+5. store those artifacts directly in native secure storage;
+6. read the certificate serial using a command that must first exit zero;
+7. accept only 1-64 hexadecimal characters and normalize them to uppercase.
+
+Any SSH, SFTP, command-exit, size, serial, or secret-store failure restores the
+credential backup through the normal Compose/health/ownership rollback path.
+The pending local secrets are then deleted.
+
+After issue, the backend renders the complete client artifact inside Rust as a
+validation step before SQLite is touched. OpenVPN must parse all PEM/static-key
+blocks. IKEv2 must parse the P-384 private key and certificate chain and build
+the password-protected PKCS#12 bundle. Secret-bearing output is discarded; it
+does not cross Tauri.
+
+If the later SQLite transaction fails, the same retained backup is restored,
+which removes the newly issued identity and restores the old CRL/index. This is
+stronger than merely revoking a replacement certificate because replacement
+has already revoked the previous identity.
+
+#### OpenVPN operations
+
+OpenVPN operations run Easy-RSA inside the pinned local image with:
+
+- batch mode;
+- the fixed `/etc/openvpn/pki` authority;
+- `EASYRSA_DN=cn_only`, matching the validated Common Name and the index check;
+- caller-independent, backend-generated safe names;
+- configured bounded client lifetime;
+- OpenSSL chain verification after signing.
+
+Revocation first checks Easy-RSA's tabular index for an existing revoked
+subject, making retry a no-op. Otherwise it revokes the exact Common Name,
+regenerates and validates the CRL, and restarts only the gateway so OpenVPN
+loads the new CRL.
+
+#### IKEv2 operations
+
+The IKEv2 backend paths were corrected to be instance-root-relative
+(`ikev2/requests`, `ikev2/issued`, and `ikev2/x509ca`) so the generic
+host/container mapper can enforce the mount boundary.
+
+Issuance:
+
+- creates a random 128-bit hexadecimal serial from `/dev/urandom`;
+- signs the locally generated PKCS#10 request with P-384/SHA-384 and explicit
+  `clientAuth`;
+- validates the returned chain before publishing it;
+- stores a non-secret serial sidecar for deterministic discovery.
+
+Revocation uses strongSwan `pki --signcrl` with the previous CRL and exact
+certificate serial, validates the new CRL before rename, and writes an
+idempotency marker under the newly declared persistent `ikev2/revoked`
+directory. It then reloads all credentials/connections.
+
+The original credential model asked to terminate an IKE identity, but
+`swanctl --terminate --ike` takes an IKE_SA/connection name, not a remote
+certificate identity. The operation now carries the backend-generated
+`client-<device-uuid>` connection name. It lists that exact SA and terminates
+it only when active; a discovery error remains fatal.
+
+This follows the current official strongSwan command contracts:
+
+- <https://docs.strongswan.org/docs/latest/pki/pkiIssue.html>
+- <https://docs.strongswan.org/docs/latest/pki/pkiSignCrl.html>
+- <https://docs.strongswan.org/docs/latest/swanctl/swanctlTerminate.html>
+
+#### Disable, delete, and replacement
+
+Disabling or deleting a certificate device revokes remotely and reloads the
+CRL before committing local disabled/deleted state. A revoked device cannot be
+re-enabled because X.509 revocation is irreversible; the application returns
+an actionable `certificate_identity_revoked` error directing the caller to
+replace identity.
+
+Replacement:
+
+- generates a distinct new local identity (including a new OpenVPN CN/IKEv2
+  identity seed);
+- issues and validates the new certificate first;
+- revokes the old certificate and reloads the gateway;
+- terminates the old IKE connection where applicable;
+- atomically swaps local metadata and retires old secret references.
+
+WireGuard, AWG2, and Xray replacement uses the same backend-aware local factory
+and atomic storage method. Their remote desired-state update remains subject to
+the existing reviewed apply/quick-refresh workflow.
+
+### 8C validation
+
+Development failures were stopped and corrected in sequence:
+
+- strict backend clippy found an obsolete `ikev2_device_required` helper after
+  credential plans began retaining the complete device; it was removed;
+- the first application compile found a wrong `validate_records` argument and
+  a moved serial value; the zone is now passed explicitly and the public serial
+  is retained with the rollback handle;
+- application tests then exposed only an unused duplicated purpose field;
+  registration purpose comes from finalized typed backend data, so the
+  transient duplicate was removed;
+- strict clippy requested two simpler raw-string delimiters and `clone_from`
+  for four serial assignments; those no-behavior-change fixes were applied.
+
+Passing gates:
+
+- 36 initial focused core/backend/storage tests;
+- 8 IKEv2 tests after the exact connection-termination/path changes;
+- 12 storage tests, including the new atomic create/replace/delete and secret
+  retirement test;
+- 17 application tests, including:
+  - five-backend identity generation and secret counts;
+  - mandatory AWG2 PSK;
+  - certificate command typing, mount quoting, Easy-RSA index idempotence,
+    strongSwan CRL/marker behavior, and serial rejection;
+  - Xray creation with no tunnel address, DNS record, or secret reference;
+  - all prior verified-SSH/deployment behavior;
+- strict clippy for all affected targets with `-D warnings`;
+- formatting and `git diff --check`.
+
+The application test/clippy gate used the temporary ring-provider diagnostic.
+`Cargo.toml` and `Cargo.lock` are restored to the delivered AWS-LC graph.
+Docker and a Linux SSH fixture are unavailable, so real Easy-RSA/strongSwan
+issue/revoke/restore execution remains an explicit integration-test gap.
