@@ -5244,3 +5244,58 @@ Previous signed commit: `3068e0d docs: record backend-aware UI implementation`
 (good EDDSA signature).
 
 Planned signed commit: `fix: clarify instance settings workspace`.
+
+### 12K. Visible modal and creation errors (2026-07-31)
+
+Application errors were rendered only in the page content. When a Create
+instance request failed, the still-open modal backdrop blurred and obscured that
+page alert, leaving the review screen apparently unchanged. Closing the wizard
+revealed the error, but the user had no immediate indication that Create failed
+or which input needed correction.
+
+Errors produced while a modal is open now render once inside that active dialog.
+The creation case is titled `Instance creation failed`, followed by the backend
+message, remediation, remote-state warning when applicable, and expandable
+technical detail. The assertive alert is programmatically focused after Svelte
+renders it, which both announces it and scrolls it into view in a long modal.
+The duplicate page alert is suppressed only while a modal owns the error; normal
+page errors retain the existing presentation. Opening a fresh creation wizard
+clears stale error/detail state, and Back clears the rejected result so corrected
+input is not visually associated with an obsolete response.
+
+The real five-step integration test exposed an existing boundary warning: the
+root application uses Svelte's legacy reactive mode while backend form children
+declared rune-style `$bindable` props. All five isolated form components now use
+the compatible exported `form` prop. Their existing object bindings and dynamic
+field behavior remain unchanged, while both creation and Settings mount without
+`binding_property_non_reactive` warnings.
+
+Files changed:
+
+- `apps/desktop/src/App.svelte`: modal-owned alert, focus, duplicate suppression,
+  and clean wizard Back/open state;
+- `apps/desktop/src/styles.css`: prominent focused modal alert styling;
+- all five `lib/components/forms/*Form.svelte` components: compatible reactive
+  prop boundary;
+- `apps/desktop/src/App.integration.test.ts`: rejected create request through all
+  five wizard steps, in-dialog ownership, focus, message, and remediation.
+
+Validation:
+
+- focused application/form suites passed 4/4 tests with no Svelte runtime
+  warnings;
+- full frontend suite passed 26/26 tests across four files;
+- Svelte check passed with 0 errors and 0 warnings;
+- Vite production build passed (134 modules, 135.47 kB JavaScript and 22.91 kB
+  CSS before gzip);
+- `git diff --check` passed.
+
+The initial patch attempt was rejected atomically because PowerShell's display
+of a Unicode close glyph did not match the UTF-8 source context. Smaller
+UTF-8-safe hunks were applied instead. No partially applied state remained from
+the rejected patch.
+
+Previous signed commit: `71f0b7e fix: clarify instance settings workspace`
+(good EDDSA signature).
+
+Planned signed commit: `fix: show creation errors in active dialog`.

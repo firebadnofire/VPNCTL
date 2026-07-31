@@ -224,6 +224,10 @@ footer { color: #9fb3c8; font-size: 11px; text-align: center; padding: 24px 0 0;
 .modal-head { display: flex; align-items: flex-start; justify-content: space-between; margin-bottom: 20px; }
 .modal-head h2 { margin: 2px 0 0; font-size: 22px; }
 .modal-head > button { border: 0; background: transparent; font-size: 25px; color: #829ab1; cursor: pointer; line-height: 1; }
+.modal-alert { margin: -3px 0 18px; border-width: 2px; box-shadow: 0 5px 18px #8d4b0018; }
+.modal-alert:focus { outline: 3px solid #ffb04f; outline-offset: 2px; }
+.modal-alert strong { font-size: 13px; }
+.modal-alert p:first-of-type { color: #6f3b00; font-weight: 650; }
 .modal form, .modal > label { display: grid; gap: 15px; }
 .modal label { display: grid; gap: 6px; font-size: 12px; font-weight: 700; color: #334e68; }
 input, select { width: 100%; border: 1px solid #cbd8e5; border-radius: 7px; background: white; padding: 10px 11px; outline: none; }

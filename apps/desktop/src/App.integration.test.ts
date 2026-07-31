@@ -80,4 +80,35 @@ describe("desktop application workflows", () => {
     expect(screen.getByRole("button", { name: "Restore this backup" })).toBeTruthy();
     expect(invoke).toHaveBeenCalledWith("preview_backup_restore", expect.objectContaining({ backupName: "pre-upgrade-20260731" }));
   });
+
+  it("surfaces a rejected create call inside the active wizard", async () => {
+    const startup = invoke.getMockImplementation()!;
+    invoke.mockImplementation(async (command: string, args?: unknown) => {
+      if (command === "create_instance") throw {
+        code: "validation",
+        message: "The private IPv4 subnet overlaps an existing instance.",
+        remediation: "Go back and choose a different private subnet.",
+        remote_state_changed: false,
+      };
+      return startup(command, args);
+    });
+    render(App);
+    await waitFor(() => expect(screen.getByText("Lab host")).toBeTruthy());
+    await fireEvent.click(screen.getByRole("button", { name: "Instances" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Create instance" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await fireEvent.input(screen.getByLabelText("Display name"), { target: { value: "Rejected instance" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Continue" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Create" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(screen.getByText("Instance creation failed")).toBeTruthy();
+    expect(screen.getByText("The private IPv4 subnet overlaps an existing instance.")).toBeTruthy();
+    expect(screen.getByText("Go back and choose a different private subnet.")).toBeTruthy();
+    expect(alert.closest('[role="dialog"]')).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(alert));
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+  });
 });

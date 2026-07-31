@@ -290,6 +290,7 @@
         remote_state_changed: false,
       };
     }
+    void tick().then(() => document.querySelector<HTMLElement>(".modal-alert")?.focus());
   }
 
   function setNotice(message: string, health: InstanceHealthView | null = null) {
@@ -495,7 +496,15 @@
     const endpointHost = hosts.find((host) => host.id === hostId)?.ssh.hostname || "";
     instanceForm = newInstanceForm(hostId, endpointHost);
     wizardStep = 1;
+    error = null;
+    technicalOpen = false;
     modal = "instance";
+  }
+
+  function wizardBack() {
+    error = null;
+    technicalOpen = false;
+    wizardStep -= 1;
   }
 
   function backendChanged(backend: VpnBackendKind) {
@@ -1144,7 +1153,7 @@
     {#if workspaceInstanceId && selectedSummary}
       {#if busy}<div class="progress" role="status" aria-live="polite"><span></span>{busy}…</div>{/if}
       {#if notice}<div class="notice" role="status"><span>{notice}</span><button aria-label="Dismiss" onclick={clearNotice}>×</button></div>{/if}
-      {#if error}<div class="alert" role="alert"><div><strong>{error.message}</strong>{#if error.remediation}<p>{error.remediation}</p>{/if}</div><button aria-label="Dismiss" onclick={() => (error = null)}>×</button></div>{/if}
+      {#if error && !modal}<div class="alert" role="alert"><div><strong>{error.message}</strong>{#if error.remediation}<p>{error.remediation}</p>{/if}</div><button aria-label="Dismiss" onclick={() => (error = null)}>×</button></div>{/if}
       <InstanceWorkspace
         summary={selectedSummary}
         options={backendOptions}
@@ -1213,7 +1222,7 @@
         <button aria-label="Dismiss" onclick={clearNotice}>×</button>
       </div>
     {/if}
-    {#if error}
+    {#if error && !modal}
       <div class="alert" role="alert">
         <div>
           <strong>{error.message}</strong>
@@ -1400,6 +1409,21 @@
 {#if modal}
   <div class="modal-backdrop" role="presentation" onclick={(event) => { if (event.target === event.currentTarget) closeModal(); }}>
     <div class="modal" role="dialog" aria-modal="true" aria-label={modalLabel(modal)} tabindex="-1" onkeydown={modalKeydown}>
+      {#if error}
+        <div class="alert modal-alert" role="alert" aria-live="assertive" tabindex="-1">
+          <div>
+            <strong>{modal === "instance" ? "Instance creation failed" : modal === "settings" ? "Settings action failed" : "Action failed"}</strong>
+            <p>{error.message}</p>
+            {#if error.remediation}<p>{error.remediation}</p>{/if}
+            {#if error.remote_state_changed}<p>Remote state changed. Rollback {error.rollback_succeeded ? "succeeded" : "did not succeed"}.</p>{/if}
+            {#if error.technical_detail}
+              <button type="button" class="text-button" onclick={() => (technicalOpen = !technicalOpen)}>{technicalOpen ? "Hide" : "Show"} technical details</button>
+              {#if technicalOpen}<pre>{error.technical_detail}</pre>{/if}
+            {/if}
+          </div>
+          <button type="button" aria-label="Dismiss error" onclick={() => (error = null)}>×</button>
+        </div>
+      {/if}
       {#if modal === "host"}
         <ModalShell title="Add SSH host" eyebrow="FIRST RUN" onclose={() => (modal = null)}>
           <form onsubmit={(event) => { event.preventDefault(); saveHost(); }}>
@@ -1446,7 +1470,7 @@
             <div class="review-facts"><div><span>Host</span><strong>{hosts.find((host) => host.id === instanceForm.host_id)?.display_name}</strong></div><div><span>Backend</span><strong>{instanceFormBackend?.display_name}</strong></div><div><span>Endpoint</span><strong>{instanceForm.endpoint_host}:{instanceForm.endpoint_port}</strong></div>{#if instanceFormBackend?.presentation.client_addresses === "allocated"}<div><span>Network</span><strong>{instanceForm.ipv4_subnet}</strong></div><div><span>DNS</span><strong>{instanceForm.dns_zone}</strong></div>{/if}</div>
             <p class="help">Create saves local desired state only. After creation, review the typed deployment impact before changing the host.</p>
           {/if}
-          <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button>{#if wizardStep > 1}<button type="button" class="secondary" onclick={() => (wizardStep -= 1)}>Back</button>{/if}<button class="primary">{wizardStep === 5 ? "Create" : "Continue"}</button></div>
+          <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button>{#if wizardStep > 1}<button type="button" class="secondary" onclick={wizardBack}>Back</button>{/if}<button class="primary">{wizardStep === 5 ? "Create" : "Continue"}</button></div>
         </form>
       {:else if modal === "device"}
         <div class="modal-head"><div><p class="eyebrow">CLIENT IDENTITY</p><h2>Add client</h2></div><button onclick={() => (modal = null)}>×</button></div>
