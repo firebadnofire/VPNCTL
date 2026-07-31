@@ -7,7 +7,7 @@ use vam_application::{
     ApplicationService, CreateDeviceInput, CreateDnsRecordInput, CreateHostInput,
     CreateInstanceInput,
 };
-use vam_core::{DEFAULT_DNS_ZONE, DEFAULT_PORT, DEFAULT_SUBNET, DnsRecordType};
+use vam_core::{DEFAULT_DNS_ZONE, DEFAULT_SUBNET, DnsRecordType, VpnBackendKind};
 use vam_secrets::KeychainSecretStore;
 
 #[derive(Debug, Parser)]
@@ -126,12 +126,35 @@ struct InstanceAdd {
     name: String,
     #[arg(long)]
     endpoint: String,
-    #[arg(long, default_value_t = DEFAULT_PORT)]
-    port: u16,
+    #[arg(long, value_enum, default_value = "wireguard")]
+    backend: BackendChoice,
+    #[arg(long)]
+    port: Option<u16>,
     #[arg(long, default_value = DEFAULT_SUBNET)]
     subnet: String,
     #[arg(long, default_value = DEFAULT_DNS_ZONE)]
     zone: String,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BackendChoice {
+    Wireguard,
+    AmneziaWg,
+    Openvpn,
+    Ikev2,
+    Xray,
+}
+
+impl From<BackendChoice> for VpnBackendKind {
+    fn from(value: BackendChoice) -> Self {
+        match value {
+            BackendChoice::Wireguard => Self::WireGuard,
+            BackendChoice::AmneziaWg => Self::AmneziaWg,
+            BackendChoice::Openvpn => Self::OpenVpn,
+            BackendChoice::Ikev2 => Self::Ikev2,
+            BackendChoice::Xray => Self::Xray,
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -251,6 +274,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         host_id: args.host_id,
                         display_name: args.name,
                         endpoint_host: args.endpoint,
+                        backend: args.backend.into(),
+                        backend_settings: None,
                         endpoint_port: args.port,
                         ipv4_subnet: args.subnet,
                         dns_zone: args.zone,
@@ -302,7 +327,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Command::DeviceAdd(args) => {
             print_json(
                 &service
-                    .create_device(CreateDeviceInput {
+                    .create_device_view(CreateDeviceInput {
                         instance_id: args.instance_id,
                         user_id: args.user_id,
                         display_name: args.name,
@@ -314,19 +339,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
         }
         Command::DeviceList { instance_id } => {
-            print_json(&service.list_devices(instance_id).await?)?;
+            print_json(&service.list_device_views(instance_id).await?)?;
         }
         Command::DeviceEnable { device_id, enabled } => {
-            let mut selected = service.storage.get_device(device_id).await?;
-            selected.enabled = enabled;
-            print_json(&service.update_device(selected).await?)?;
+            print_json(&service.set_device_enabled(device_id, enabled).await?)?;
         }
         Command::DeviceDelete { device_id } => {
             service.delete_device(device_id).await?;
             println!("Device soft-deleted.");
         }
         Command::DeviceReplaceIdentity { device_id } => {
-            print_json(&service.replace_device_identity(device_id).await?)?;
+            print_json(&service.replace_device_identity_view(device_id).await?)?;
         }
         Command::DnsAdd(args) => {
             print_json(
@@ -384,5 +407,61 @@ mod tests {
                 .expect("boolean device state should parse");
             assert!(matches!(cli.command, Command::DeviceEnable { .. }));
         }
+    }
+
+    #[test]
+    fn instance_add_accepts_every_backend_and_defers_the_default_port() {
+        let host_id = Uuid::nil().to_string();
+        let cases = [
+            ("wireguard", VpnBackendKind::WireGuard),
+            ("amnezia-wg", VpnBackendKind::AmneziaWg),
+            ("openvpn", VpnBackendKind::OpenVpn),
+            ("ikev2", VpnBackendKind::Ikev2),
+            ("xray", VpnBackendKind::Xray),
+        ];
+        for (argument, expected) in cases {
+            let cli = Cli::try_parse_from([
+                "vam-dev",
+                "instance-add",
+                "--host-id",
+                &host_id,
+                "--name",
+                "test",
+                "--endpoint",
+                "vpn.example.test",
+                "--backend",
+                argument,
+            ])
+            .expect("backend should parse");
+            let Command::InstanceAdd(args) = cli.command else {
+                panic!("expected instance-add");
+            };
+            assert_eq!(VpnBackendKind::from(args.backend), expected);
+            assert_eq!(args.port, None);
+        }
+    }
+
+    #[test]
+    fn instance_add_remains_wireguard_compatible_by_default() {
+        let host_id = Uuid::nil().to_string();
+        let cli = Cli::try_parse_from([
+            "vam-dev",
+            "instance-add",
+            "--host-id",
+            &host_id,
+            "--name",
+            "test",
+            "--endpoint",
+            "vpn.example.test",
+        ])
+        .expect("legacy instance-add should parse");
+        let Command::InstanceAdd(args) = cli.command else {
+            panic!("expected instance-add");
+        };
+        assert_eq!(
+            VpnBackendKind::from(args.backend),
+            VpnBackendKind::WireGuard
+        );
+        assert_eq!(args.port, None);
     }
 }

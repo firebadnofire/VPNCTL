@@ -3775,3 +3775,177 @@ The application test/clippy gate used the temporary ring-provider diagnostic.
 `Cargo.toml` and `Cargo.lock` are restored to the delivered AWS-LC graph.
 Docker and a Linux SSH fixture are unavailable, so real Easy-RSA/strongSwan
 issue/revoke/restore execution remains an explicit integration-test gap.
+
+Commit:
+
+- `00fb896 feat: add transactional device credentials`;
+- verified good EDDSA signature from William Jones' configured YubiKey-backed
+  key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+## Unit 9: Generic application, CLI, and desktop boundary
+
+### Current-state findings
+
+The backend/deployment refactor is not yet reachable through every product
+surface:
+
+- `CreateInstanceInput` has no backend field and defaults its port directly to
+  WireGuard's 51820;
+- `ApplicationService::create_instance` always writes
+  `VpnBackendKind::WireGuard` and `BackendSettings::default()`;
+- `vam-dev instance-add` has no backend selector and also defaults its port to
+  51820;
+- the Tauri device commands return and accept the complete core `Device`.
+  Consequently, opaque native-secret references and backend identity storage
+  metadata are serialized into frontend payloads even though the Svelte UI
+  neither needs nor should be allowed to mutate them;
+- `vam-dev device-list`, `device-add`, and identity replacement serialize the
+  same complete core device, so routine CLI output exposes internal secret
+  reference identifiers contrary to the redacted-output contract;
+- the Svelte types and forms still describe only a WireGuard instance, require
+  a tunnel address for every device, always offer PSK and managed-DNS controls,
+  and label all health checks as WireGuard checks.
+
+The core already provides the required strongly typed settings and a single
+source of backend defaults through `BackendSettings::defaults_for`. The
+backend registry already owns protocol validation and capabilities. Unit 9
+will use those boundaries instead of duplicating backend rules in Tauri or the
+CLI.
+
+### Unit 9 implementation plan
+
+#### 9A: application and CLI
+
+1. Extend `CreateInstanceInput` with a backend kind, optional typed backend
+   settings, and an optional endpoint port. Preserve old callers through Serde
+   defaults: an omitted backend remains WireGuard, omitted settings come from
+   the selected backend, and an omitted port comes from
+   `VpnBackendKind::default_port`.
+2. Reject a backend/settings discriminator mismatch before persistence. Build
+   an empty desired state and call the selected registered backend's validator
+   in addition to generic instance and same-host listener validation.
+3. Add a public device view containing only ordinary UI/CLI fields, backend
+   kind, and a deliberately public identity label. It must not contain
+   `SecretReference`, private material, CSR/certificate storage references, or
+   the mutable core `DeviceBackendData`.
+4. Add an update input containing only mutable public fields. The application
+   must load the existing core device, preserve its instance/address/identity
+   metadata, and route the update through the existing transactional
+   `update_device` workflow. Provide public-view create/list/replace methods so
+   external surfaces never need the core record.
+5. Extend `vam-dev instance-add` with a typed backend selector. Let the
+   application select the corresponding default port and typed settings unless
+   explicitly overridden. Route add/list/enable/replace device commands through
+   the public application methods; do not read storage directly or reimplement
+   business logic in the CLI.
+6. Add parser and application tests for defaults, every backend, mismatch
+   rejection, device redaction, and metadata-only mutation.
+7. Run formatting, focused application/CLI tests, strict Clippy, patch sanity,
+   and the manifest/lock restoration check before a signed commit.
+
+Expected checkpoint: a backend-aware, redacted Rust/CLI boundary without
+changing deployment semantics.
+
+#### 9B: Tauri and Svelte
+
+1. Change the Tauri device command signatures to the public application DTOs.
+   Retain the thin-command pattern: no storage reads or protocol logic in
+   Tauri.
+2. Replace WireGuard-only TypeScript declarations with exact discriminated
+   unions for backend settings and public device views. Reflect optional
+   tunnel addresses and generic health fields.
+3. Add protocol selection to instance creation. Present conditional,
+   user-relevant settings:
+   - WireGuard fallback and routed-network controls;
+   - AWG2 obfuscation values with validated defaults;
+   - OpenVPN transport, cipher, TLS protection, and certificate lifetime;
+   - IKEv2 server identity and certificate lifetime;
+   - Xray security, transport, server name, fingerprint, and XHTTP path.
+4. Derive the default listener port from the selected backend. Hide
+   routed-address/DNS/device PSK controls when capabilities do not apply,
+   especially for Xray. Adapt labels and identity details without dumping
+   secret-bearing protocol internals into the UI.
+5. Generalize health presentation to backend/listener/client-state/DNS
+   readiness while retaining legacy fields only for backward-compatible
+   deserialization.
+6. Run frontend type checking, tests, and production build, then focused Tauri
+   Rust tests/Clippy where the local toolchain permits. Stop and document any
+   environment-only failure rather than weakening the checks.
+
+Expected checkpoint: all five backends are creatable and manageable through
+the existing desktop visual language, while the frontend remains a
+non-secret-bearing thin client.
+
+### 9A implementation
+
+`CreateInstanceInput` now carries:
+
+- a backend discriminator that defaults to WireGuard when omitted;
+- optional strongly typed `BackendSettings`;
+- an optional listener port.
+
+The application trims the endpoint once, derives settings with
+`BackendSettings::defaults_for`, and derives the port with the selected
+backend's `default_port`. A caller-supplied settings discriminator must match
+the selected backend. Before any database write, the service validates both
+the generic instance and an empty desired state through the registered backend.
+This catches protocol rules such as IKEv2's fixed port and required server
+identity at the same boundary used by later render/deploy operations.
+
+The application also exposes a backend catalog for thin clients. Every entry
+contains the stable kind, display name, default port, and the registry-owned
+capabilities that drive address, DNS, credential, QR, identity-update, and
+statistics controls. Tauri and Svelte therefore do not need a second source of
+truth for feature availability.
+
+Routine device data now crosses external Rust surfaces as `DeviceView`, not the
+storage `Device`. Its discriminated public identity contains only:
+
+- WireGuard public key and whether a PSK exists;
+- AWG2 public key;
+- OpenVPN Common Name and public certificate serial;
+- IKEv2 identity and public certificate serial;
+- Xray UUID, email label, and non-secret flow.
+
+It intentionally has no `SecretReference`, private key/PSK, CSR/certificate
+reference, bundle password reference, or mutable `DeviceBackendData`.
+`UpdateDeviceInput` contains only the public fields that may be changed.
+`update_device_metadata` reloads the authoritative core device, normalizes DNS
+only when the registered backend supports managed DNS, preserves the allocated
+address and entire backend identity, and delegates to the existing
+transactional update/revocation path. A dedicated enable method prevents the
+CLI from reading storage or reconstructing the device.
+
+`vam-dev instance-add` accepts `--backend` values `wireguard`, `amnezia-wg`,
+`openvpn`, `ikev2`, and `xray`. An omitted selector remains WireGuard-compatible.
+An omitted `--port` is deliberately passed as `None`, allowing the application
+to choose the backend default rather than teaching the CLI protocol rules.
+Device add/list/enable/identity-replace commands now serialize only public
+views and contain no direct storage access.
+
+### 9A validation
+
+The first native test attempt stopped before application compilation because
+`aws-lc-sys` could not find NASM. No package was installed and the product
+dependency was not weakened. The established local diagnostic changed only
+the workspace `russh` declaration to its Ring provider while running the
+focused gates, then restored the manifest and lockfile.
+
+Passing gates:
+
+- 19 application tests, including:
+  - default creation and registered validation for all five backends;
+  - legacy JSON input defaulting to WireGuard;
+  - backend/settings mismatch rejection;
+  - device-view serialization with every opaque secret reference absent;
+  - public metadata update with DNS normalization and byte-for-byte unchanged
+    backend identity metadata;
+- 3 CLI parser tests, including every backend selector, WireGuard compatibility,
+  backend-derived port deferral, and explicit device enable/disable values;
+- strict Clippy for application and CLI, all targets, with `-D warnings`;
+- formatting and `git diff --check`.
+
+After diagnostics, `cargo tree -i aws-lc-rs -e features` confirmed the restored
+default russh/AWS-LC graph, and `git diff -- Cargo.toml Cargo.lock` was empty.
+The normal native AWS-LC build remains blocked only by the already documented
+missing NASM prerequisite.

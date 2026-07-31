@@ -3,12 +3,13 @@ use std::collections::BTreeSet;
 use std::{
     collections::HashMap,
     fmt::Write as _,
+    net::{Ipv4Addr, Ipv6Addr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use ipnet::Ipv4Net;
 use qrcode::{QrCode, render::svg};
 use serde::{Deserialize, Serialize};
@@ -27,10 +28,12 @@ use vam_backend_ikev2::Ikev2Backend;
 use vam_backend_openvpn::OpenVpnBackend;
 use vam_backend_wireguard::WireGuardBackend;
 use vam_backend_xray::{REALITY_PUBLIC_KEY_PATH, REALITY_SHORT_ID_PATH, XrayBackend};
+#[cfg(test)]
+use vam_core::DEFAULT_PORT;
 use vam_core::{
-    AmneziaWgDeviceData, BackendSettings, DEFAULT_DNS_ZONE, DEFAULT_KEEPALIVE, DEFAULT_PORT,
-    DEFAULT_SUBNET, DesiredState, Device, DeviceBackendData, DnsConfig, DnsRecord, DnsRecordType,
-    DockerHost, EndpointConfig, Ikev2DeviceData, ListenerPort, NetworkConfig, OpenVpnDeviceData,
+    AmneziaWgDeviceData, BackendSettings, DEFAULT_DNS_ZONE, DEFAULT_KEEPALIVE, DEFAULT_SUBNET,
+    DesiredState, Device, DeviceBackendData, DnsConfig, DnsRecord, DnsRecordType, DockerHost,
+    EndpointConfig, Ikev2DeviceData, ListenerPort, NetworkConfig, OpenVpnDeviceData,
     OpenVpnTlsProtection, RoutingMode, SecretReference, SshConnectionConfig, TransportProtocol,
     User, VpnBackendKind, VpnInstance, WireGuardDeviceData, XraySecurity, allocate_next_ipv4,
     first_usable, validate_host_instances, validate_instance,
@@ -106,8 +109,12 @@ pub struct CreateInstanceInput {
     pub host_id: Uuid,
     pub display_name: String,
     pub endpoint_host: String,
-    #[serde(default = "default_vpn_port")]
-    pub endpoint_port: u16,
+    #[serde(default = "default_backend")]
+    pub backend: VpnBackendKind,
+    #[serde(default)]
+    pub backend_settings: Option<BackendSettings>,
+    #[serde(default)]
+    pub endpoint_port: Option<u16>,
     #[serde(default = "default_subnet")]
     pub ipv4_subnet: String,
     #[serde(default = "default_zone")]
@@ -116,8 +123,8 @@ pub struct CreateInstanceInput {
     pub routing_mode: Option<RoutingMode>,
 }
 
-const fn default_vpn_port() -> u16 {
-    DEFAULT_PORT
+const fn default_backend() -> VpnBackendKind {
+    VpnBackendKind::WireGuard
 }
 
 fn default_subnet() -> String {
@@ -138,6 +145,117 @@ pub struct CreateDeviceInput {
     #[serde(default = "default_true")]
     pub create_dns_record: bool,
     pub dns_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "backend", content = "identity")]
+pub enum DevicePublicIdentity {
+    #[serde(rename = "wireguard")]
+    WireGuard {
+        public_key: String,
+        preshared_key: bool,
+    },
+    #[serde(rename = "amnezia_wg")]
+    AmneziaWg { public_key: String },
+    #[serde(rename = "openvpn")]
+    OpenVpn {
+        common_name: String,
+        certificate_serial: Option<String>,
+    },
+    #[serde(rename = "ikev2")]
+    Ikev2 {
+        identity: String,
+        certificate_serial: Option<String>,
+    },
+    #[serde(rename = "xray")]
+    Xray {
+        client_id: Uuid,
+        email: String,
+        flow: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeviceView {
+    pub id: Uuid,
+    pub instance_id: Uuid,
+    pub user_id: Option<Uuid>,
+    pub display_name: String,
+    pub ipv4_address: Option<Ipv4Addr>,
+    pub ipv6_address: Option<Ipv6Addr>,
+    pub dns_name: Option<String>,
+    pub enabled: bool,
+    pub backend: VpnBackendKind,
+    pub public_identity: DevicePublicIdentity,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<&Device> for DeviceView {
+    fn from(device: &Device) -> Self {
+        let public_identity = match &device.backend_data {
+            DeviceBackendData::WireGuard(data) => DevicePublicIdentity::WireGuard {
+                public_key: data.public_key.clone(),
+                preshared_key: data.preshared_key_ref.is_some(),
+            },
+            DeviceBackendData::AmneziaWg(data) => DevicePublicIdentity::AmneziaWg {
+                public_key: data.public_key.clone(),
+            },
+            DeviceBackendData::OpenVpn(data) => DevicePublicIdentity::OpenVpn {
+                common_name: data.common_name.clone(),
+                certificate_serial: data.certificate_serial.clone(),
+            },
+            DeviceBackendData::Ikev2(data) => DevicePublicIdentity::Ikev2 {
+                identity: data.identity.clone(),
+                certificate_serial: data.certificate_serial.clone(),
+            },
+            DeviceBackendData::Xray(data) => DevicePublicIdentity::Xray {
+                client_id: data.client_id,
+                email: data.email.clone(),
+                flow: data.flow.clone(),
+            },
+        };
+        Self {
+            id: device.id,
+            instance_id: device.instance_id,
+            user_id: device.user_id,
+            display_name: device.display_name.clone(),
+            ipv4_address: device.ipv4_address,
+            ipv6_address: device.ipv6_address,
+            dns_name: device.dns_name.clone(),
+            enabled: device.enabled,
+            backend: device.backend_data.kind(),
+            public_identity,
+            created_at: device.created_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateDeviceInput {
+    pub id: Uuid,
+    pub user_id: Option<Uuid>,
+    pub display_name: String,
+    pub dns_name: Option<String>,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendCapabilitiesView {
+    pub allocated_tunnel_addresses: bool,
+    pub managed_dns: bool,
+    pub quick_credential_refresh: bool,
+    pub live_identity_updates: bool,
+    pub qr_export: bool,
+    pub traffic_statistics: bool,
+    pub certificate_authority: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendOptionView {
+    pub kind: VpnBackendKind,
+    pub display_name: String,
+    pub default_port: u16,
+    pub capabilities: BackendCapabilitiesView,
 }
 
 struct PendingSecret {
@@ -669,6 +787,15 @@ fi
             .get_host(input.host_id)
             .await
             .map_err(storage_error)?;
+        let endpoint_host = input.endpoint_host.trim().to_owned();
+        let backend_settings = input
+            .backend_settings
+            .unwrap_or_else(|| BackendSettings::defaults_for(input.backend, &endpoint_host));
+        if backend_settings.kind() != input.backend {
+            return Err(validation_error(
+                "Backend settings do not match the selected backend.",
+            ));
+        }
         let subnet: Ipv4Net = input
             .ipv4_subnet
             .parse()
@@ -679,11 +806,13 @@ fi
             id: Uuid::new_v4(),
             host_id: input.host_id,
             display_name: input.display_name.trim().into(),
-            backend: VpnBackendKind::WireGuard,
-            backend_settings: BackendSettings::default(),
+            backend: input.backend,
+            backend_settings,
             endpoint: EndpointConfig {
-                host: input.endpoint_host.trim().into(),
-                port: input.endpoint_port,
+                host: endpoint_host,
+                port: input
+                    .endpoint_port
+                    .unwrap_or_else(|| input.backend.default_port()),
             },
             network: NetworkConfig {
                 ipv4_subnet: subnet,
@@ -707,6 +836,17 @@ fi
             deleted_at: None,
         };
         validate_instance(&instance).map_err(|error| validation_error(&error.to_string()))?;
+        self.backends
+            .get(instance.backend)
+            .map_err(backend_error)?
+            .validate(&DesiredState {
+                instance: instance.clone(),
+                users: Vec::new(),
+                devices: Vec::new(),
+                dns_records: Vec::new(),
+                dns_blocklist_domains: Vec::new(),
+            })
+            .map_err(backend_error)?;
         let mut instances = self
             .storage
             .list_instances(Some(input.host_id))
@@ -752,6 +892,36 @@ fi
             .list_instances(host_id)
             .await
             .map_err(storage_error)
+    }
+
+    pub fn backend_options(&self) -> Vec<BackendOptionView> {
+        [
+            VpnBackendKind::WireGuard,
+            VpnBackendKind::AmneziaWg,
+            VpnBackendKind::OpenVpn,
+            VpnBackendKind::Ikev2,
+            VpnBackendKind::Xray,
+        ]
+        .into_iter()
+        .filter_map(|kind| {
+            self.backends
+                .capabilities(kind)
+                .map(|capabilities| BackendOptionView {
+                    kind,
+                    display_name: kind.display_name().into(),
+                    default_port: kind.default_port(),
+                    capabilities: BackendCapabilitiesView {
+                        allocated_tunnel_addresses: capabilities.allocated_tunnel_addresses,
+                        managed_dns: capabilities.managed_dns,
+                        quick_credential_refresh: capabilities.quick_credential_refresh,
+                        live_identity_updates: capabilities.live_identity_updates,
+                        qr_export: capabilities.qr_export,
+                        traffic_statistics: capabilities.traffic_statistics,
+                        certificate_authority: capabilities.certificate_authority,
+                    },
+                })
+        })
+        .collect()
     }
 
     pub async fn desired_state(&self, instance_id: Uuid) -> Result<DesiredState, AppError> {
@@ -1140,6 +1310,80 @@ fi
             .list_devices(instance_id)
             .await
             .map_err(storage_error)
+    }
+
+    pub async fn create_device_view(
+        &self,
+        input: CreateDeviceInput,
+    ) -> Result<DeviceView, AppError> {
+        let device = self.create_device(input).await?;
+        Ok(DeviceView::from(&device))
+    }
+
+    pub async fn update_device_metadata(
+        &self,
+        input: UpdateDeviceInput,
+    ) -> Result<DeviceView, AppError> {
+        if input.display_name.trim().is_empty() {
+            return Err(validation_error("Device name is required."));
+        }
+        let mut device = self
+            .storage
+            .get_device(input.id)
+            .await
+            .map_err(storage_error)?;
+        let instance = self
+            .storage
+            .get_instance(device.instance_id)
+            .await
+            .map_err(storage_error)?;
+        let backend = self.backends.get(instance.backend).map_err(backend_error)?;
+        device.user_id = input.user_id;
+        device.display_name = input.display_name.trim().into();
+        device.dns_name = if backend.capabilities().managed_dns {
+            input
+                .dns_name
+                .as_deref()
+                .map(|value| normalize_dns_owner(value, &instance.dns.zone))
+                .transpose()
+                .map_err(|error| validation_error(&error))?
+                .flatten()
+        } else {
+            None
+        };
+        device.enabled = input.enabled;
+        let device = self.update_device(device).await?;
+        Ok(DeviceView::from(&device))
+    }
+
+    pub async fn set_device_enabled(
+        &self,
+        id: Uuid,
+        enabled: bool,
+    ) -> Result<DeviceView, AppError> {
+        let device = self.storage.get_device(id).await.map_err(storage_error)?;
+        self.update_device_metadata(UpdateDeviceInput {
+            id,
+            user_id: device.user_id,
+            display_name: device.display_name,
+            dns_name: device.dns_name,
+            enabled,
+        })
+        .await
+    }
+
+    pub async fn list_device_views(&self, instance_id: Uuid) -> Result<Vec<DeviceView>, AppError> {
+        Ok(self
+            .list_devices(instance_id)
+            .await?
+            .iter()
+            .map(DeviceView::from)
+            .collect())
+    }
+
+    pub async fn replace_device_identity_view(&self, id: Uuid) -> Result<DeviceView, AppError> {
+        let device = self.replace_device_identity(id).await?;
+        Ok(DeviceView::from(&device))
     }
 
     async fn store_pending_secrets(&self, secrets: &[PendingSecret]) -> Result<(), AppError> {
@@ -5711,7 +5955,9 @@ mod tests {
                 host_id: host.id,
                 display_name: "private".into(),
                 endpoint_host: "vpn.example.test".into(),
-                endpoint_port: DEFAULT_PORT,
+                backend: VpnBackendKind::WireGuard,
+                backend_settings: None,
+                endpoint_port: Some(DEFAULT_PORT),
                 ipv4_subnet: DEFAULT_SUBNET.into(),
                 dns_zone: DEFAULT_DNS_ZONE.into(),
                 routing_mode: None,
@@ -5719,6 +5965,182 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(service.list_instances(None).await.unwrap(), vec![instance]);
+    }
+
+    #[tokio::test]
+    async fn instance_creation_dispatches_defaults_and_validation_for_every_backend() {
+        let storage = Storage::in_memory().await.unwrap();
+        let service = ApplicationService::with_transport(
+            storage,
+            Arc::new(MemorySecretStore::default()),
+            Arc::new(RusshTransport::default()),
+        );
+        let backends = [
+            VpnBackendKind::WireGuard,
+            VpnBackendKind::AmneziaWg,
+            VpnBackendKind::OpenVpn,
+            VpnBackendKind::Ikev2,
+            VpnBackendKind::Xray,
+        ];
+        let options = service.backend_options();
+        assert_eq!(options.len(), backends.len());
+        assert!(
+            options
+                .iter()
+                .all(|option| option.default_port == option.kind.default_port())
+        );
+        for (index, backend) in backends.into_iter().enumerate() {
+            let host = service
+                .create_host(CreateHostInput {
+                    display_name: format!("lab-{index}"),
+                    hostname: format!("192.0.2.{}", index + 1),
+                    port: 22,
+                    username: "tester".into(),
+                    private_key_path: PathBuf::from("/tmp/key"),
+                    passphrase: None,
+                })
+                .await
+                .unwrap();
+            let endpoint_host = format!("vpn-{index}.example.test");
+            let instance = service
+                .create_instance(CreateInstanceInput {
+                    host_id: host.id,
+                    display_name: backend.display_name().into(),
+                    endpoint_host: endpoint_host.clone(),
+                    backend,
+                    backend_settings: None,
+                    endpoint_port: None,
+                    ipv4_subnet: format!("10.64.{index}.0/24"),
+                    dns_zone: format!("backend-{index}.internal"),
+                    routing_mode: None,
+                })
+                .await
+                .unwrap();
+            assert_eq!(instance.backend, backend);
+            assert_eq!(instance.backend_settings.kind(), backend);
+            assert_eq!(instance.endpoint.port, backend.default_port());
+            if let BackendSettings::Ikev2(settings) = &instance.backend_settings {
+                assert_eq!(settings.server_identity, endpoint_host);
+            }
+        }
+
+        let old_input: CreateInstanceInput = serde_json::from_value(serde_json::json!({
+            "host_id": Uuid::nil(),
+            "display_name": "legacy",
+            "endpoint_host": "legacy.example.test"
+        }))
+        .unwrap();
+        assert_eq!(old_input.backend, VpnBackendKind::WireGuard);
+        assert_eq!(old_input.endpoint_port, None);
+
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "mismatch".into(),
+                hostname: "192.0.2.100".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let error = service
+            .create_instance(CreateInstanceInput {
+                host_id: host.id,
+                display_name: "mismatch".into(),
+                endpoint_host: "vpn.example.test".into(),
+                backend: VpnBackendKind::OpenVpn,
+                backend_settings: Some(BackendSettings::default()),
+                endpoint_port: None,
+                ipv4_subnet: "10.65.0.0/24".into(),
+                dns_zone: "mismatch.internal".into(),
+                routing_mode: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "validation");
+        assert!(error.message.contains("do not match"));
+    }
+
+    #[tokio::test]
+    async fn public_device_workflow_redacts_references_and_preserves_identity_metadata() {
+        let storage = Storage::in_memory().await.unwrap();
+        let service = ApplicationService::with_transport(
+            storage,
+            Arc::new(MemorySecretStore::default()),
+            Arc::new(RusshTransport::default()),
+        );
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "192.0.2.1".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let instance = service
+            .create_instance(CreateInstanceInput {
+                host_id: host.id,
+                display_name: "private".into(),
+                endpoint_host: "vpn.example.test".into(),
+                backend: VpnBackendKind::WireGuard,
+                backend_settings: None,
+                endpoint_port: None,
+                ipv4_subnet: DEFAULT_SUBNET.into(),
+                dns_zone: "test.internal".into(),
+                routing_mode: None,
+            })
+            .await
+            .unwrap();
+        let view = service
+            .create_device_view(CreateDeviceInput {
+                instance_id: instance.id,
+                user_id: None,
+                display_name: "Laptop".into(),
+                preshared_key: true,
+                create_dns_record: true,
+                dns_name: Some("laptop".into()),
+            })
+            .await
+            .unwrap();
+        let raw = service.storage.get_device(view.id).await.unwrap();
+        let references: Vec<_> = raw
+            .backend_data
+            .secret_references()
+            .into_iter()
+            .map(|reference| reference.0.to_string())
+            .collect();
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(!json.contains("private_key_ref"));
+        assert!(!json.contains("preshared_key_ref"));
+        assert!(
+            references
+                .iter()
+                .all(|reference| !json.contains(reference.as_str()))
+        );
+
+        let updated = service
+            .update_device_metadata(UpdateDeviceInput {
+                id: view.id,
+                user_id: None,
+                display_name: " Travel Laptop ".into(),
+                dns_name: Some("travel".into()),
+                enabled: false,
+            })
+            .await
+            .unwrap();
+        assert_eq!(updated.display_name, "Travel Laptop");
+        assert_eq!(updated.dns_name.as_deref(), Some("travel.test.internal"));
+        assert!(!updated.enabled);
+        assert_eq!(
+            service.list_device_views(instance.id).await.unwrap(),
+            vec![updated.clone()]
+        );
+        let after = service.storage.get_device(view.id).await.unwrap();
+        assert_eq!(after.backend_data, raw.backend_data);
     }
 
     #[tokio::test]
@@ -5853,7 +6275,9 @@ mod tests {
                 host_id: host.id,
                 display_name: "private".into(),
                 endpoint_host: "vpn.example.test".into(),
-                endpoint_port: DEFAULT_PORT,
+                backend: VpnBackendKind::WireGuard,
+                backend_settings: None,
+                endpoint_port: Some(DEFAULT_PORT),
                 ipv4_subnet: DEFAULT_SUBNET.into(),
                 dns_zone: DEFAULT_DNS_ZONE.into(),
                 routing_mode: None,
@@ -5893,7 +6317,9 @@ mod tests {
                 host_id: host.id,
                 display_name: "private".into(),
                 endpoint_host: "vpn.example.test".into(),
-                endpoint_port: DEFAULT_PORT,
+                backend: VpnBackendKind::WireGuard,
+                backend_settings: None,
+                endpoint_port: Some(DEFAULT_PORT),
                 ipv4_subnet: DEFAULT_SUBNET.into(),
                 dns_zone: "test.internal".into(),
                 routing_mode: None,
@@ -5963,7 +6389,9 @@ mod tests {
                 host_id: host.id,
                 display_name: "private".into(),
                 endpoint_host: "vpn.example.test".into(),
-                endpoint_port: DEFAULT_PORT,
+                backend: VpnBackendKind::WireGuard,
+                backend_settings: None,
+                endpoint_port: Some(DEFAULT_PORT),
                 ipv4_subnet: DEFAULT_SUBNET.into(),
                 dns_zone: DEFAULT_DNS_ZONE.into(),
                 routing_mode: None,
@@ -6092,7 +6520,9 @@ mod tests {
                 host_id: host.id,
                 display_name: "private".into(),
                 endpoint_host: "vpn.example.test".into(),
-                endpoint_port: DEFAULT_PORT,
+                backend: VpnBackendKind::WireGuard,
+                backend_settings: None,
+                endpoint_port: Some(DEFAULT_PORT),
                 ipv4_subnet: DEFAULT_SUBNET.into(),
                 dns_zone: DEFAULT_DNS_ZONE.into(),
                 routing_mode: None,
@@ -6135,7 +6565,9 @@ mod tests {
                 host_id: host.id,
                 display_name: "private".into(),
                 endpoint_host: "vpn.example.test".into(),
-                endpoint_port: DEFAULT_PORT,
+                backend: VpnBackendKind::WireGuard,
+                backend_settings: None,
+                endpoint_port: Some(DEFAULT_PORT),
                 ipv4_subnet: DEFAULT_SUBNET.into(),
                 dns_zone: DEFAULT_DNS_ZONE.into(),
                 routing_mode: None,
