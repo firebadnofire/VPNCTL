@@ -4963,3 +4963,77 @@ Previous signed commit: `1296493 refactor: componentize desktop management UI`
 (good EDDSA signature).
 
 Planned signed commit: `feat: deliver backend-aware desktop workflows`.
+
+### 12G. Responsive and accessible native UI (2026-07-31)
+
+The desktop shell previously imposed a 900-pixel minimum in both Tauri and
+global CSS. Dense panels could consequently force whole-application horizontal
+overflow, the sidebar could not contract, workspace/DNS tabs depended on mouse
+clicks, the compact instance action menu lacked explicit dismissal behavior,
+and modal focus was not contained or restored. These limitations conflicted
+with the required 800×600 native baseline even though the established navy,
+light-panel, compact control-plane presentation remained appropriate.
+
+The native minimum is now 800×600 while the default remains 1180×760. The
+global body minimum width was removed. At narrow desktop widths the sidebar
+becomes a 76-pixel icon rail whose real buttons retain accessible names and
+native title tooltips; primary content, stat grids, readiness matrices,
+toolbars, cards, and forms reflow. Horizontal overflow is limited to panels
+that are genuinely tabular. Primary actions remain outside the compact
+instance overflow menu.
+
+Global navigation and every operation remain real buttons. A consistent
+`:focus-visible` outline was added. Workspace and DNS tabs now implement
+`role=tab`, selected state, stable tab/panel IDs, roving tab stops, and
+Left/Right keyboard navigation; workspace tabs additionally support Home and
+End. The instance overflow menu closes on outside pointer input and Escape,
+restoring focus to its summary control. Shared instance selectors have stable
+IDs and explicit labels.
+
+The application modal is now labelled, modal to assistive technology, and
+focusable. Opening captures the invoking control and moves focus into the
+dialog; Tab and Shift+Tab stay within its controls; Escape or a backdrop click
+closes it; focus returns to the invoker. Closing also clears QR SVG and pending
+Xray certificate/key paths so sensitive or export-derived material is not kept
+in ordinary UI state. Busy messages use polite live regions, and destructive
+actions continue to carry explicit text such as `Delete instance` and
+`Restore this backup`, rather than relying on color.
+
+Files and subsystems changed:
+
+- `apps/desktop/src-tauri/tauri.conf.json`: 800×600 native minimum;
+- `apps/desktop/src/App.svelte`: accessible navigation, DNS tabs, modal focus
+  lifecycle, live status, and sensitive transient-state clearing;
+- `apps/desktop/src/lib/components/InstanceWorkspace.svelte`: keyboard tablist;
+- `InstanceActions.svelte`: dismissible, focus-restoring overflow menu;
+- `InstanceSelector.svelte`: stable explicit form labelling;
+- `apps/desktop/src/styles.css`: rail, local overflow, responsive grids/stacks,
+  and visible keyboard focus without changing the established palette.
+
+Validation for this unit:
+
+- Svelte check passed with 0 errors and 0 warnings;
+- Vitest passed the existing 2/2 frontend tests;
+- the Vite production build passed (134 modules, 131.42 kB JavaScript and
+  20.14 kB CSS before gzip);
+- `cargo check -p vpn-appliance-manager`, Rust formatting, and strict Clippy for
+  the Tauri package with all targets and `-D warnings` passed using the existing
+  process-local portable NASM path;
+- `git diff --check` passed;
+- in-app browser checks at 1180×760, 900×600, and 800×600 found no document
+  wider than its viewport; the full sidebar became the compact rail at both
+  narrow sizes;
+- keyboard checks reached all six global screens, opened the Add SSH host
+  dialog, closed it with Escape, and confirmed focus returned to Add host.
+
+The browser validation used the already-running local Vite server. A plain web
+page cannot supply Tauri's native `invoke` bridge, so it correctly displayed a
+startup error and empty local screens; backend-populated tab and per-backend
+fixture behavior is covered in the following component-test unit rather than
+being misreported as native runtime proof. No host inspection, SSH connection,
+remote operation, dependency installation, or machine change occurred.
+
+Previous signed commit: `f8efa79 feat: deliver backend-aware desktop workflows`
+(good EDDSA signature).
+
+Planned signed commit: `fix: improve desktop responsiveness and accessibility`.

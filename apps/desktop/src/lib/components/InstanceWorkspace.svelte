@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { tick } from "svelte";
   import type {
     BackendOption,
     BackupView,
@@ -59,6 +60,15 @@
   const tabs: WorkspaceTab[] = ["Overview", "Clients", "DNS", "Settings", "Backups", "Logs"];
   let backend = $derived(options.find((option) => option.kind === summary.instance.backend));
   let instanceLogs = $derived(logs.filter((event) => event.instance_id === summary.instance.id));
+  async function tabKeydown(event: KeyboardEvent, current: WorkspaceTab) {
+    const index = tabs.indexOf(current);
+    const next = event.key === "ArrowRight" ? tabs[(index + 1) % tabs.length] : event.key === "ArrowLeft" ? tabs[(index - 1 + tabs.length) % tabs.length] : event.key === "Home" ? tabs[0] : event.key === "End" ? tabs.at(-1)! : null;
+    if (!next) return;
+    event.preventDefault();
+    ontabchange(next);
+    await tick();
+    document.getElementById(`instance-tab-${summary.instance.id}-${next}`)?.focus();
+  }
 </script>
 
 <section class="workspace">
@@ -81,13 +91,18 @@
       <button
         type="button"
         role="tab"
+        id={`instance-tab-${summary.instance.id}-${item}`}
+        aria-controls={`instance-panel-${summary.instance.id}`}
         aria-selected={tab === item}
+        tabindex={tab === item ? 0 : -1}
         class:active={tab === item}
+        onkeydown={(event) => tabKeydown(event, item)}
         onclick={() => ontabchange(item)}>{item}</button
       >
     {/each}
   </div>
 
+  <div role="tabpanel" id={`instance-panel-${summary.instance.id}`} aria-labelledby={`instance-tab-${summary.instance.id}-${tab}`} tabindex="0">
   {#if tab === "Overview"}
     <div class="stats">
       <article><span>Backend</span><strong>{backend?.display_name ?? summary.instance.backend}</strong><small>{backend?.presentation.description}</small></article>
@@ -125,4 +140,5 @@
   {:else}
     <div class="panel"><div class="panel-head"><h3>Instance activity</h3><span>{instanceLogs.length} events</span></div><LogsContent events={instanceLogs} /></div>
   {/if}
+  </div>
 </section>

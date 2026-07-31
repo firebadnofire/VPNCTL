@@ -1,6 +1,6 @@
 <script lang="ts">
   import { open, save, confirm } from "@tauri-apps/plugin-dialog";
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { call, errorText } from "./lib/api";
   import BackendBadge from "./lib/components/BackendBadge.svelte";
   import BackupsContent from "./lib/components/BackupsContent.svelte";
@@ -117,6 +117,8 @@
   let settingsPreview: InstanceUpdatePreview | null = null;
   let settingsImpactAcknowledged = false;
   let wizardStep = 1;
+  let previousModal: Modal = null;
+  let focusReturn: HTMLElement | null = null;
   let qrSvg = "";
   let technicalOpen = false;
 
@@ -162,6 +164,10 @@
   $: deviceFormBackend = backendOptions.find((item) => item.kind === deviceFormInstance?.backend);
   $: selectedBackend = backendOptions.find((item) => item.kind === selectedInstance?.backend);
   $: deviceDnsPreview = deviceDnsNamePreview(deviceForm.dns_name, deviceFormInstance?.dns.zone || "");
+  $: if (modal !== previousModal) {
+    handleModalTransition(previousModal, modal);
+    previousModal = modal;
+  }
 
   onMount(load);
 
@@ -231,6 +237,15 @@
     if (active === "Backups") await refreshBackups();
   }
 
+  function dnsTabKeydown(event: KeyboardEvent, panel: DnsPanel) {
+    const index = dnsPanels.indexOf(panel);
+    const next = event.key === "ArrowRight" ? dnsPanels[(index + 1) % dnsPanels.length] : event.key === "ArrowLeft" ? dnsPanels[(index - 1 + dnsPanels.length) % dnsPanels.length] : null;
+    if (!next) return;
+    event.preventDefault();
+    activeDnsPanel = next;
+    document.getElementById(`dns-tab-${next}`)?.focus();
+  }
+
   async function manageInstance(instanceId: string) {
     selectedInstanceId = instanceId;
     workspaceInstanceId = instanceId;
@@ -285,6 +300,55 @@
   function clearNotice() {
     notice = "";
     noticeHealth = null;
+  }
+
+  async function handleModalTransition(previous: Modal, next: Modal) {
+    if (!previous && next) {
+      focusReturn = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+      await tick();
+      document.querySelector<HTMLElement>(".modal")?.focus();
+    } else if (previous && !next) {
+      qrSvg = "";
+      restorePreview = null;
+      instanceForm.xray_certificate_path = "";
+      instanceForm.xray_private_key_path = "";
+      if (settingsForm) {
+        settingsForm.xray_certificate_path = "";
+        settingsForm.xray_private_key_path = "";
+      }
+      await tick();
+      focusReturn?.focus();
+      focusReturn = null;
+    }
+  }
+
+  function closeModal() {
+    modal = null;
+  }
+
+  function modalKeydown(event: KeyboardEvent) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeModal();
+      return;
+    }
+    if (event.key !== "Tab") return;
+    const dialog = event.currentTarget as HTMLElement;
+    const controls = [...dialog.querySelectorAll<HTMLElement>("button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex='-1'])")];
+    if (!controls.length) return;
+    const first = controls[0];
+    const last = controls.at(-1)!;
+    if (event.shiftKey && document.activeElement === first) { event.preventDefault(); last.focus(); }
+    else if (!event.shiftKey && document.activeElement === last) { event.preventDefault(); first.focus(); }
+  }
+
+  function modalLabel(value: Exclude<Modal, null>) {
+    return {
+      host: "Add SSH host", trust: "Verify SSH host key", instance: "Create VPN instance",
+      device: "Add client", dns: "Add DNS record", hostlist: "Edit DNS hostlist",
+      "host-setup": "Review host setup", plan: "Review deployment", restore: "Review backup restore",
+      settings: "Edit instance settings", qr: "Client QR code",
+    }[value];
   }
 
   function applyLiveHealth(instanceId: string, health: InstanceHealthView) {
@@ -1069,8 +1133,8 @@
     </div>
     <nav aria-label="Primary">
       {#each sections as section}
-        <button class:active={active === section} onclick={() => selectSection(section)}>
-          <span class="nav-dot"></span>{section}
+        <button class:active={active === section} title={section} aria-label={section} onclick={() => selectSection(section)}>
+          <span class="nav-icon" aria-hidden="true">{{ Hosts: "H", Instances: "I", Clients: "C", DNS: "D", Backups: "B", Logs: "L" }[section]}</span><span class="nav-label">{section}</span>
         </button>
       {/each}
     </nav>
@@ -1078,7 +1142,7 @@
 
   <main>
     {#if workspaceInstanceId && selectedSummary}
-      {#if busy}<div class="progress"><span></span>{busy}…</div>{/if}
+      {#if busy}<div class="progress" role="status" aria-live="polite"><span></span>{busy}…</div>{/if}
       {#if notice}<div class="notice" role="status"><span>{notice}</span><button aria-label="Dismiss" onclick={clearNotice}>×</button></div>{/if}
       {#if error}<div class="alert" role="alert"><div><strong>{error.message}</strong>{#if error.remediation}<p>{error.remediation}</p>{/if}</div><button aria-label="Dismiss" onclick={() => (error = null)}>×</button></div>{/if}
       <InstanceWorkspace
@@ -1123,7 +1187,7 @@
       </div>
     </header>
 
-    {#if busy}<div class="progress"><span></span>{busy}…</div>{/if}
+    {#if busy}<div class="progress" role="status" aria-live="polite"><span></span>{busy}…</div>{/if}
     {#if notice}
       <div class="notice" role="status">
         <div class="notice-body">
@@ -1228,7 +1292,7 @@
         <article><span>Managed hosts</span><strong class="green">{hosts.length}</strong><small>Explicit SSH trust</small></article>
         <article><span>Selected</span><strong>{selectedInstance ? "1" : "0"}</strong><small>{selectedInstance?.display_name || "None"}</small></article>
       </section>
-      <section class="panel">
+      <section class="panel instance-list-panel">
         {#if instances.length}
           <div class="rows instance-rows">
             {#each instanceSummaries as summary}
@@ -1265,9 +1329,10 @@
       </div>
       <div class="tabs" role="tablist" aria-label="DNS panels">
         {#each dnsPanels as panel}
-          <button type="button" role="tab" aria-selected={activeDnsPanel === panel} class:active={activeDnsPanel === panel} onclick={() => (activeDnsPanel = panel)}>{panel}</button>
+          <button type="button" role="tab" id={`dns-tab-${panel}`} aria-controls="dns-panel" aria-selected={activeDnsPanel === panel} tabindex={activeDnsPanel === panel ? 0 : -1} class:active={activeDnsPanel === panel} onclick={() => (activeDnsPanel = panel)} onkeydown={(event) => dnsTabKeydown(event, panel)}>{panel}</button>
         {/each}
       </div>
+      <div id="dns-panel" role="tabpanel" aria-labelledby={`dns-tab-${activeDnsPanel}`} tabindex="0">
       {#if activeDnsPanel === "Records"}
       <section class="panel">
         <div class="panel-head"><h3>Private DNS records</h3><span>A · AAAA · CNAME · TXT · SRV</span></div>
@@ -1310,6 +1375,7 @@
           {/if}
         </section>
       {/if}
+      </div>
     {:else if active === "Backups"}
       <div class="toolbar">
         <InstanceSelector {instances} value={selectedInstanceId} onchange={selectedInstanceChanged} />
@@ -1332,8 +1398,8 @@
 </div>
 
 {#if modal}
-  <div class="modal-backdrop" role="presentation" onclick={(event) => { if (event.target === event.currentTarget) modal = null; }}>
-    <section class="modal" role="dialog" aria-modal="true">
+  <div class="modal-backdrop" role="presentation" onclick={(event) => { if (event.target === event.currentTarget) closeModal(); }}>
+    <div class="modal" role="dialog" aria-modal="true" aria-label={modalLabel(modal)} tabindex="-1" onkeydown={modalKeydown}>
       {#if modal === "host"}
         <ModalShell title="Add SSH host" eyebrow="FIRST RUN" onclose={() => (modal = null)}>
           <form onsubmit={(event) => { event.preventDefault(); saveHost(); }}>
@@ -1418,7 +1484,7 @@
           <div class="modal-actions"><button type="button" class="secondary" onclick={() => (modal = null)}>Cancel</button><button class="primary">Validate and save</button></div>
         </form>
       {:else if modal === "hostlist"}
-        <div class="modal-head"><div><p class="eyebrow">DNS BLOCKLIST</p><h2>{hostlistForm.id ? "Edit hostlist" : "Add hostlist"}</h2></div><button onclick={() => (modal = null)}>Ã—</button></div>
+        <div class="modal-head"><div><p class="eyebrow">DNS BLOCKLIST</p><h2>{hostlistForm.id ? "Edit hostlist" : "Add hostlist"}</h2></div><button onclick={() => (modal = null)}>×</button></div>
         <form onsubmit={(event) => { event.preventDefault(); saveHostlist(); }}>
           <label>Name<input bind:value={hostlistForm.name} required placeholder="Malware hosts" /></label>
           <label>HTTPS URL<input type="url" bind:value={hostlistForm.url} required placeholder="https://example.com/hosts" /></label>
@@ -1483,6 +1549,6 @@
         <div class="qr">{@html qrSvg}</div>
         <p class="help centered">This SVG exists only in the current desktop view. Close it when the device has imported the configuration.</p>
       {/if}
-    </section>
+    </div>
   </div>
 {/if}

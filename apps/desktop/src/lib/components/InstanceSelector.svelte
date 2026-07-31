@@ -6,17 +6,19 @@
     value,
     onchange,
     label = "Instance",
+    id = "instance-selector",
   }: {
     instances: VpnInstance[];
     value: string;
     onchange: (value: string) => void;
     label?: string;
+    id?: string;
   } = $props();
 </script>
 
-<label class="instance-selector">
+<label class="instance-selector" for={id}>
   {label}
-  <select value={value} onchange={(event) => onchange(event.currentTarget.value)}>
+  <select {id} value={value} onchange={(event) => onchange(event.currentTarget.value)}>
     <option value="">Select…</option>
     {#each instances as instance}<option value={instance.id}>{instance.display_name}</option>{/each}
   </select>
