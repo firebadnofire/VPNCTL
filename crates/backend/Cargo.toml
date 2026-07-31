@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde.workspace = true
 thiserror.workspace = true
 vam-core = { path = "../core" }
 vam-protocol = { path = "../protocol" }

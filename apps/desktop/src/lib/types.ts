@@ -104,6 +104,75 @@ export interface BackendOption {
   display_name: string;
   default_port: number;
   capabilities: BackendCapabilities;
+  presentation: BackendPresentation;
+}
+
+export type ClientAction =
+  | "enable"
+  | "disable"
+  | "rotate_identity"
+  | "replace_identity"
+  | "revoke"
+  | "export"
+  | "qr_export"
+  | "remove"
+  | "inspect_statistics";
+
+export type ClientExportFormat =
+  | "wire_guard_configuration"
+  | "amnezia_wg_configuration"
+  | "open_vpn_profile"
+  | "protected_pkcs12"
+  | "vless_uri";
+
+export type ConfigurationSection = "general" | "network" | "protocol" | "dns" | "advanced";
+
+export type ConfigurationField =
+  | "endpoint"
+  | "listener_port"
+  | "address_pool"
+  | "routing_mode"
+  | "managed_dns"
+  | "persistent_keepalive"
+  | "userspace_fallback"
+  | "amnezia_obfuscation"
+  | "open_vpn_transport"
+  | "open_vpn_cipher"
+  | "open_vpn_tls_protection"
+  | "certificate_lifetime"
+  | "ikev2_server_identity"
+  | "xray_security"
+  | "xray_transport"
+  | "xray_server_name"
+  | "xray_camouflage_target"
+  | "xray_http_path"
+  | "xray_tls_material";
+
+export type BackendHostRequirement =
+  | "linux"
+  | "supported_architecture"
+  | "docker_engine"
+  | "compose_v2"
+  | "docker_access"
+  | "tun_device"
+  | "wire_guard_kernel_or_userspace";
+
+export interface BackendPresentation {
+  short_name: string;
+  badge: string;
+  description: string;
+  routing: "routed_tunnel" | "proxy";
+  dns: "managed_private_dns" | "unsupported";
+  client_addresses: "allocated" | "none";
+  statistics: "backend_supported" | "unavailable";
+  listener_model: "configurable" | "fixed_multiple";
+  client_identity_name: string;
+  client_actions: ClientAction[];
+  export_formats: ClientExportFormat[];
+  configuration_sections: ConfigurationSection[];
+  configuration_fields: ConfigurationField[];
+  host_requirements: BackendHostRequirement[];
+  identity_replacement_warning: string;
 }
 
 export interface VpnInstance {

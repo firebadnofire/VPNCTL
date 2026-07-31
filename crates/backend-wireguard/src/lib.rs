@@ -1,9 +1,12 @@
 use std::{collections::HashMap, fmt::Write as _};
 
 use vam_backend::{
-    BackendCapabilities, BackendError, BackendHealthProbe, BackendRuntimeSpec, BackendValidation,
-    ChangeImpact, ClientArtifactKind, ContainerCapability, ContainerImage, ContainerMount,
-    ContainerMountOwnership, ServerIdentityStrategy, VpnBackend,
+    BackendCapabilities, BackendError, BackendHealthProbe, BackendHostRequirement,
+    BackendPresentation, BackendRuntimeSpec, BackendValidation, ChangeImpact, ClientAction,
+    ClientAddressCapability, ClientArtifactKind, ClientExportFormat, ConfigurationField,
+    ConfigurationSection, ContainerCapability, ContainerImage, ContainerMount,
+    ContainerMountOwnership, DnsCapability, ListenerModel, RoutingCapability,
+    ServerIdentityStrategy, StatisticsCapability, VpnBackend,
 };
 use vam_core::{
     BackendSettings, DesiredState, Device, DeviceBackendData, ListenerPort, RoutingMode,
@@ -49,6 +52,54 @@ impl VpnBackend for WireGuardBackend {
             qr_export: true,
             traffic_statistics: true,
             certificate_authority: false,
+        }
+    }
+
+    fn presentation(&self) -> BackendPresentation {
+        BackendPresentation {
+            short_name: "WG",
+            badge: "WG",
+            description: "Fast modern routed VPN",
+            routing: RoutingCapability::RoutedTunnel,
+            dns: DnsCapability::ManagedPrivateDns,
+            client_addresses: ClientAddressCapability::Allocated,
+            statistics: StatisticsCapability::BackendSupported,
+            listener_model: ListenerModel::Configurable,
+            client_identity_name: "peer keypair",
+            client_actions: &[
+                ClientAction::Enable,
+                ClientAction::Disable,
+                ClientAction::RotateIdentity,
+                ClientAction::Export,
+                ClientAction::QrExport,
+                ClientAction::Remove,
+            ],
+            export_formats: &[ClientExportFormat::WireGuardConfiguration],
+            configuration_sections: &[
+                ConfigurationSection::General,
+                ConfigurationSection::Network,
+                ConfigurationSection::Protocol,
+                ConfigurationSection::Dns,
+                ConfigurationSection::Advanced,
+            ],
+            configuration_fields: &[
+                ConfigurationField::Endpoint,
+                ConfigurationField::ListenerPort,
+                ConfigurationField::AddressPool,
+                ConfigurationField::RoutingMode,
+                ConfigurationField::ManagedDns,
+                ConfigurationField::PersistentKeepalive,
+                ConfigurationField::UserspaceFallback,
+            ],
+            host_requirements: &[
+                BackendHostRequirement::Linux,
+                BackendHostRequirement::SupportedArchitecture,
+                BackendHostRequirement::DockerEngine,
+                BackendHostRequirement::ComposeV2,
+                BackendHostRequirement::DockerAccess,
+                BackendHostRequirement::WireGuardKernelOrUserspace,
+            ],
+            identity_replacement_warning: "Generates a new client keypair and preshared key. Existing exported configurations for this client will stop working.",
         }
     }
 

@@ -6,10 +6,13 @@ use rcgen::{
 };
 use uuid::Uuid;
 use vam_backend::{
-    BackendCapabilities, BackendError, BackendHealthProbe, BackendRuntimeSpec, BackendValidation,
-    ChangeImpact, ClientArtifactKind, ContainerCapability, ContainerDevice, ContainerImage,
-    ContainerMount, ContainerMountOwnership, CredentialAction, CredentialArtifact,
-    CredentialOperation, CredentialPlan, ServerIdentityStrategy, VpnBackend,
+    BackendCapabilities, BackendError, BackendHealthProbe, BackendHostRequirement,
+    BackendPresentation, BackendRuntimeSpec, BackendValidation, ChangeImpact, ClientAction,
+    ClientAddressCapability, ClientArtifactKind, ClientExportFormat, ConfigurationField,
+    ConfigurationSection, ContainerCapability, ContainerDevice, ContainerImage, ContainerMount,
+    ContainerMountOwnership, CredentialAction, CredentialArtifact, CredentialOperation,
+    CredentialPlan, DnsCapability, ListenerModel, RoutingCapability, ServerIdentityStrategy,
+    StatisticsCapability, VpnBackend,
 };
 use vam_core::{
     BackendSettings, DesiredState, Device, DeviceBackendData, ListenerPort, OpenVpnCipher,
@@ -95,6 +98,54 @@ impl VpnBackend for OpenVpnBackend {
             qr_export: false,
             traffic_statistics: true,
             certificate_authority: true,
+        }
+    }
+
+    fn presentation(&self) -> BackendPresentation {
+        BackendPresentation {
+            short_name: "OVPN",
+            badge: "OVPN",
+            description: "TLS-based VPN with broad client compatibility",
+            routing: RoutingCapability::RoutedTunnel,
+            dns: DnsCapability::ManagedPrivateDns,
+            client_addresses: ClientAddressCapability::Allocated,
+            statistics: StatisticsCapability::BackendSupported,
+            listener_model: ListenerModel::Configurable,
+            client_identity_name: "certificate identity",
+            client_actions: &[
+                ClientAction::Revoke,
+                ClientAction::ReplaceIdentity,
+                ClientAction::Export,
+                ClientAction::Remove,
+            ],
+            export_formats: &[ClientExportFormat::OpenVpnProfile],
+            configuration_sections: &[
+                ConfigurationSection::General,
+                ConfigurationSection::Network,
+                ConfigurationSection::Protocol,
+                ConfigurationSection::Dns,
+                ConfigurationSection::Advanced,
+            ],
+            configuration_fields: &[
+                ConfigurationField::Endpoint,
+                ConfigurationField::ListenerPort,
+                ConfigurationField::AddressPool,
+                ConfigurationField::RoutingMode,
+                ConfigurationField::ManagedDns,
+                ConfigurationField::OpenVpnTransport,
+                ConfigurationField::OpenVpnCipher,
+                ConfigurationField::OpenVpnTlsProtection,
+                ConfigurationField::CertificateLifetime,
+            ],
+            host_requirements: &[
+                BackendHostRequirement::Linux,
+                BackendHostRequirement::SupportedArchitecture,
+                BackendHostRequirement::DockerEngine,
+                BackendHostRequirement::ComposeV2,
+                BackendHostRequirement::DockerAccess,
+                BackendHostRequirement::TunDevice,
+            ],
+            identity_replacement_warning: "Revokes the current certificate and issues a new client identity. Existing exported profiles will stop working.",
         }
     }
 

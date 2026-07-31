@@ -4,9 +4,11 @@ use serde_json::{Value, json};
 use url::{Host, Url};
 use uuid::Uuid;
 use vam_backend::{
-    BackendCapabilities, BackendError, BackendHealthProbe, BackendRuntimeSpec, BackendValidation,
-    ChangeImpact, ClientArtifactKind, ContainerImage, ContainerMount, ContainerMountOwnership,
-    ServerIdentityStrategy, VpnBackend,
+    BackendCapabilities, BackendError, BackendHealthProbe, BackendHostRequirement,
+    BackendPresentation, BackendRuntimeSpec, BackendValidation, ChangeImpact, ClientAction,
+    ClientAddressCapability, ClientArtifactKind, ClientExportFormat, ConfigurationField,
+    ConfigurationSection, ContainerImage, ContainerMount, ContainerMountOwnership, DnsCapability,
+    ListenerModel, RoutingCapability, ServerIdentityStrategy, StatisticsCapability, VpnBackend,
 };
 use vam_core::{
     BackendSettings, DesiredState, Device, DeviceBackendData, ListenerPort, SecretReference,
@@ -211,6 +213,52 @@ impl VpnBackend for XrayBackend {
             qr_export: true,
             traffic_statistics: false,
             certificate_authority: false,
+        }
+    }
+
+    fn presentation(&self) -> BackendPresentation {
+        BackendPresentation {
+            short_name: "XRAY",
+            badge: "XRAY",
+            description: "VLESS proxy with Reality or TLS transport security",
+            routing: RoutingCapability::Proxy,
+            dns: DnsCapability::Unsupported,
+            client_addresses: ClientAddressCapability::None,
+            statistics: StatisticsCapability::Unavailable,
+            listener_model: ListenerModel::Configurable,
+            client_identity_name: "VLESS UUID identity",
+            client_actions: &[
+                ClientAction::Enable,
+                ClientAction::Disable,
+                ClientAction::RotateIdentity,
+                ClientAction::Export,
+                ClientAction::QrExport,
+                ClientAction::Remove,
+            ],
+            export_formats: &[ClientExportFormat::VlessUri],
+            configuration_sections: &[
+                ConfigurationSection::General,
+                ConfigurationSection::Protocol,
+                ConfigurationSection::Advanced,
+            ],
+            configuration_fields: &[
+                ConfigurationField::Endpoint,
+                ConfigurationField::ListenerPort,
+                ConfigurationField::XraySecurity,
+                ConfigurationField::XrayTransport,
+                ConfigurationField::XrayServerName,
+                ConfigurationField::XrayCamouflageTarget,
+                ConfigurationField::XrayHttpPath,
+                ConfigurationField::XrayTlsMaterial,
+            ],
+            host_requirements: &[
+                BackendHostRequirement::Linux,
+                BackendHostRequirement::SupportedArchitecture,
+                BackendHostRequirement::DockerEngine,
+                BackendHostRequirement::ComposeV2,
+                BackendHostRequirement::DockerAccess,
+            ],
+            identity_replacement_warning: "Generates a new UUID and updates desired server state. Existing exported profiles will stop working after deployment.",
         }
     }
 

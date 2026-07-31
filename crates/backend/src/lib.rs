@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vam_core::{
     BackendSettings, DesiredState, Device, ListenerPort, SecretReference, ValidationError,
@@ -17,6 +18,130 @@ pub struct BackendCapabilities {
     pub qr_export: bool,
     pub traffic_statistics: bool,
     pub certificate_authority: bool,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RoutingCapability {
+    RoutedTunnel,
+    Proxy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsCapability {
+    ManagedPrivateDns,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAddressCapability {
+    Allocated,
+    None,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StatisticsCapability {
+    BackendSupported,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ListenerModel {
+    Configurable,
+    FixedMultiple,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAction {
+    Enable,
+    Disable,
+    RotateIdentity,
+    ReplaceIdentity,
+    Revoke,
+    Export,
+    QrExport,
+    Remove,
+    InspectStatistics,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientExportFormat {
+    WireGuardConfiguration,
+    AmneziaWgConfiguration,
+    OpenVpnProfile,
+    ProtectedPkcs12,
+    VlessUri,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigurationSection {
+    General,
+    Network,
+    Protocol,
+    Dns,
+    Advanced,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigurationField {
+    Endpoint,
+    ListenerPort,
+    AddressPool,
+    RoutingMode,
+    ManagedDns,
+    PersistentKeepalive,
+    UserspaceFallback,
+    AmneziaObfuscation,
+    OpenVpnTransport,
+    OpenVpnCipher,
+    OpenVpnTlsProtection,
+    CertificateLifetime,
+    Ikev2ServerIdentity,
+    XraySecurity,
+    XrayTransport,
+    XrayServerName,
+    XrayCamouflageTarget,
+    XrayHttpPath,
+    XrayTlsMaterial,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum BackendHostRequirement {
+    Linux,
+    SupportedArchitecture,
+    DockerEngine,
+    ComposeV2,
+    DockerAccess,
+    TunDevice,
+    WireGuardKernelOrUserspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackendPresentation {
+    pub short_name: &'static str,
+    pub badge: &'static str,
+    pub description: &'static str,
+    pub routing: RoutingCapability,
+    pub dns: DnsCapability,
+    pub client_addresses: ClientAddressCapability,
+    pub statistics: StatisticsCapability,
+    pub listener_model: ListenerModel,
+    pub client_identity_name: &'static str,
+    pub client_actions: &'static [ClientAction],
+    pub export_formats: &'static [ClientExportFormat],
+    pub configuration_sections: &'static [ConfigurationSection],
+    pub configuration_fields: &'static [ConfigurationField],
+    pub host_requirements: &'static [BackendHostRequirement],
+    pub identity_replacement_warning: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -246,6 +371,7 @@ pub enum BackendError {
 pub trait VpnBackend: Send + Sync {
     fn kind(&self) -> VpnBackendKind;
     fn capabilities(&self) -> BackendCapabilities;
+    fn presentation(&self) -> BackendPresentation;
     fn runtime(&self, settings: &BackendSettings) -> Result<BackendRuntimeSpec, BackendError>;
     fn listeners(&self, settings: &BackendSettings, endpoint_port: u16) -> Vec<ListenerPort>;
     fn validate(&self, state: &DesiredState) -> Result<(), BackendError>;
@@ -318,6 +444,13 @@ impl BackendRegistry {
         self.backends
             .get(&kind)
             .map(|backend| backend.capabilities())
+    }
+
+    #[must_use]
+    pub fn presentation(&self, kind: VpnBackendKind) -> Option<BackendPresentation> {
+        self.backends
+            .get(&kind)
+            .map(|backend| backend.presentation())
     }
 
     #[must_use]

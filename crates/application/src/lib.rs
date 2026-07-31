@@ -20,9 +20,11 @@ use tokio::{sync::Mutex, time::sleep};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vam_backend::{
-    BackendError, BackendHealthProbe, BackendRegistry, BackendRuntimeSpec, BackendValidation,
-    ChangeImpact, ContainerImage, ContainerMountOwnership, CredentialAction, CredentialOperation,
-    ServerIdentityStrategy, VpnBackend,
+    BackendError, BackendHealthProbe, BackendHostRequirement, BackendPresentation, BackendRegistry,
+    BackendRuntimeSpec, BackendValidation, ChangeImpact, ClientAction, ClientAddressCapability,
+    ClientExportFormat, ConfigurationField, ConfigurationSection, ContainerImage,
+    ContainerMountOwnership, CredentialAction, CredentialOperation, DnsCapability, ListenerModel,
+    RoutingCapability, ServerIdentityStrategy, StatisticsCapability, VpnBackend,
 };
 use vam_backend_amneziawg::AmneziaWgBackend;
 use vam_backend_ikev2::Ikev2Backend;
@@ -377,6 +379,48 @@ pub struct BackendOptionView {
     pub display_name: String,
     pub default_port: u16,
     pub capabilities: BackendCapabilitiesView,
+    pub presentation: BackendPresentationView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackendPresentationView {
+    pub short_name: String,
+    pub badge: String,
+    pub description: String,
+    pub routing: RoutingCapability,
+    pub dns: DnsCapability,
+    pub client_addresses: ClientAddressCapability,
+    pub statistics: StatisticsCapability,
+    pub listener_model: ListenerModel,
+    pub client_identity_name: String,
+    pub client_actions: Vec<ClientAction>,
+    pub export_formats: Vec<ClientExportFormat>,
+    pub configuration_sections: Vec<ConfigurationSection>,
+    pub configuration_fields: Vec<ConfigurationField>,
+    pub host_requirements: Vec<BackendHostRequirement>,
+    pub identity_replacement_warning: String,
+}
+
+impl From<BackendPresentation> for BackendPresentationView {
+    fn from(value: BackendPresentation) -> Self {
+        Self {
+            short_name: value.short_name.into(),
+            badge: value.badge.into(),
+            description: value.description.into(),
+            routing: value.routing,
+            dns: value.dns,
+            client_addresses: value.client_addresses,
+            statistics: value.statistics,
+            listener_model: value.listener_model,
+            client_identity_name: value.client_identity_name.into(),
+            client_actions: value.client_actions.to_vec(),
+            export_formats: value.export_formats.to_vec(),
+            configuration_sections: value.configuration_sections.to_vec(),
+            configuration_fields: value.configuration_fields.to_vec(),
+            host_requirements: value.host_requirements.to_vec(),
+            identity_replacement_warning: value.identity_replacement_warning.into(),
+        }
+    }
 }
 
 struct PendingSecret {
@@ -1189,6 +1233,11 @@ fi
                     kind,
                     display_name: kind.display_name().into(),
                     default_port: kind.default_port(),
+                    presentation: self
+                        .backends
+                        .presentation(kind)
+                        .expect("registered backend has presentation metadata")
+                        .into(),
                     capabilities: BackendCapabilitiesView {
                         allocated_tunnel_addresses: capabilities.allocated_tunnel_addresses,
                         managed_dns: capabilities.managed_dns,
@@ -6756,10 +6805,61 @@ mod tests {
         ];
         let options = service.backend_options();
         assert_eq!(options.len(), backends.len());
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| (option.kind, option.presentation.badge.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                (VpnBackendKind::WireGuard, "WG"),
+                (VpnBackendKind::AmneziaWg, "AWG"),
+                (VpnBackendKind::OpenVpn, "OVPN"),
+                (VpnBackendKind::Ikev2, "IKE"),
+                (VpnBackendKind::Xray, "XRAY"),
+            ]
+        );
         assert!(
             options
                 .iter()
                 .all(|option| option.default_port == option.kind.default_port())
+        );
+        for option in &options {
+            assert_eq!(
+                option.capabilities.qr_export,
+                option
+                    .presentation
+                    .client_actions
+                    .contains(&ClientAction::QrExport)
+            );
+            assert_eq!(
+                option.capabilities.managed_dns,
+                option.presentation.dns == DnsCapability::ManagedPrivateDns
+            );
+            assert_eq!(
+                option.capabilities.allocated_tunnel_addresses,
+                option.presentation.client_addresses == ClientAddressCapability::Allocated
+            );
+            assert!(!option.presentation.export_formats.is_empty());
+            assert!(
+                option
+                    .presentation
+                    .host_requirements
+                    .contains(&BackendHostRequirement::Linux)
+            );
+            let json = serde_json::to_string(option).unwrap();
+            assert!(!json.contains("secret_reference"));
+            assert!(!json.contains("private_key"));
+            assert!(!json.contains("certificate_ref"));
+        }
+        assert_eq!(
+            options[3].presentation.export_formats,
+            vec![ClientExportFormat::ProtectedPkcs12]
+        );
+        assert_eq!(options[4].presentation.routing, RoutingCapability::Proxy);
+        assert_eq!(options[4].presentation.dns, DnsCapability::Unsupported);
+        assert_eq!(
+            options[4].presentation.statistics,
+            StatisticsCapability::Unavailable
         );
         for (index, backend) in backends.into_iter().enumerate() {
             let host = service

@@ -1,9 +1,12 @@
 use std::{collections::HashMap, fmt::Write as _};
 
 use vam_backend::{
-    BackendCapabilities, BackendError, BackendHealthProbe, BackendRuntimeSpec, BackendValidation,
-    ChangeImpact, ClientArtifactKind, ContainerCapability, ContainerDevice, ContainerImage,
-    ContainerMount, ContainerMountOwnership, ServerIdentityStrategy, VpnBackend,
+    BackendCapabilities, BackendError, BackendHealthProbe, BackendHostRequirement,
+    BackendPresentation, BackendRuntimeSpec, BackendValidation, ChangeImpact, ClientAction,
+    ClientAddressCapability, ClientArtifactKind, ClientExportFormat, ConfigurationField,
+    ConfigurationSection, ContainerCapability, ContainerDevice, ContainerImage, ContainerMount,
+    ContainerMountOwnership, DnsCapability, ListenerModel, RoutingCapability,
+    ServerIdentityStrategy, StatisticsCapability, VpnBackend,
 };
 use vam_core::{
     AmneziaWgMagicRange, AmneziaWgSettings, BackendSettings, DesiredState, Device,
@@ -71,6 +74,54 @@ impl VpnBackend for AmneziaWgBackend {
             qr_export: true,
             traffic_statistics: true,
             certificate_authority: false,
+        }
+    }
+
+    fn presentation(&self) -> BackendPresentation {
+        BackendPresentation {
+            short_name: "AWG",
+            badge: "AWG",
+            description: "WireGuard-compatible VPN with traffic obfuscation",
+            routing: RoutingCapability::RoutedTunnel,
+            dns: DnsCapability::ManagedPrivateDns,
+            client_addresses: ClientAddressCapability::Allocated,
+            statistics: StatisticsCapability::BackendSupported,
+            listener_model: ListenerModel::Configurable,
+            client_identity_name: "AWG peer keypair",
+            client_actions: &[
+                ClientAction::Enable,
+                ClientAction::Disable,
+                ClientAction::RotateIdentity,
+                ClientAction::Export,
+                ClientAction::QrExport,
+                ClientAction::Remove,
+            ],
+            export_formats: &[ClientExportFormat::AmneziaWgConfiguration],
+            configuration_sections: &[
+                ConfigurationSection::General,
+                ConfigurationSection::Network,
+                ConfigurationSection::Protocol,
+                ConfigurationSection::Dns,
+                ConfigurationSection::Advanced,
+            ],
+            configuration_fields: &[
+                ConfigurationField::Endpoint,
+                ConfigurationField::ListenerPort,
+                ConfigurationField::AddressPool,
+                ConfigurationField::RoutingMode,
+                ConfigurationField::ManagedDns,
+                ConfigurationField::PersistentKeepalive,
+                ConfigurationField::AmneziaObfuscation,
+            ],
+            host_requirements: &[
+                BackendHostRequirement::Linux,
+                BackendHostRequirement::SupportedArchitecture,
+                BackendHostRequirement::DockerEngine,
+                BackendHostRequirement::ComposeV2,
+                BackendHostRequirement::DockerAccess,
+                BackendHostRequirement::TunDevice,
+            ],
+            identity_replacement_warning: "Generates a new AWG client keypair. Existing exported configurations for this client will stop working.",
         }
     }
 

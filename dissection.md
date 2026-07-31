@@ -4522,3 +4522,54 @@ Environment-bounded checks not claimed:
 These are environment limitations, not substituted passing evidence. The
 reusable, backend-specific VM acceptance procedure is recorded in
 `docs/testing-vm.md`.
+
+## 12. Backend-aware desktop UI implementation
+
+### 12A. Authoritative backend presentation metadata
+
+The desktop previously received only seven capability booleans plus the backend
+name and default port. That was insufficient to render general screens without
+repeating protocol comparisons in Svelte. The backend contract now owns a typed,
+public-safe presentation description for every registered implementation:
+
+- short and full names, visible text badge, and creation description;
+- routed-tunnel versus proxy behavior, DNS/address/statistics capability, and
+  configurable versus fixed-multiple listeners;
+- supported client actions and the concrete export format that the backend
+  actually renders;
+- applicable configuration sections and fields;
+- host requirements and a backend-specific identity replacement warning.
+
+The application converts borrowed static backend metadata into an owned
+`BackendPresentationView`, nested in each `BackendOptionView`. TypeScript mirrors
+the serialized enums. Existing capability booleans remain temporarily available
+for compatibility while the screens move to the richer contract. The metadata
+does not contain secret references, private key paths, certificate references,
+or configuration contents. IKEv2 advertises only its implemented protected
+PKCS#12 export; Xray advertises only its implemented VLESS URI/QR representation.
+No statistics action is exposed until the application can return real client
+statistics.
+
+Validation for this unit:
+
+- `cargo check -p vam-application` passed;
+- the five-backend descriptor matrix test passed and asserted capability/action
+  consistency, exact badges, implemented exports, Xray proxy/DNS semantics, and
+  serialized secret-reference absence;
+- strict Clippy passed for `vam-backend`, all five concrete backend crates, and
+  `vam-application` with all targets and `-D warnings`;
+- `cargo fmt --all -- --check` and `git diff --check` passed;
+- Svelte check passed with 0 errors and 0 warnings;
+- Vitest passed 2/2 existing frontend tests.
+
+The first focused Rust test attempt confirmed the production AWS-LC build still
+cannot find NASM on the ordinary process PATH. The repository helper's existing,
+previously installed portable NASM 3.02 was then added to the validation
+process's PATH; no installation or machine change was performed, and the same
+production AWS-LC dependency graph passed. The normal pnpm wrapper also hit its
+known non-interactive modules-directory guard and a blocked registry metadata
+request, so the already-installed Svelte/Vitest executables were run directly.
+Their first sandboxed launch hit Windows `EPERM`; the approved unsandboxed read
+of existing dependencies passed.
+
+Planned signed commit: `feat: expose backend UI metadata`.
