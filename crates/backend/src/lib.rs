@@ -56,6 +56,13 @@ pub struct ContainerMount {
     pub host_path: &'static str,
     pub container_path: &'static str,
     pub read_only: bool,
+    pub ownership: ContainerMountOwnership,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerMountOwnership {
+    HostUser,
+    Numeric { uid: u32, gid: u32 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -8,8 +8,8 @@ use uuid::Uuid;
 use vam_backend::{
     BackendCapabilities, BackendError, BackendHealthProbe, BackendRuntimeSpec, BackendValidation,
     ChangeImpact, ClientArtifactKind, ContainerCapability, ContainerDevice, ContainerImage,
-    ContainerMount, CredentialAction, CredentialArtifact, CredentialOperation, CredentialPlan,
-    ServerIdentityStrategy, VpnBackend,
+    ContainerMount, ContainerMountOwnership, CredentialAction, CredentialArtifact,
+    CredentialOperation, CredentialPlan, ServerIdentityStrategy, VpnBackend,
 };
 use vam_core::{
     BackendSettings, DesiredState, Device, DeviceBackendData, ListenerPort, OpenVpnCipher,
@@ -117,6 +117,7 @@ impl VpnBackend for OpenVpnBackend {
                 host_path: "vpn",
                 container_path: "/etc/openvpn",
                 read_only: false,
+                ownership: ContainerMountOwnership::HostUser,
             }],
             environment: Vec::new(),
             entrypoint: Vec::new(),

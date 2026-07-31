@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Write as _};
 use vam_backend::{
     BackendCapabilities, BackendError, BackendHealthProbe, BackendRuntimeSpec, BackendValidation,
     ChangeImpact, ClientArtifactKind, ContainerCapability, ContainerDevice, ContainerImage,
-    ContainerMount, ServerIdentityStrategy, VpnBackend,
+    ContainerMount, ContainerMountOwnership, ServerIdentityStrategy, VpnBackend,
 };
 use vam_core::{
     AmneziaWgMagicRange, AmneziaWgSettings, BackendSettings, DesiredState, Device,
@@ -90,6 +90,7 @@ impl VpnBackend for AmneziaWgBackend {
                 host_path: "vpn",
                 container_path: "/etc/amneziawg",
                 read_only: false,
+                ownership: ContainerMountOwnership::HostUser,
             }],
             environment: Vec::new(),
             entrypoint: vec!["/etc/amneziawg/start-awg.sh"],

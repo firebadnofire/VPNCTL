@@ -3,7 +3,7 @@ use std::{collections::HashMap, fmt::Write as _};
 use vam_backend::{
     BackendCapabilities, BackendError, BackendHealthProbe, BackendRuntimeSpec, BackendValidation,
     ChangeImpact, ClientArtifactKind, ContainerCapability, ContainerImage, ContainerMount,
-    ServerIdentityStrategy, VpnBackend,
+    ContainerMountOwnership, ServerIdentityStrategy, VpnBackend,
 };
 use vam_core::{
     BackendSettings, DesiredState, Device, DeviceBackendData, ListenerPort, RoutingMode,
@@ -68,6 +68,7 @@ impl VpnBackend for WireGuardBackend {
                 host_path: "vpn",
                 container_path: "/config/wg_confs",
                 read_only: false,
+                ownership: ContainerMountOwnership::HostUser,
             }],
             environment: vec![
                 ("PUID", "0"),

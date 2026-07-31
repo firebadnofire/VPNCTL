@@ -190,6 +190,14 @@ pub struct DeploymentProgress {
 pub struct InstanceHealth {
     pub compose_project_exists: bool,
     pub gateway_running: bool,
+    #[serde(default)]
+    pub backend_ready: bool,
+    #[serde(default)]
+    pub listeners_ready: bool,
+    #[serde(default)]
+    pub client_state_matches: bool,
+    #[serde(default)]
+    pub dns_required: bool,
     pub dns_running: bool,
     pub watchtower_running: bool,
     pub private_dns_resolves: bool,

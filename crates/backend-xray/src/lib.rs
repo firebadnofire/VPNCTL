@@ -5,8 +5,8 @@ use url::{Host, Url};
 use uuid::Uuid;
 use vam_backend::{
     BackendCapabilities, BackendError, BackendHealthProbe, BackendRuntimeSpec, BackendValidation,
-    ChangeImpact, ClientArtifactKind, ContainerImage, ContainerMount, ServerIdentityStrategy,
-    VpnBackend,
+    ChangeImpact, ClientArtifactKind, ContainerImage, ContainerMount, ContainerMountOwnership,
+    ServerIdentityStrategy, VpnBackend,
 };
 use vam_core::{
     BackendSettings, DesiredState, Device, DeviceBackendData, ListenerPort, SecretReference,
@@ -233,11 +233,16 @@ impl VpnBackend for XrayBackend {
                     host_path: "xray",
                     container_path: "/etc/xray",
                     read_only: true,
+                    ownership: ContainerMountOwnership::HostUser,
                 },
                 ContainerMount {
                     host_path: "xray-state",
                     container_path: "/var/lib/vam-xray",
                     read_only: false,
+                    ownership: ContainerMountOwnership::Numeric {
+                        uid: 10_001,
+                        gid: 10_001,
+                    },
                 },
             ],
             environment: Vec::new(),

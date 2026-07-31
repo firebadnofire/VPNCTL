@@ -3025,4 +3025,288 @@ was installed. Therefore:
 
 Commit:
 
-- pending staged-patch inspection and signed commit.
+- `09141ca refactor: render backend-driven deployments`;
+- signed with the configured EDDSA signing key
+  `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+## Implementation Unit 7: backend-driven verified-SSH deployment
+
+### Plan
+
+This unit generalizes the remote deployment transaction around the backend
+runtime contract. Certificate-authority issuance/revocation and the local
+device lifecycle remain the next unit.
+
+1. Replace the legacy WireGuard/Watchtower health shape with additive generic
+   signals while retaining old fields for serialized/UI compatibility:
+   backend readiness, all declared listeners published, desired client set
+   present, and whether DNS is required. Watchtower must no longer be required
+   for health.
+2. Generate the SSH port-conflict probe from every typed listener:
+   `ss -ltn` for TCP and `ss -lun` for UDP. A port occupied by the instance's
+   existing gateway is allowed; any other collision fails before upload.
+3. Generate idempotent UFW/Firewalld allow/remove commands for every exact
+   `<port>/<protocol>` tuple. Do not infer UDP from the primary endpoint.
+4. Prepare images from `ContainerImage`:
+   - pull the exact backend reference for pulled runtimes;
+   - build the exact staged Compose gateway for local runtimes;
+   - pull pinned CoreDNS only when managed DNS is enabled.
+5. Materialize `WireGuardLike` identities from the declared tool, key,
+   template, active-config, and sentinel paths. Preserve an existing key,
+   generate only when absent, and capture only the public key. This must work
+   for both `wg` and `awg`.
+6. Build validation commands from `BackendValidation`:
+   - WireGuard/AWG quick-strip the staged active config;
+   - OpenVPN checks its staged configuration using its built image;
+   - IKEv2 performs static strongSwan configuration checks available without
+     starting the live service;
+   - Xray validates Compose before activation and relies on its fail-closed
+     startup self-test for identity materialization.
+   CoreDNS validation is capability-gated.
+7. Activate all backend-declared identity files rather than hard-coded
+   `vpn/wg0.conf`. Pull/build/up/restart commands must follow reviewed plan
+   operations, and DNS restarts must be capability-gated.
+8. Build health commands from `BackendHealthProbe`:
+   WireGuard/AWG interface and peer count; OpenVPN management/process/config
+   readiness; strongSwan daemon/loaded connection state; Xray process and
+   `run -test` against its active config. Verify every published listener and
+   DNS only when required.
+9. Retrieve Xray REALITY public key/short ID after healthy startup and persist
+   only those public values in desired settings; private identity remains on
+   the remote host and is backup/rollback material.
+10. Normalize ownership only for declared writable bind mounts and without
+    assuming the WireGuard image or `vpn/` path. Staging cleanup must use an
+    exact validated instance/plan path and must not rely on an arbitrary
+    backend image containing a privileged shell.
+11. Keep backup-before-mutation, same-filesystem activation, health-gated
+    rollback, bounded retention, redacted events, cancellation, and approved
+    host-key verification intact.
+12. Add pure command-generation and mocked SSH tests for all listener,
+    identity, image, validation, health, activation, and failure boundaries.
+    Run focused tests/clippy first; report the already-known NASM/CMake
+    full-desktop prerequisite separately.
+
+### Uncertainties resolved conservatively
+
+- OpenVPN and IKEv2 cannot become healthy until their CA/server material exists.
+  This unit may prepare their runtime, but a fresh certificate backend apply
+  must fail before remote activation with an actionable typed-credential
+  prerequisite until Unit 8 initializes the authority transactionally.
+- Xray TLS uses Keychain certificate/key material rendered as mode-0600 files.
+  REALITY generates and preserves private material remotely. Planning must
+  never substitute an invalid fake PEM for TLS; actual secret access remains
+  inside the Rust boundary.
+- Static validation commands differ in strength. A backend startup self-test
+  is part of health and remains rollback-triggering; no weak validation result
+  will be presented as full runtime proof.
+
+### Implementation
+
+#### Runtime-owned mount permissions
+
+`ContainerMount` now declares `ContainerMountOwnership` instead of leaving the
+application to infer an owner from a hard-coded WireGuard image:
+
+- `HostUser` means that a writable bind mount must be returned to the remote
+  SSH user's numeric UID/GID after the container becomes healthy;
+- `Numeric { uid, gid }` means that the selected backend image is run once as
+  root, with only that exact bind mount attached at `/work`, to create and
+  chown its contents before the non-root service starts.
+
+WireGuard, AWG2, OpenVPN, and IKEv2 use `HostUser`. Xray's read-only
+configuration mount uses `HostUser`, while its writable identity/state mount
+uses UID/GID 10001 to match the explicitly non-root image user. Read-only
+mounts are never recursively changed. The command generator attaches only
+validated instance-root subpaths, and staging cleanup similarly uses the
+selected pinned backend image as root against the exact staging directory.
+
+This keeps the former post-health ownership guarantee without assuming every
+backend writes `vpn/` or that every service runs under the LinuxServer image's
+user model.
+
+#### Typed listener preflight and firewall management
+
+The SSH transaction now consumes every `ListenerPort` in the backend runtime:
+
+- TCP listeners are checked with `ss -H -ltn`; UDP listeners use
+  `ss -H -lun`;
+- a matching socket is accepted only when `docker compose port --protocol
+  <tcp|udp> gateway <port>` proves that the current instance already owns it;
+- any other collision fails before files are uploaded or the firewall is
+  changed, and the error names both the transport and port;
+- UFW and Firewalld commands enumerate exact `<port>/<transport>` tuples;
+- an inactive firewall is left unchanged, and repeated add/remove operations
+  remain safe;
+- rollback of a failed first installation removes only those declared rules,
+  never unrelated host firewall state.
+
+This is necessary for IKEv2's fixed pair of UDP 500 and UDP 4500, OpenVPN's
+selected TCP/UDP transport, Xray's selectable transport, and the single UDP
+listeners used by WireGuard and AWG2.
+
+#### Backend-selected image preparation
+
+Image preparation follows `ContainerImage` and the reviewed deployment plan:
+
+- pulled backends pull their exact pinned digest/tag;
+- locally built OpenVPN, IKEv2, and Xray runtimes build the staged `gateway`
+  service through the generated Compose file;
+- pinned CoreDNS is pulled only when `managed_dns` is true;
+- no generic `docker compose pull` is allowed to silently update a locally
+  built or unrelated service;
+- explicit image refresh uses the same backend-aware preparation path before
+  recreating the services.
+
+Watchtower remains absent. No Docker socket is exposed to a container.
+
+#### Server identity materialization
+
+The former WireGuard-only key command is now generated from
+`ServerIdentityStrategy`:
+
+- `WireGuardLike` declares its binary (`wg` or `awg`), private-key path,
+  staged template, materialized active configuration, and sentinel;
+- an existing private key is copied into the stage when present;
+- otherwise the declared tool generates it in the protected stage;
+- the private key substitutes the backend-specific sentinel only in the
+  server-side active configuration;
+- only `<tool> pubkey` output crosses back into the application and is
+  persisted as public server metadata;
+- the private key remains on the remote host and is covered by backup,
+  activation, and rollback.
+
+Host-to-container and container-to-host path mapping requires an exact mount
+path or a slash-delimited child. For example, `vpn/awg0.conf` maps through the
+`vpn` mount, but `vpn-other/awg0.conf` cannot match it.
+
+Xray REALITY uses its image's fail-closed startup entrypoint to generate its
+private X25519 identity and short ID in the 10001-owned state mount. After the
+service is healthy, the application reads only the declared public-key and
+short-ID files over the already verified SSH connection. It rejects either:
+
+- an invalid public value; or
+- a value that differs from a previously approved desired-state value.
+
+Only the public REALITY values are persisted. TLS mode instead resolves the
+certificate/private-key references inside the Rust application boundary for
+the real render; planning does not fabricate invalid PEM.
+
+#### Backend-specific validation and health
+
+Staged validation is selected by `BackendValidation`:
+
+- WireGuard and AWG2 run their declared quick helper's `strip` operation
+  against the mapped staged active configuration;
+- OpenVPN checks its staged configuration with the locally built image and
+  `openvpn --test-crypto`;
+- IKEv2 checks that its generated strongSwan configuration is non-empty and
+  that the built image provides `swanctl`; full daemon/connection proof is
+  deliberately deferred to health;
+- Xray verifies non-empty staged JSON and the built binary before activation;
+  its entrypoint performs `xray run -test` on the materialized live
+  configuration before executing the server;
+- every backend runs `docker compose ... config --quiet`;
+- CoreDNS receives its own temporary configuration check only for a backend
+  that declares managed DNS. A shell trap removes the temporary verifier.
+
+`InstanceHealth` adds serialized, defaulted generic signals while retaining
+the legacy fields for UI/database compatibility:
+
+- `backend_ready`;
+- `listeners_ready`;
+- `client_state_matches`;
+- `dns_required`.
+
+The remote probe always verifies the Compose project and gateway status, then
+uses `BackendHealthProbe`:
+
+- WireGuard/AWG2: declared tool can read the interface and observed peer count
+  matches enabled desired devices;
+- OpenVPN: daemon PID/status files are ready and the rendered client-directory
+  count matches desired enabled clients;
+- IKEv2: `charon` is alive, `swanctl` can enumerate loaded connections, and
+  the rendered secret/connection set matches desired clients;
+- Xray: `xray run -test` succeeds against the active materialized JSON and its
+  client count matches desired enabled clients.
+
+Every declared Compose port mapping is independently checked. Private/public
+DNS probes run only when DNS is managed. Health no longer checks Watchtower.
+The transaction accepts a deployment only when the generic signals are all
+healthy, then normalizes eligible host-owned mounts. Otherwise it rolls back.
+
+#### Activation, quick refresh, and rollback
+
+Activation moves every backend-declared identity file, not just
+`vpn/wg0.conf`, from the same-filesystem stage into the active directory.
+Compose actions follow the reviewed plan:
+
+- DNS-only plans restart DNS only;
+- gateway restart plans restart the gateway and DNS only when DNS exists;
+- create/reinstall plans bring up the complete generated project;
+- image pull/build preparation occurs only when the plan contains that
+  operation.
+
+Quick credential refresh remains available only when the backend capability
+declares it. It now works for both WireGuard and AWG2, uploads only the
+backend's credential/config mount, rematerializes the active configuration
+with the preserved server private key, validates it, restarts only the
+gateway, proves health, and then restores host ownership. DNS files and DNS
+restart remain out of this path.
+
+Rollback now distinguishes two cases:
+
+- when a previous current directory existed, restore its backup, recreate the
+  previous Compose project, and prove the previous health contract;
+- on a first deployment with no backup, bring down the failed project,
+  quarantine its current directory under the instance trash path, and remove
+  only the new backend's typed firewall rules.
+
+This fixes the former first-install failure path, which attempted to restore a
+backup that could not exist. Backup-before-mutation, bounded retention,
+redacted events, cancellation propagation, and strict approved-host-key
+verification remain in place.
+
+### Validation
+
+The first application test run stopped on a new assertion that expected the
+AWG2 host mount to map to the LinuxServer WireGuard container path. Inspection
+confirmed that AWG2 deliberately maps `vpn/` to `/etc/amneziawg`; the test
+expectation was corrected to the backend contract, and the complete
+application gate was rerun.
+
+Passing delivered-source gates:
+
+- formatting with `cargo fmt --all --check`;
+- `git diff --check`;
+- 45 tests across the backend and deployment crates:
+  - AWG2: 4;
+  - IKEv2: 8;
+  - OpenVPN: 8;
+  - WireGuard: 3;
+  - Xray: 9;
+  - deployment: 13;
+- strict clippy with `-D warnings` for those backend/deployment crates and all
+  targets.
+
+The application crate was also diagnosed after temporarily selecting russh's
+ring provider:
+
+- all 12 application tests passed;
+- strict application clippy passed for all targets with `-D warnings`;
+- the exact mount-prefix regression covers both accepted children and rejected
+  sibling-prefix paths.
+
+That temporary dependency selection was not retained. `Cargo.toml` is back to
+`russh = "0.62.3"`, `Cargo.lock` is restored to the AWS-LC graph, and neither
+file is part of this change.
+
+Remaining environment-limited validation is explicit:
+
+- a clean native build of the delivered AWS-LC provider is still blocked by
+  missing NASM; its documented no-assembly fallback is blocked by missing
+  CMake;
+- Docker/Compose and a POSIX remote shell are not installed locally, so image
+  builds, Compose configuration, entrypoint behavior, and live SSH deployment
+  have not been executed;
+- OpenVPN and IKEv2 certificate-authority provisioning is the next functional
+  unit and is required before those backends can reach live healthy state.

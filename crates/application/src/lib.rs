@@ -2,6 +2,7 @@
 use std::collections::BTreeSet;
 use std::{
     collections::HashMap,
+    fmt::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -16,18 +17,21 @@ use tokio::time::timeout;
 use tokio::{sync::Mutex, time::sleep};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use vam_backend::{BackendError, BackendRegistry, VpnBackend};
+use vam_backend::{
+    BackendError, BackendHealthProbe, BackendRegistry, BackendRuntimeSpec, BackendValidation,
+    ContainerImage, ContainerMountOwnership, ServerIdentityStrategy, VpnBackend,
+};
 use vam_backend_amneziawg::AmneziaWgBackend;
 use vam_backend_ikev2::Ikev2Backend;
 use vam_backend_openvpn::OpenVpnBackend;
-use vam_backend_wireguard::{WIREGUARD_IMAGE, WireGuardBackend};
-use vam_backend_xray::XrayBackend;
+use vam_backend_wireguard::WireGuardBackend;
+use vam_backend_xray::{REALITY_PUBLIC_KEY_PATH, REALITY_SHORT_ID_PATH, XrayBackend};
 use vam_core::{
     BackendSettings, DEFAULT_DNS_ZONE, DEFAULT_KEEPALIVE, DEFAULT_PORT, DEFAULT_SUBNET,
     DesiredState, Device, DeviceBackendData, DnsConfig, DnsRecord, DnsRecordType, DockerHost,
-    EndpointConfig, NetworkConfig, RoutingMode, SecretReference, SshConnectionConfig, User,
-    VpnBackendKind, VpnInstance, WireGuardDeviceData, allocate_next_ipv4, first_usable,
-    validate_host_instances, validate_instance,
+    EndpointConfig, ListenerPort, NetworkConfig, RoutingMode, SecretReference, SshConnectionConfig,
+    TransportProtocol, User, VpnBackendKind, VpnInstance, WireGuardDeviceData, XraySecurity,
+    allocate_next_ipv4, first_usable, validate_host_instances, validate_instance,
 };
 use vam_deployment::{
     COREDNS_IMAGE, DeploymentExecutor, DeploymentPlanner, RemoteManifest, build_manifest,
@@ -1057,7 +1061,7 @@ fi
     }
 
     pub async fn update_images(&self, instance_id: Uuid) -> Result<InstanceHealth, AppError> {
-        self.compose_operation(instance_id, "pull && docker compose up -d", true)
+        self.compose_operation(instance_id, "refresh_images", true)
             .await
     }
 
@@ -1080,10 +1084,29 @@ fi
             )
             .await?;
         }
-        let command = format!(
-            "set -eu; cd {}; docker compose {operation}",
-            shell_quote(&state.instance.remote_path())
-        );
+        let command = if operation == "refresh_images" {
+            let backend = self
+                .backends
+                .get(state.instance.backend)
+                .map_err(backend_error)?;
+            let runtime = backend
+                .runtime(&state.instance.backend_settings)
+                .map_err(backend_error)?;
+            format!(
+                "{}; cd {}; docker compose up -d --remove-orphans",
+                image_prepare_command(
+                    &state.instance.remote_path(),
+                    &runtime,
+                    backend.capabilities().managed_dns,
+                ),
+                shell_quote(&state.instance.remote_path()),
+            )
+        } else {
+            format!(
+                "set -eu; cd {}; docker compose {operation}",
+                shell_quote(&state.instance.remote_path())
+            )
+        };
         self.checked_execute(
             &host,
             &trusted,
@@ -1162,10 +1185,39 @@ fi
         instance_id: Uuid,
     ) -> Result<InstanceHealth, AppError> {
         let state = self.desired_state(instance_id).await?;
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
+        if !backend.capabilities().quick_credential_refresh {
+            return Err(validation_error(&format!(
+                "{} credentials require the typed issue/revoke workflow.",
+                state.instance.backend
+            )));
+        }
+        let runtime = backend
+            .runtime(&state.instance.backend_settings)
+            .map_err(backend_error)?;
+        if !matches!(
+            runtime.identity,
+            ServerIdentityStrategy::WireGuardLike { .. }
+        ) {
+            return Err(validation_error(
+                "Quick credential refresh requires a WireGuard-like backend identity.",
+            ));
+        }
         let files = self.render_state(&state).await?;
         let device_store_files: Vec<_> = files
             .iter()
-            .filter(|file| file.path.starts_with("vpn/"))
+            .filter(|file| {
+                runtime.mounts.iter().any(|mount| {
+                    file.path == mount.host_path
+                        || file
+                            .path
+                            .strip_prefix(mount.host_path)
+                            .is_some_and(|suffix| suffix.starts_with('/'))
+                })
+            })
             .collect();
         if device_store_files.is_empty() {
             return Err(validation_error(
@@ -1183,21 +1235,15 @@ fi
             &cancellation,
         )
         .await?;
+        let current = state.instance.remote_path();
+        let identity_command = materialize_server_identity_command(&current, &current, &runtime)
+            .expect("quick-refresh backends have WireGuard-like identity");
+        let validate = validation_command(&current, &runtime, backend.capabilities().managed_dns);
         let command = format!(
-            r#"set -eu
-test -d {vpn_dir}
-test -s {server_key}
-docker run --rm --entrypoint sh -v {vpn_mount} {image} -c 'set -eu; umask 077; test -s /work/server.key; awk '"'"'{{ if ($0 == "PrivateKey = __VAM_SERVER_PRIVATE_KEY__") {{ getline key < "/work/server.key"; print "PrivateKey = " key }} else print }}'"'"' /work/wg0.conf.template > /work/wg0.conf; chmod 0600 /work/server.key /work/wg0.conf'
-cd {current}
-docker compose restart gateway
-"#,
-            vpn_dir = shell_quote(&format!("{}/vpn", state.instance.remote_path())),
-            server_key = shell_quote(&format!("{}/vpn/server.key", state.instance.remote_path())),
-            vpn_mount = shell_quote(&format!("{}/vpn:/work", state.instance.remote_path())),
-            image = shell_quote(WIREGUARD_IMAGE),
-            current = shell_quote(&state.instance.remote_path()),
+            "{identity_command}; {validate}; cd {}; docker compose restart gateway",
+            shell_quote(&current)
         );
-        if let Err(mut error) = self
+        let result = match self
             .checked_execute(
                 &host,
                 &trusted,
@@ -1207,13 +1253,25 @@ docker compose restart gateway
             )
             .await
         {
-            error.remote_state_changed = true;
-            error.scope = Some(state.instance.id.to_string());
-            error.remediation = Some(
-                "Deploy the instance if the server key is missing, then retry the credential refresh."
-                    .into(),
-            );
-            return Err(error);
+            Ok(result) => result,
+            Err(mut error) => {
+                error.remote_state_changed = true;
+                error.scope = Some(state.instance.id.to_string());
+                error.remediation = Some(
+                    "Deploy the instance if the server key is missing, then retry the credential refresh."
+                        .into(),
+                );
+                return Err(error);
+            }
+        };
+        if let Some(public) = parse_key_values(&result.stdout_text().map_err(ssh_error)?)
+            .get("server_public_key")
+            .filter(|value| value.len() == 44)
+        {
+            self.storage
+                .set_setting(&server_public_key_setting(instance_id), public)
+                .await
+                .map_err(storage_error)?;
         }
         let health = self
             .wait_for_healthy(&state, &host, &trusted, passphrase.as_ref(), &cancellation)
@@ -1637,11 +1695,15 @@ docker compose restart gateway
             .map_err(backend_error)?;
         let placeholder =
             Zeroizing::new(String::from("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="));
-        let secrets = backend
-            .server_secret_references(state)
-            .into_iter()
-            .map(|reference| (reference, placeholder.clone()))
-            .collect();
+        let mut secrets = HashMap::new();
+        for reference in backend.server_secret_references(state) {
+            let value = if state.instance.backend == VpnBackendKind::Xray {
+                self.secret_text(&reference).await?
+            } else {
+                placeholder.clone()
+            };
+            secrets.insert(reference, value);
+        }
         self.render_state_with_secrets(state, &secrets).await
     }
 
@@ -1858,7 +1920,10 @@ docker compose restart gateway
         {
             secrets.insert(reference.clone(), self.secret_text(&reference).await?);
         }
-        if state.instance.backend == VpnBackendKind::WireGuard {
+        if matches!(
+            state.instance.backend,
+            VpnBackendKind::WireGuard | VpnBackendKind::AmneziaWg
+        ) {
             let server_reference = SecretReference(state.instance.id);
             let server_public = self
                 .storage
@@ -1957,15 +2022,16 @@ docker compose restart gateway
         passphrase: Option<&Zeroizing<String>>,
         cancellation: &CancellationToken,
     ) -> Result<(), AppError> {
-        let command = firewall_allow_command(instance.endpoint.port);
+        let listeners = instance.listeners();
+        let command = firewall_allow_command(&listeners);
         self.checked_execute(host, trusted, passphrase, &command, cancellation)
             .await
             .map(|_| ())
             .map_err(|mut error| {
                 error.code = "remote_firewall".into();
                 error.message = format!(
-                    "The remote firewall could not be opened for UDP port {}.",
-                    instance.endpoint.port
+                    "The remote firewall could not be opened for {}.",
+                    listener_summary(&listeners)
                 );
                 error.scope = Some(instance.id.to_string());
                 error.remediation = Some(
@@ -1984,15 +2050,16 @@ docker compose restart gateway
         passphrase: Option<&Zeroizing<String>>,
         cancellation: &CancellationToken,
     ) -> Result<(), AppError> {
-        let command = firewall_remove_command(instance.endpoint.port);
+        let listeners = instance.listeners();
+        let command = firewall_remove_command(&listeners);
         self.checked_execute(host, trusted, passphrase, &command, cancellation)
             .await
             .map(|_| ())
             .map_err(|mut error| {
                 error.code = "remote_firewall".into();
                 error.message = format!(
-                    "The remote firewall rule for UDP port {} could not be removed.",
-                    instance.endpoint.port
+                    "The remote firewall rules for {} could not be removed.",
+                    listener_summary(&listeners)
                 );
                 error.scope = Some(instance.id.to_string());
                 error.remediation = Some(
@@ -2046,41 +2113,20 @@ docker compose restart gateway
         passphrase: Option<&Zeroizing<String>>,
         cancellation: &CancellationToken,
     ) -> Result<InstanceHealth, AppError> {
-        let expected_peers = state
+        let expected_clients = state
             .devices
             .iter()
             .filter(|device| device.enabled && device.deleted_at.is_none())
             .count();
-        let command = format!(
-            r#"set +e
-cd {path} || exit 0
-services="$(docker compose ps --status running --services 2>/dev/null)"
-statuses="$(docker compose ps --all --format '{{{{.Service}}}}|{{{{.State}}}}|{{{{.Health}}}}|{{{{.Status}}}}' 2>/dev/null)"
-status_for() {{
-  printf '%s\n' "$statuses" | awk -F'|' -v service="$1" '$1 == service {{ health = ($3 == "" ? "none" : $3); print $2 "/" health " " $4; exit }}'
-}}
-printf 'project=1\n'
-printf 'gateway=%s\n' "$(printf '%s\n' "$services" | grep -qx gateway; echo $?)"
-printf 'dns=%s\n' "$(printf '%s\n' "$services" | grep -qx dns; echo $?)"
-printf 'watchtower=%s\n' "$(printf '%s\n' "$services" | grep -qx watchtower; echo $?)"
-printf 'gateway_status=%s\n' "$(status_for gateway)"
-printf 'dns_status=%s\n' "$(status_for dns)"
-printf 'watchtower_status=%s\n' "$(status_for watchtower)"
-docker compose exec -T gateway wg show wg0 >/dev/null 2>&1
-printf 'wireguard=%s\n' "$?"
-peer_count="$(docker compose exec -T gateway wg show wg0 peers 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')"
-printf 'peer_count=%s\n' "$peer_count"
-docker compose port --protocol udp gateway 51820 2>/dev/null | grep -Eq ':{port}$'
-printf 'port=%s\n' "$?"
-docker compose exec -T gateway nslookup gateway.{zone} 127.0.0.1 >/dev/null 2>&1
-printf 'private_dns=%s\n' "$?"
-docker compose exec -T gateway nslookup example.com 127.0.0.1 >/dev/null 2>&1
-printf 'public_dns=%s\n' "$?"
-"#,
-            path = shell_quote(&state.instance.remote_path()),
-            zone = state.instance.dns.zone,
-            port = state.instance.endpoint.port,
-        );
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
+        let runtime = backend
+            .runtime(&state.instance.backend_settings)
+            .map_err(backend_error)?;
+        let capabilities = backend.capabilities();
+        let command = remote_health_command(state, &runtime, capabilities.managed_dns);
         let result = self
             .transport
             .execute(
@@ -2095,15 +2141,23 @@ printf 'public_dns=%s\n' "$?"
         let text = result.stdout_text().map_err(ssh_error)?;
         let values = parse_key_values(&text);
         let zero = |key: &str| values.get(key).is_some_and(|value| value == "0");
-        let peer_count = values
-            .get("peer_count")
+        let client_count = values
+            .get("client_count")
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or_default();
+        let listeners_ready = state
+            .instance
+            .listeners()
+            .iter()
+            .enumerate()
+            .all(|(index, _)| zero(&format!("listener_{index}")));
+        let backend_ready = zero("backend");
+        let client_state_matches = client_count == expected_clients;
         let mut details = Vec::new();
         for (label, key) in [
             ("Gateway status", "gateway_status"),
             ("DNS status", "dns_status"),
-            ("Watchtower status", "watchtower_status"),
+            ("Backend probe", "backend_status"),
         ] {
             if let Some(status) = values.get(key).filter(|value| !value.is_empty()) {
                 details.push(format!("{label}: {status}"));
@@ -2112,15 +2166,105 @@ printf 'public_dns=%s\n' "$?"
         Ok(InstanceHealth {
             compose_project_exists: values.get("project").is_some_and(|value| value == "1"),
             gateway_running: zero("gateway"),
+            backend_ready,
+            listeners_ready,
+            client_state_matches,
+            dns_required: capabilities.managed_dns,
             dns_running: zero("dns"),
-            watchtower_running: zero("watchtower"),
+            watchtower_running: false,
             private_dns_resolves: zero("private_dns"),
             public_dns_resolves: zero("public_dns"),
-            wireguard_interface_exists: zero("wireguard"),
-            listen_port_matches: zero("port"),
-            expected_peers_present: peer_count == expected_peers,
+            wireguard_interface_exists: matches!(
+                runtime.health,
+                BackendHealthProbe::WireGuardLike { .. }
+            ) && backend_ready,
+            listen_port_matches: listeners_ready,
+            expected_peers_present: client_state_matches,
             details,
         })
+    }
+
+    async fn persist_discovered_public_identity(
+        &self,
+        state: &DesiredState,
+        host: &DockerHost,
+        trusted: &vam_storage::KnownHostKey,
+        passphrase: Option<&Zeroizing<String>>,
+        cancellation: &CancellationToken,
+    ) -> Result<(), AppError> {
+        let BackendSettings::Xray(settings) = &state.instance.backend_settings else {
+            return Ok(());
+        };
+        if settings.security != XraySecurity::Reality {
+            return Ok(());
+        }
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
+        let runtime = backend
+            .runtime(&state.instance.backend_settings)
+            .map_err(backend_error)?;
+        let public_relative = runtime_host_path(&runtime, REALITY_PUBLIC_KEY_PATH)
+            .ok_or_else(|| validation_error("Xray public identity path is not mounted."))?;
+        let short_id_relative = runtime_host_path(&runtime, REALITY_SHORT_ID_PATH)
+            .ok_or_else(|| validation_error("Xray short-ID path is not mounted."))?;
+        let public_path = format!("{}/{}", state.instance.remote_path(), public_relative);
+        let short_id_path = format!("{}/{}", state.instance.remote_path(), short_id_relative);
+        let command = format!(
+            "set -eu; test -s {public}; test -s {short}; printf 'reality_public_key='; tr -d '\\r\\n' < {public}; printf '\\nreality_short_id='; tr -d '\\r\\n' < {short}; printf '\\n'",
+            public = shell_quote(&public_path),
+            short = shell_quote(&short_id_path),
+        );
+        let result = self
+            .checked_execute(host, trusted, passphrase, &command, cancellation)
+            .await?;
+        let values = parse_key_values(&result.stdout_text().map_err(ssh_error)?);
+        let public_key = values
+            .get("reality_public_key")
+            .cloned()
+            .ok_or_else(|| validation_error("Xray did not expose its REALITY public key."))?;
+        let short_id = values
+            .get("reality_short_id")
+            .cloned()
+            .ok_or_else(|| validation_error("Xray did not expose its REALITY short ID."))?;
+        if let (Some(previous_key), Some(previous_short_id)) = (
+            settings.reality_public_key.as_ref(),
+            settings.reality_short_id.as_ref(),
+        ) && (previous_key != &public_key || previous_short_id != &short_id)
+        {
+            return Err(AppError {
+                code: "xray_public_identity_changed".into(),
+                message:
+                    "The remote Xray REALITY identity differs from the approved public identity."
+                        .into(),
+                scope: Some(state.instance.id.to_string()),
+                remote_state_changed: true,
+                rollback_succeeded: None,
+                remediation: Some(
+                    "Restore the expected backup or explicitly replace the Xray server identity."
+                        .into(),
+                ),
+                technical_detail: None,
+            });
+        }
+        if settings.reality_public_key.as_ref() == Some(&public_key)
+            && settings.reality_short_id.as_ref() == Some(&short_id)
+        {
+            return Ok(());
+        }
+        let mut discovered = state.clone();
+        let BackendSettings::Xray(settings) = &mut discovered.instance.backend_settings else {
+            unreachable!("the cloned settings retain their backend")
+        };
+        settings.reality_public_key = Some(public_key);
+        settings.reality_short_id = Some(short_id);
+        backend.validate(&discovered).map_err(backend_error)?;
+        discovered.instance.updated_at = Utc::now();
+        self.storage
+            .save_instance(&discovered.instance)
+            .await
+            .map_err(storage_error)
     }
 
     async fn normalize_vpn_ownership(
@@ -2131,16 +2275,18 @@ printf 'public_dns=%s\n' "$?"
         passphrase: Option<&Zeroizing<String>>,
         cancellation: &CancellationToken,
     ) -> Result<(), AppError> {
-        let command = format!(
-            r#"set -eu
-docker run --rm --entrypoint sh \
-  -e VAM_UID="$(id -u)" -e VAM_GID="$(id -g)" \
-  -v {vpn_mount} {image} \
-  -c 'chown -R "$VAM_UID:$VAM_GID" /work'
-"#,
-            vpn_mount = shell_quote(&format!("{}/vpn:/work", state.instance.remote_path())),
-            image = shell_quote(WIREGUARD_IMAGE),
-        );
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
+        let runtime = backend
+            .runtime(&state.instance.backend_settings)
+            .map_err(backend_error)?;
+        let Some(command) =
+            normalize_host_mount_ownership_command(&state.instance.remote_path(), &runtime)
+        else {
+            return Ok(());
+        };
         self.checked_execute(host, trusted, passphrase, &command, cancellation)
             .await
             .map(|_| ())
@@ -2181,6 +2327,14 @@ impl DeploymentExecutor for ApplicationService {
         cancellation: &CancellationToken,
     ) -> Result<DeploymentResult, AppError> {
         let (host, trusted, passphrase) = self.trusted_host(state.instance.host_id).await?;
+        let backend = self
+            .backends
+            .get(state.instance.backend)
+            .map_err(backend_error)?;
+        let runtime = backend
+            .runtime(&state.instance.backend_settings)
+            .map_err(backend_error)?;
+        let capabilities = backend.capabilities();
         let rollback_state = self
             .storage
             .last_successful_deployment(state.instance.id)
@@ -2271,18 +2425,8 @@ install -d {instances} {staging_root} {backups} {trash} {stage}
                 .map_err(storage_error)?;
             return Err(error);
         }
-        let port_check = format!(
-            r#"set -eu
-if ss -H -lun | awk -v port=':{port}' '$5 ~ (port "$") {{ found=1 }} END {{ exit !found }}'; then
-  if test ! -d {current} || test -z "$(cd {current} && docker compose ps -q gateway 2>/dev/null)"; then
-    printf 'UDP port {port} is already in use\n' >&2
-    exit 42
-  fi
-fi
-"#,
-            port = state.instance.endpoint.port,
-            current = shell_quote(&state.instance.remote_path()),
-        );
+        let listeners = state.instance.listeners();
+        let port_check = port_conflict_command(&state.instance, &runtime);
         self.checked_execute(
             &host,
             &trusted,
@@ -2292,13 +2436,13 @@ fi
         )
         .await
         .map_err(|mut error| {
-            error.code = "udp_port_conflict".into();
+            error.code = "listener_port_conflict".into();
             error.message = format!(
-                "UDP port {} is already in use on the host.",
-                state.instance.endpoint.port
+                "One or more required listeners ({}) are already in use on the host.",
+                listener_summary(&listeners)
             );
             error.remediation =
-                Some("Choose an unused UDP port or stop the conflicting service.".into());
+                Some("Choose unused listener ports or stop the conflicting host service.".into());
             error
         })?;
         let directories = rendered_directories(files);
@@ -2344,56 +2488,66 @@ fi
             plan.id,
             &mut sequence,
             "images",
-            "Pulling the pinned WireGuard and CoreDNS images.",
+            "Preparing the selected pinned backend image and optional DNS image.",
             None,
             "info",
         )
         .await?;
-        let pull = format!(
-            "set -eu; docker pull {}; docker pull {}",
-            shell_quote(WIREGUARD_IMAGE),
-            shell_quote(COREDNS_IMAGE),
-        );
-        self.checked_execute(&host, &trusted, passphrase.as_ref(), &pull, cancellation)
-            .await?;
-        let key_command = format!(
-            r#"set -eu
-if test -r {current_key}; then cp {current_key} {stage_key}; fi
-docker run --rm --entrypoint sh -v {vpn_mount} {image} -c 'set -eu; umask 077; test -s /work/server.key || wg genkey > /work/server.key; wg pubkey < /work/server.key; awk '"'"'{{ if ($0 == "PrivateKey = __VAM_SERVER_PRIVATE_KEY__") {{ getline key < "/work/server.key"; print "PrivateKey = " key }} else print }}'"'"' /work/wg0.conf.template > /work/wg0.conf; chmod 0600 /work/server.key /work/wg0.conf'
-"#,
-            current_key = shell_quote(&format!("{}/vpn/server.key", state.instance.remote_path())),
-            stage_key = shell_quote(&format!("{stage}/vpn/server.key")),
-            vpn_mount = shell_quote(&format!("{stage}/vpn:/work")),
-            image = shell_quote(WIREGUARD_IMAGE),
-        );
-        let public_result = self
-            .checked_execute(
-                &host,
-                &trusted,
-                passphrase.as_ref(),
-                &key_command,
-                cancellation,
+        let prepare_images = if plan.operations.iter().any(|operation| {
+            matches!(
+                operation,
+                DeploymentOperation::ComposePull | DeploymentOperation::ComposeBuild
             )
-            .await?;
-        let server_public = public_result.stdout_text().map_err(ssh_error)?;
-        let server_public = server_public.trim();
-        if server_public.len() != 44 {
-            self.storage
-                .finish_deployment(plan.id, DeploymentStatus::Failed, None)
-                .await
-                .map_err(storage_error)?;
-            return Err(AppError {
-                code: "server_key_generation_failed".into(),
-                message: "The remote WireGuard image did not return a valid public key.".into(),
-                scope: Some(state.instance.id.to_string()),
-                remote_state_changed: false,
-                rollback_succeeded: None,
-                remediation: Some("Inspect Docker and the pinned WireGuard image.".into()),
-                technical_detail: None,
-            });
-        }
+        }) {
+            image_prepare_command(&stage, &runtime, capabilities.managed_dns)
+        } else {
+            "true".into()
+        };
+        self.checked_execute(
+            &host,
+            &trusted,
+            passphrase.as_ref(),
+            &prepare_images,
+            cancellation,
+        )
+        .await?;
+        let server_public = if let Some(identity_command) =
+            materialize_server_identity_command(&state.instance.remote_path(), &stage, &runtime)
+        {
+            let result = self
+                .checked_execute(
+                    &host,
+                    &trusted,
+                    passphrase.as_ref(),
+                    &identity_command,
+                    cancellation,
+                )
+                .await?;
+            let values = parse_key_values(&result.stdout_text().map_err(ssh_error)?);
+            let public = values
+                .get("server_public_key")
+                .filter(|value| value.len() == 44)
+                .cloned()
+                .ok_or_else(|| AppError {
+                    code: "server_key_generation_failed".into(),
+                    message: format!(
+                        "The remote {} runtime did not return a valid public key.",
+                        state.instance.backend
+                    ),
+                    scope: Some(state.instance.id.to_string()),
+                    remote_state_changed: false,
+                    rollback_succeeded: None,
+                    remediation: Some(
+                        "Inspect Docker and the selected pinned backend image.".into(),
+                    ),
+                    technical_detail: None,
+                })?;
+            Some(public)
+        } else {
+            None
+        };
         let mut manifest = build_manifest(files);
-        manifest.server_public_key = Some(server_public.into());
+        manifest.server_public_key.clone_from(&server_public);
         manifest.deployed_at = Some(Utc::now().to_rfc3339());
         let state_json = format!(
             "{}\n",
@@ -2415,27 +2569,12 @@ docker run --rm --entrypoint sh -v {vpn_mount} {image} -c 'set -eu; umask 077; t
             plan.id,
             &mut sequence,
             "validate",
-            "Validating WireGuard, CoreDNS, and Compose configuration.",
+            "Validating the selected backend, optional DNS, and Compose configuration.",
             None,
             "info",
         )
         .await?;
-        let validate = format!(
-            r#"set -eu
-docker run --rm --entrypoint sh -v {vpn_mount} {wg_image} -c 'wg-quick strip /work/wg0.conf >/dev/null'
-cid="$(docker run -d --rm -v {dns_mount} {dns_image} -conf /etc/coredns/Corefile)"
-sleep 1
-test "$(docker inspect -f '{{{{.State.Running}}}}' "$cid")" = true
-docker rm -f "$cid" >/dev/null
-cd {stage}
-docker compose --env-file .env config --quiet
-"#,
-            vpn_mount = shell_quote(&format!("{stage}/vpn:/work:ro")),
-            wg_image = shell_quote(WIREGUARD_IMAGE),
-            dns_mount = shell_quote(&format!("{stage}/dns:/etc/coredns:ro")),
-            dns_image = shell_quote(COREDNS_IMAGE),
-            stage = shell_quote(&stage),
-        );
+        let validate = validation_command(&stage, &runtime, capabilities.managed_dns);
         if let Err(error) = self
             .checked_execute(
                 &host,
@@ -2476,8 +2615,8 @@ docker compose --env-file .env config --quiet
             "info",
         )
         .await?;
-        let activate = activation_command(&current, &stage, files, plan);
-        let activation_result = self
+        let activate = activation_command(&current, &stage, files, plan, &runtime);
+        let mut activation_result = self
             .checked_execute(
                 &host,
                 &trusted,
@@ -2486,6 +2625,13 @@ docker compose --env-file .env config --quiet
                 cancellation,
             )
             .await;
+        if activation_result.is_ok()
+            && let Some(command) = prepare_numeric_mount_ownership_command(&current, &runtime)
+        {
+            activation_result = self
+                .checked_execute(&host, &trusted, passphrase.as_ref(), &command, cancellation)
+                .await;
+        }
         if let Err(mut error) = activation_result {
             error.remote_state_changed = true;
             let rollback_ok = self
@@ -2494,7 +2640,7 @@ docker compose --env-file .env config --quiet
                     &host,
                     &trusted,
                     passphrase.as_ref(),
-                    &backup,
+                    rollback_state.as_ref().map(|_| backup.as_str()),
                     cancellation,
                 )
                 .await
@@ -2524,7 +2670,7 @@ docker compose --env-file .env config --quiet
             plan.id,
             &mut sequence,
             "firewall",
-            "Ensuring active host firewalls allow the WireGuard UDP port.",
+            "Ensuring active host firewalls allow every declared backend listener.",
             None,
             "info",
         )
@@ -2546,7 +2692,7 @@ docker compose --env-file .env config --quiet
                     &host,
                     &trusted,
                     passphrase.as_ref(),
-                    &backup,
+                    rollback_state.as_ref().map(|_| backup.as_str()),
                     cancellation,
                 )
                 .await
@@ -2563,23 +2709,7 @@ docker compose --env-file .env config --quiet
                 .map_err(storage_error)?;
             return Err(error);
         }
-        let compose_command = if plan
-            .operations
-            .iter()
-            .any(|operation| matches!(operation, DeploymentOperation::ReloadDns))
-        {
-            "true"
-        } else if plan.operations.iter().any(|operation| {
-            matches!(
-                operation,
-                DeploymentOperation::ComposeRestart { service } if service == "gateway"
-            )
-        }) {
-            "docker compose restart gateway && docker compose restart dns"
-        } else {
-            "docker compose pull && docker compose up -d --remove-orphans"
-        };
-        let compose = format!("set -eu; cd {}; {compose_command}", shell_quote(&current));
+        let compose = compose_activation_command(&current, plan, capabilities.managed_dns);
         let compose_result = self
             .checked_execute(&host, &trusted, passphrase.as_ref(), &compose, cancellation)
             .await;
@@ -2588,16 +2718,30 @@ docker compose --env-file .env config --quiet
                 .wait_for_healthy(state, &host, &trusted, passphrase.as_ref(), cancellation)
                 .await
             {
-                Ok(health) if health_is_healthy(&health) => self
-                    .normalize_vpn_ownership(
-                        rollback_health_state,
-                        &host,
-                        &trusted,
-                        passphrase.as_ref(),
-                        cancellation,
-                    )
-                    .await
-                    .map(|()| health),
+                Ok(health) if health_is_healthy(&health) => {
+                    match self
+                        .persist_discovered_public_identity(
+                            state,
+                            &host,
+                            &trusted,
+                            passphrase.as_ref(),
+                            cancellation,
+                        )
+                        .await
+                    {
+                        Ok(()) => self
+                            .normalize_vpn_ownership(
+                                state,
+                                &host,
+                                &trusted,
+                                passphrase.as_ref(),
+                                cancellation,
+                            )
+                            .await
+                            .map(|()| health),
+                        Err(error) => Err(error),
+                    }
+                }
                 result => result,
             }
         } else {
@@ -2612,7 +2756,7 @@ docker compose --env-file .env config --quiet
                         &host,
                         &trusted,
                         passphrase.as_ref(),
-                        &backup,
+                        rollback_state.as_ref().map(|_| backup.as_str()),
                         cancellation,
                     )
                     .await
@@ -2644,7 +2788,7 @@ docker compose --env-file .env config --quiet
                         &host,
                         &trusted,
                         passphrase.as_ref(),
-                        &backup,
+                        rollback_state.as_ref().map(|_| backup.as_str()),
                         cancellation,
                     )
                     .await
@@ -2663,17 +2807,16 @@ docker compose --env-file .env config --quiet
                 return Err(error);
             }
         };
-        self.storage
-            .set_setting(
-                &server_public_key_setting(state.instance.id),
-                &server_public,
-            )
-            .await
-            .map_err(storage_error)?;
+        if let Some(server_public) = &server_public {
+            self.storage
+                .set_setting(&server_public_key_setting(state.instance.id), server_public)
+                .await
+                .map_err(storage_error)?;
+        }
         let cleanup_stage = format!(
-            "docker run --rm --entrypoint sh -v {root_mount} {image} -c {script}",
+            "docker run --rm --user 0:0 --entrypoint sh -v {root_mount} {image} -c {script}",
             root_mount = shell_quote(&format!("{APP_ROOT}:/vam")),
-            image = shell_quote(WIREGUARD_IMAGE),
+            image = shell_quote(runtime_image_reference(&runtime)),
             script = shell_quote(&format!(
                 "rm -rf -- /vam/staging/{}-{}",
                 state.instance.id, plan.id
@@ -2768,7 +2911,7 @@ impl ApplicationService {
         host: &DockerHost,
         trusted: &vam_storage::KnownHostKey,
         passphrase: Option<&Zeroizing<String>>,
-        backup: &str,
+        backup: Option<&str>,
         cancellation: &CancellationToken,
     ) -> Result<InstanceHealth, AppError> {
         let current = state.instance.remote_path();
@@ -2777,14 +2920,27 @@ impl ApplicationService {
             state.instance.id,
             Utc::now().format("%Y%m%dT%H%M%SZ")
         );
-        let command = format!(
-            "set -eu; if test -d {current}; then cd {current}; docker compose down || true; cd /; mv {current} {failed}; fi; cp -a {backup} {current}; cd {current}; docker compose up -d",
-            current = shell_quote(&current),
-            failed = shell_quote(&failed),
-            backup = shell_quote(backup),
-        );
+        let command = if let Some(backup) = backup {
+            format!(
+                "set -eu; test -d {backup}; if test -d {current}; then cd {current}; docker compose down || true; cd /; mv {current} {failed}; fi; cp -a {backup} {current}; cd {current}; docker compose up -d",
+                current = shell_quote(&current),
+                failed = shell_quote(&failed),
+                backup = shell_quote(backup),
+            )
+        } else {
+            format!(
+                "set -eu; if test -d {current}; then cd {current}; docker compose down || true; cd /; mv {current} {failed}; fi",
+                current = shell_quote(&current),
+                failed = shell_quote(&failed),
+            )
+        };
         self.checked_execute(host, trusted, passphrase, &command, cancellation)
             .await?;
+        if backup.is_none() {
+            self.remove_firewall_allow(&state.instance, host, trusted, passphrase, cancellation)
+                .await?;
+            return Ok(InstanceHealth::default());
+        }
         let health = self
             .wait_for_healthy(state, host, trusted, passphrase, cancellation)
             .await?;
@@ -2838,6 +2994,7 @@ fn activation_command(
     stage: &str,
     files: &[RenderedFile],
     plan: &DeploymentPlan,
+    runtime: &BackendRuntimeSpec,
 ) -> String {
     let mut command = format!("set -eu; install -d {}", shell_quote(current));
     for directory in rendered_directories(files) {
@@ -2862,20 +3019,26 @@ fn activation_command(
             shell_quote(&format!("{current}/{path}"))
         ));
     }
-    if plan
-        .operations
-        .iter()
-        .any(|operation| matches!(operation, DeploymentOperation::GenerateServerKey))
-        || plan.operations.iter().any(|operation| {
-            matches!(
-                operation,
-                DeploymentOperation::UploadFile { path, .. }
-                    | DeploymentOperation::ReplaceFile { path, .. }
-                    if path == "vpn/wg0.conf.template"
-            )
-        })
+    if let ServerIdentityStrategy::WireGuardLike {
+        private_key_path,
+        template_path,
+        materialized_path,
+        ..
+    } = runtime.identity
+        && (plan
+            .operations
+            .iter()
+            .any(|operation| matches!(operation, DeploymentOperation::GenerateServerKey))
+            || plan.operations.iter().any(|operation| {
+                matches!(
+                    operation,
+                    DeploymentOperation::UploadFile { path, .. }
+                        | DeploymentOperation::ReplaceFile { path, .. }
+                        if path == template_path
+                )
+            }))
     {
-        for path in ["vpn/server.key", "vpn/wg0.conf"] {
+        for path in [private_key_path, materialized_path] {
             command.push_str(&format!(
                 "; mv {} {}",
                 shell_quote(&format!("{stage}/{path}")),
@@ -2914,42 +3077,510 @@ fn prune_command(instance_id: Uuid, retention: usize) -> String {
     )
 }
 
-fn firewall_allow_command(port: u16) -> String {
+fn remote_health_command(
+    state: &DesiredState,
+    runtime: &BackendRuntimeSpec,
+    managed_dns: bool,
+) -> String {
+    let mut command = format!(
+        r#"set +e
+cd {path} || exit 0
+services="$(docker compose ps --status running --services 2>/dev/null)"
+statuses="$(docker compose ps --all --format '{{{{.Service}}}}|{{{{.State}}}}|{{{{.Health}}}}|{{{{.Status}}}}' 2>/dev/null)"
+status_for() {{
+  printf '%s\n' "$statuses" | awk -F'|' -v service="$1" '$1 == service {{ health = ($3 == "" ? "none" : $3); print $2 "/" health " " $4; exit }}'
+}}
+printf 'project=1\n'
+printf 'gateway=%s\n' "$(printf '%s\n' "$services" | grep -qx gateway; echo $?)"
+printf 'dns=%s\n' "$(printf '%s\n' "$services" | grep -qx dns; echo $?)"
+printf 'gateway_status=%s\n' "$(status_for gateway)"
+printf 'dns_status=%s\n' "$(status_for dns)"
+"#,
+        path = shell_quote(&state.instance.remote_path()),
+    );
+    match runtime.health {
+        BackendHealthProbe::WireGuardLike { tool, interface } => {
+            write!(
+                command,
+                r#"
+docker compose exec -T gateway {tool} show {interface} >/dev/null 2>&1
+printf 'backend=%s\n' "$?"
+client_count="$(docker compose exec -T gateway {tool} show {interface} peers 2>/dev/null | sed '/^$/d' | wc -l | tr -d ' ')"
+printf 'client_count=%s\n' "$client_count"
+printf 'backend_status={tool} interface {interface}\n'
+"#
+            )
+            .expect("writing to a String cannot fail");
+        }
+        BackendHealthProbe::OpenVpn => {
+            command.push_str(
+                r#"
+docker compose exec -T gateway sh -c 'pidof openvpn >/dev/null && test -s /run/openvpn/status.log' >/dev/null 2>&1
+printf 'backend=%s\n' "$?"
+client_count="$(docker compose exec -T gateway sh -c 'find /etc/openvpn/ccd -maxdepth 1 -type f ! -name .keep -print 2>/dev/null | wc -l' | tr -d ' ')"
+printf 'client_count=%s\n' "$client_count"
+printf 'backend_status=OpenVPN process and status file\n'
+"#,
+            );
+        }
+        BackendHealthProbe::Ikev2 => {
+            command.push_str(
+                r#"
+docker compose exec -T gateway sh -c 'pidof charon >/dev/null && swanctl --list-conns >/dev/null' >/dev/null 2>&1
+printf 'backend=%s\n' "$?"
+client_count="$(docker compose exec -T gateway sh -c "swanctl --list-conns 2>/dev/null | grep -Ec '^client-[0-9a-f]{32}:'" | tr -d ' ')"
+printf 'client_count=%s\n' "$client_count"
+printf 'backend_status=strongSwan daemon and loaded connections\n'
+"#,
+            );
+        }
+        BackendHealthProbe::Xray => {
+            let BackendValidation::Xray { config_path } = runtime.validation else {
+                unreachable!("Xray health requires Xray validation metadata")
+            };
+            writeln!(
+                command,
+                r#"
+docker compose exec -T gateway xray run -test -c {config_path} >/dev/null 2>&1
+printf 'backend=%s\n' "$?"
+client_count="$(docker compose exec -T gateway jq -r '.inbounds[0].settings.clients | length' {config_path} 2>/dev/null | tr -d ' ')"
+printf 'client_count=%s\n' "$client_count"
+printf 'backend_status=Xray active configuration self-test\n'"#,
+                config_path = shell_quote(config_path),
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    for (index, (host, container)) in state
+        .instance
+        .listeners()
+        .iter()
+        .zip(&runtime.container_listeners)
+        .enumerate()
+    {
+        writeln!(
+            command,
+            r#"docker compose port --protocol {protocol} gateway {container_port} 2>/dev/null | grep -Eq ':{host_port}$'
+printf 'listener_{index}=%s\n' "$?""#,
+            protocol = host.protocol,
+            container_port = container.port,
+            host_port = host.port,
+        )
+        .expect("writing to a String cannot fail");
+    }
+    if managed_dns {
+        writeln!(
+            command,
+            r#"docker compose exec -T gateway nslookup gateway.{zone} 127.0.0.1 >/dev/null 2>&1
+printf 'private_dns=%s\n' "$?"
+docker compose exec -T gateway nslookup example.com 127.0.0.1 >/dev/null 2>&1
+printf 'public_dns=%s\n' "$?""#,
+            zone = state.instance.dns.zone,
+        )
+        .expect("writing to a String cannot fail");
+    } else {
+        command.push_str("printf 'private_dns=1\\npublic_dns=1\\n'\n");
+    }
+    command
+}
+
+fn port_conflict_command(instance: &VpnInstance, runtime: &BackendRuntimeSpec) -> String {
+    let mut command = String::from("set -eu\n");
+    let current = shell_quote(&instance.remote_path());
+    for (host, container) in instance
+        .listeners()
+        .iter()
+        .zip(&runtime.container_listeners)
+    {
+        let ss_mode = match host.protocol {
+            TransportProtocol::Tcp => "-ltn",
+            TransportProtocol::Udp => "-lun",
+        };
+        writeln!(
+            command,
+            r"if ss -H {ss_mode} | awk '{{print $5}}' | grep -Eq ':{host_port}$'; then
+  if test ! -d {current} || ! (cd {current} && docker compose port --protocol {protocol} gateway {container_port} 2>/dev/null | grep -Eq ':{host_port}$'); then
+    printf '{protocol_upper} port {host_port} is already in use\n' >&2
+    exit 42
+  fi
+fi",
+            host_port = host.port,
+            protocol = host.protocol,
+            protocol_upper = host.protocol.as_str().to_ascii_uppercase(),
+            container_port = container.port,
+        )
+        .expect("writing to a String cannot fail");
+    }
+    command
+}
+
+fn image_prepare_command(stage: &str, runtime: &BackendRuntimeSpec, managed_dns: bool) -> String {
+    let mut command = String::from("set -eu");
+    match runtime.image {
+        ContainerImage::Pull(reference) => {
+            write!(command, "; docker pull {}", shell_quote(reference))
+                .expect("writing to a String cannot fail");
+        }
+        ContainerImage::Build { .. } => {
+            write!(
+                command,
+                "; cd {}; docker compose --env-file .env build gateway",
+                shell_quote(stage)
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    if managed_dns {
+        write!(command, "; docker pull {}", shell_quote(COREDNS_IMAGE))
+            .expect("writing to a String cannot fail");
+    }
+    command
+}
+
+fn compose_activation_command(current: &str, plan: &DeploymentPlan, managed_dns: bool) -> String {
+    let operation = if plan
+        .operations
+        .iter()
+        .any(|operation| matches!(operation, DeploymentOperation::ReloadDns))
+    {
+        "docker compose restart dns".to_owned()
+    } else if plan.operations.iter().any(|operation| {
+        matches!(
+            operation,
+            DeploymentOperation::ComposeRestart { service } if service == "gateway"
+        )
+    }) {
+        if managed_dns {
+            "docker compose restart gateway && docker compose restart dns".into()
+        } else {
+            "docker compose restart gateway".into()
+        }
+    } else if plan
+        .operations
+        .iter()
+        .any(|operation| matches!(operation, DeploymentOperation::ComposeUp))
+    {
+        "docker compose up -d --remove-orphans".into()
+    } else {
+        "true".into()
+    };
+    format!("set -eu; cd {}; {operation}", shell_quote(current))
+}
+
+fn runtime_image_reference(runtime: &BackendRuntimeSpec) -> &'static str {
+    match runtime.image {
+        ContainerImage::Pull(reference) => reference,
+        ContainerImage::Build { tag, .. } => tag,
+    }
+}
+
+fn prepare_numeric_mount_ownership_command(
+    current: &str,
+    runtime: &BackendRuntimeSpec,
+) -> Option<String> {
+    let mut command = String::from("set -eu");
+    let mut changed = false;
+    for mount in runtime.mounts.iter().filter(|mount| {
+        !mount.read_only && matches!(mount.ownership, ContainerMountOwnership::Numeric { .. })
+    }) {
+        let ContainerMountOwnership::Numeric { uid, gid } = mount.ownership else {
+            unreachable!("the iterator retains only numeric ownership")
+        };
+        let bind = format!("{current}/{}:/work", mount.host_path);
+        write!(
+            command,
+            "; docker run --rm --user 0:0 --entrypoint sh -v {} {} -c {}",
+            shell_quote(&bind),
+            shell_quote(runtime_image_reference(runtime)),
+            shell_quote(&format!("chown -R {uid}:{gid} /work"))
+        )
+        .expect("writing to a String cannot fail");
+        changed = true;
+    }
+    changed.then_some(command)
+}
+
+fn normalize_host_mount_ownership_command(
+    current: &str,
+    runtime: &BackendRuntimeSpec,
+) -> Option<String> {
+    let mut command = String::from("set -eu");
+    let mut changed = false;
+    for mount in runtime
+        .mounts
+        .iter()
+        .filter(|mount| !mount.read_only && mount.ownership == ContainerMountOwnership::HostUser)
+    {
+        let bind = format!("{current}/{}:/work", mount.host_path);
+        write!(
+            command,
+            "; docker run --rm --user 0:0 --entrypoint sh -e VAM_UID=\"$(id -u)\" -e VAM_GID=\"$(id -g)\" -v {} {} -c {}",
+            shell_quote(&bind),
+            shell_quote(runtime_image_reference(runtime)),
+            shell_quote("chown -R \"$VAM_UID:$VAM_GID\" /work"),
+        )
+        .expect("writing to a String cannot fail");
+        changed = true;
+    }
+    changed.then_some(command)
+}
+
+fn materialize_server_identity_command(
+    current: &str,
+    stage: &str,
+    runtime: &BackendRuntimeSpec,
+) -> Option<String> {
+    let ServerIdentityStrategy::WireGuardLike {
+        tool,
+        private_key_path,
+        template_path,
+        materialized_path,
+        sentinel,
+    } = runtime.identity
+    else {
+        return None;
+    };
+    let current_key = format!("{current}/{private_key_path}");
+    let stage_key = format!("{stage}/{private_key_path}");
+    let private_in_container = format!("/work/{private_key_path}");
+    let template_in_container = format!("/work/{template_path}");
+    let materialized_in_container = format!("/work/{materialized_path}");
+    let script = format!(
+        r#"set -eu
+umask 077
+private_key={private_key}
+template={template}
+materialized={materialized}
+test -s "$private_key" || {tool} genkey > "$private_key"
+public_key="$({tool} pubkey < "$private_key")"
+awk -v sentinel={sentinel} -v key_file="$private_key" '
+  $0 == "PrivateKey = " sentinel {{
+    if ((getline key < key_file) <= 0) exit 42
+    print "PrivateKey = " key
+    next
+  }}
+  {{ print }}
+' "$template" > "$materialized"
+chmod 0600 "$private_key" "$materialized"
+printf 'server_public_key=%s\n' "$public_key"
+"#,
+        private_key = shell_quote(&private_in_container),
+        template = shell_quote(&template_in_container),
+        materialized = shell_quote(&materialized_in_container),
+        sentinel = shell_quote(sentinel),
+    );
+    let preserve = if current == stage {
+        String::new()
+    } else {
+        format!(
+            "if test -r {current_key}; then cp {current_key} {stage_key}; fi; ",
+            current_key = shell_quote(&current_key),
+            stage_key = shell_quote(&stage_key),
+        )
+    };
+    Some(format!(
+        "set -eu; {preserve}docker run --rm --entrypoint sh -v {stage_mount} {image} -c {script}",
+        stage_mount = shell_quote(&format!("{stage}:/work")),
+        image = shell_quote(runtime_image_reference(runtime)),
+        script = shell_quote(&script),
+    ))
+}
+
+fn runtime_container_path(runtime: &BackendRuntimeSpec, relative_path: &str) -> Option<String> {
+    runtime.mounts.iter().find_map(|mount| {
+        let suffix = if relative_path == mount.host_path {
+            Some("")
+        } else {
+            relative_path.strip_prefix(&format!("{}/", mount.host_path))
+        }?;
+        Some(if suffix.is_empty() {
+            mount.container_path.into()
+        } else {
+            format!("{}/{suffix}", mount.container_path.trim_end_matches('/'))
+        })
+    })
+}
+
+fn runtime_host_path(runtime: &BackendRuntimeSpec, container_path: &str) -> Option<String> {
+    runtime.mounts.iter().find_map(|mount| {
+        let suffix = if container_path == mount.container_path {
+            Some("")
+        } else {
+            container_path.strip_prefix(&format!("{}/", mount.container_path.trim_end_matches('/')))
+        }?;
+        Some(if suffix.is_empty() {
+            mount.host_path.into()
+        } else {
+            format!("{}/{suffix}", mount.host_path.trim_end_matches('/'))
+        })
+    })
+}
+
+fn validation_command(stage: &str, runtime: &BackendRuntimeSpec, managed_dns: bool) -> String {
+    let image = shell_quote(runtime_image_reference(runtime));
+    let mut command = String::from("set -eu");
+    match runtime.validation {
+        BackendValidation::WireGuardQuick { tool, config_path } => {
+            let container_config = runtime_container_path(runtime, config_path)
+                .expect("backend validation path must be under a declared mount");
+            let mount = runtime
+                .mounts
+                .iter()
+                .find(|mount| config_path.starts_with(mount.host_path))
+                .expect("backend validation path must be under a declared mount");
+            let mount_value = format!("{stage}/{}:{}:ro", mount.host_path, mount.container_path);
+            let script = format!(
+                "{} strip {} >/dev/null",
+                tool,
+                shell_quote(&container_config)
+            );
+            write!(
+                command,
+                "; docker run --rm --entrypoint sh -v {} {} -c {}",
+                shell_quote(&mount_value),
+                image,
+                shell_quote(&script)
+            )
+            .expect("writing to a String cannot fail");
+        }
+        BackendValidation::OpenVpn { config_path } => {
+            let container_config = runtime_container_path(runtime, config_path)
+                .expect("backend validation path must be under a declared mount");
+            let mount = runtime
+                .mounts
+                .iter()
+                .find(|mount| config_path.starts_with(mount.host_path))
+                .expect("backend validation path must be under a declared mount");
+            let mount_value = format!("{stage}/{}:{}:ro", mount.host_path, mount.container_path);
+            write!(
+                command,
+                "; docker run --rm --entrypoint openvpn -v {} {} --config {} --test-crypto",
+                shell_quote(&mount_value),
+                image,
+                shell_quote(&container_config)
+            )
+            .expect("writing to a String cannot fail");
+        }
+        BackendValidation::Ikev2 => {
+            write!(
+                command,
+                "; test -s {}; docker run --rm --entrypoint swanctl {} --version >/dev/null",
+                shell_quote(&format!("{stage}/ikev2/swanctl.conf")),
+                image
+            )
+            .expect("writing to a String cannot fail");
+        }
+        BackendValidation::Xray { .. } => {
+            write!(
+                command,
+                "; test -s {}; docker run --rm --entrypoint xray {} version >/dev/null",
+                shell_quote(&format!("{stage}/xray/server-template.json")),
+                image
+            )
+            .expect("writing to a String cannot fail");
+        }
+    }
+    if managed_dns {
+        let dns_mount = format!("{stage}/dns:/etc/coredns:ro");
+        write!(
+            command,
+            r#"; cid="$(docker run -d --rm -v {dns_mount} {dns_image} -conf /etc/coredns/Corefile)"; trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT HUP INT TERM; sleep 1; test "$(docker inspect -f '{{{{.State.Running}}}}' "$cid")" = true; docker rm -f "$cid" >/dev/null; cid=; trap - EXIT HUP INT TERM"#,
+            dns_mount = shell_quote(&dns_mount),
+            dns_image = shell_quote(COREDNS_IMAGE),
+        )
+        .expect("writing to a String cannot fail");
+    }
+    write!(
+        command,
+        "; cd {}; docker compose --env-file .env config --quiet",
+        shell_quote(stage)
+    )
+    .expect("writing to a String cannot fail");
+    command
+}
+
+fn firewall_allow_command(listeners: &[ListenerPort]) -> String {
+    let mut ufw_rules = String::new();
+    let mut firewalld_rules = String::new();
+    for listener in listeners {
+        writeln!(
+            ufw_rules,
+            "    sudo -n ufw allow {}/{} >/dev/null",
+            listener.port, listener.protocol
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            firewalld_rules,
+            "  sudo -n firewall-cmd --permanent --add-port={}/{} >/dev/null",
+            listener.port, listener.protocol
+        )
+        .expect("writing to a String cannot fail");
+    }
     format!(
         r"set -eu
 if command -v ufw >/dev/null 2>&1; then
   if sudo -n ufw status 2>/dev/null | grep -q '^Status: active'; then
-    sudo -n ufw allow {port}/udp >/dev/null
+{ufw_rules}\
   elif ! sudo -n ufw status >/dev/null 2>&1; then
     printf 'UFW is installed, but its status could not be checked with sudo -n.\n' >&2
     exit 43
   fi
 fi
 if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-  sudo -n firewall-cmd --permanent --add-port={port}/udp >/dev/null
+{firewalld_rules}\
   sudo -n firewall-cmd --reload >/dev/null
 fi
 "
     )
 }
 
-fn firewall_remove_command(port: u16) -> String {
+fn firewall_remove_command(listeners: &[ListenerPort]) -> String {
+    let mut ufw_rules = String::new();
+    let mut firewalld_rules = String::new();
+    for listener in listeners {
+        writeln!(
+            ufw_rules,
+            "    sudo -n ufw delete allow {}/{} >/dev/null 2>&1 || true",
+            listener.port, listener.protocol
+        )
+        .expect("writing to a String cannot fail");
+        writeln!(
+            firewalld_rules,
+            "  sudo -n firewall-cmd --permanent --remove-port={}/{} >/dev/null 2>&1 || true",
+            listener.port, listener.protocol
+        )
+        .expect("writing to a String cannot fail");
+    }
     format!(
         r"set -eu
 if command -v ufw >/dev/null 2>&1; then
   if sudo -n ufw status 2>/dev/null | grep -q '^Status: active'; then
-    sudo -n ufw delete allow {port}/udp >/dev/null 2>&1 || true
+{ufw_rules}\
   elif ! sudo -n ufw status >/dev/null 2>&1; then
     printf 'UFW is installed, but its status could not be checked with sudo -n.\n' >&2
     exit 43
   fi
 fi
 if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-  sudo -n firewall-cmd --permanent --remove-port={port}/udp >/dev/null 2>&1 || true
+{firewalld_rules}\
   sudo -n firewall-cmd --reload >/dev/null
 fi
 "
     )
+}
+
+fn listener_summary(listeners: &[ListenerPort]) -> String {
+    listeners
+        .iter()
+        .enumerate()
+        .fold(String::new(), |mut output, (index, listener)| {
+            if index > 0 {
+                output.push_str(", ");
+            }
+            write!(output, "{}/{}", listener.port, listener.protocol)
+                .expect("writing to a String cannot fail");
+            output
+        })
 }
 
 fn backup_path(instance_id: Uuid, name: &str) -> String {
@@ -2978,13 +3609,11 @@ fn parse_find_timestamp(value: &str) -> Option<chrono::DateTime<Utc>> {
 fn health_is_healthy(health: &InstanceHealth) -> bool {
     health.compose_project_exists
         && health.gateway_running
-        && health.dns_running
-        && health.watchtower_running
-        && health.private_dns_resolves
-        && health.public_dns_resolves
-        && health.wireguard_interface_exists
-        && health.listen_port_matches
-        && health.expected_peers_present
+        && health.backend_ready
+        && health.listeners_ready
+        && health.client_state_matches
+        && (!health.dns_required
+            || (health.dns_running && health.private_dns_resolves && health.public_dns_resolves))
 }
 
 fn parse_key_values(output: &str) -> HashMap<String, String> {
@@ -3306,9 +3935,9 @@ mod tests {
             commands.push(command.to_owned());
             if command.contains("services=\"$(docker compose ps --status running --services") {
                 let stdout = if after_stop {
-                    b"project=1\ngateway=1\ndns=1\nwatchtower=1\ngateway_status=running/none Up 1 second\ndns_status=running/none Up 1 second\nwatchtower_status=running/healthy Up 1 second (healthy)\nwireguard=1\npeer_count=0\nport=1\nprivate_dns=1\npublic_dns=1\n".to_vec()
+                    b"project=1\ngateway=1\ndns=1\ngateway_status=exited/none Exited (0)\ndns_status=exited/none Exited (0)\nbackend=1\nclient_count=0\nbackend_status=stopped\nlistener_0=1\nprivate_dns=1\npublic_dns=1\n".to_vec()
                 } else {
-                    b"project=1\ngateway=0\ndns=0\nwatchtower=0\ngateway_status=exited/none Exited (0)\ndns_status=exited/none Exited (0)\nwatchtower_status=restarting/unhealthy Restarting (1)\nwireguard=0\npeer_count=1\nport=0\nprivate_dns=0\npublic_dns=0\n".to_vec()
+                    b"project=1\ngateway=0\ndns=0\ngateway_status=running/none Up 1 second\ndns_status=running/none Up 1 second\nbackend=0\nclient_count=1\nbackend_status=ready\nlistener_0=0\nprivate_dns=0\npublic_dns=0\n".to_vec()
                 };
                 return Ok(CommandResult {
                     stdout,
@@ -3347,6 +3976,42 @@ mod tests {
         })
     }
 
+    fn command_state(kind: VpnBackendKind) -> DesiredState {
+        let now = Utc::now();
+        DesiredState {
+            instance: VpnInstance {
+                id: Uuid::nil(),
+                host_id: Uuid::from_u128(1),
+                display_name: "Command Test".into(),
+                backend: kind,
+                backend_settings: BackendSettings::defaults_for(kind, "vpn.example.test"),
+                endpoint: EndpointConfig {
+                    host: "vpn.example.test".into(),
+                    port: kind.default_port(),
+                },
+                network: NetworkConfig {
+                    ipv4_subnet: "10.64.0.0/24".parse().unwrap(),
+                    gateway_ipv4: "10.64.0.1".parse().unwrap(),
+                    ipv6_subnet: None,
+                    gateway_ipv6: None,
+                },
+                dns: DnsConfig {
+                    zone: "internal".into(),
+                    soa_serial: 2_026_073_001,
+                },
+                routing_mode: RoutingMode::SplitTunnel,
+                persistent_keepalive: DEFAULT_KEEPALIVE,
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+            },
+            users: Vec::new(),
+            devices: Vec::new(),
+            dns_records: Vec::new(),
+            dns_blocklist_domains: Vec::new(),
+        }
+    }
+
     #[test]
     fn activation_paths_are_shell_quoted() {
         let plan = DeploymentPlan {
@@ -3365,24 +4030,106 @@ mod tests {
             mode: 0o644,
             sensitive: false,
         }];
-        let command = activation_command("/safe/current", "/safe/stage", &files, &plan);
+        let runtime = WireGuardBackend
+            .runtime(&BackendSettings::default())
+            .expect("WireGuard runtime");
+        let command = activation_command("/safe/current", "/safe/stage", &files, &plan, &runtime);
         assert!(command.contains("'/safe/stage/dns/zones/db.vpn.internal'"));
         assert!(!command.contains("$(bad)"));
     }
 
     #[test]
     fn firewall_commands_manage_active_ufw_and_firewalld_idempotently() {
-        let allow = firewall_allow_command(51_820);
+        let listeners = [
+            ListenerPort {
+                port: 443,
+                protocol: TransportProtocol::Tcp,
+            },
+            ListenerPort {
+                port: 4_500,
+                protocol: TransportProtocol::Udp,
+            },
+        ];
+        let allow = firewall_allow_command(&listeners);
         assert!(allow.contains("sudo -n ufw status"));
-        assert!(allow.contains("sudo -n ufw allow 51820/udp"));
+        assert!(allow.contains("sudo -n ufw allow 443/tcp"));
+        assert!(allow.contains("sudo -n ufw allow 4500/udp"));
         assert!(allow.contains("firewall-cmd --state"));
-        assert!(allow.contains("sudo -n firewall-cmd --permanent --add-port=51820/udp"));
+        assert!(allow.contains("sudo -n firewall-cmd --permanent --add-port=443/tcp"));
+        assert!(allow.contains("sudo -n firewall-cmd --permanent --add-port=4500/udp"));
         assert!(allow.contains("sudo -n firewall-cmd --reload"));
 
-        let remove = firewall_remove_command(51_820);
-        assert!(remove.contains("sudo -n ufw delete allow 51820/udp"));
+        let remove = firewall_remove_command(&listeners);
+        assert!(remove.contains("sudo -n ufw delete allow 443/tcp"));
+        assert!(remove.contains("sudo -n ufw delete allow 4500/udp"));
         assert!(remove.contains("|| true"));
-        assert!(remove.contains("sudo -n firewall-cmd --permanent --remove-port=51820/udp"));
+        assert!(remove.contains("sudo -n firewall-cmd --permanent --remove-port=443/tcp"));
+        assert!(remove.contains("sudo -n firewall-cmd --permanent --remove-port=4500/udp"));
+    }
+
+    #[test]
+    fn ssh_commands_follow_backend_runtime_contracts() {
+        let ikev2 = command_state(VpnBackendKind::Ikev2);
+        let ikev2_runtime = Ikev2Backend
+            .runtime(&ikev2.instance.backend_settings)
+            .unwrap();
+        let ports = port_conflict_command(&ikev2.instance, &ikev2_runtime);
+        assert_eq!(ports.matches("ss -H -lun").count(), 2);
+        assert!(ports.contains("--protocol udp gateway 500"));
+        assert!(ports.contains("--protocol udp gateway 4500"));
+        assert!(ports.contains("UDP port 4500 is already in use"));
+
+        let xray = command_state(VpnBackendKind::Xray);
+        let xray_runtime = XrayBackend
+            .runtime(&xray.instance.backend_settings)
+            .unwrap();
+        let images = image_prepare_command("/safe/stage", &xray_runtime, false);
+        assert!(images.contains("docker compose --env-file .env build gateway"));
+        assert!(!images.contains(COREDNS_IMAGE));
+        let health = remote_health_command(&xray, &xray_runtime, false);
+        assert!(health.contains("xray run -test"));
+        assert!(health.contains("--protocol tcp gateway 8443"));
+        assert!(!health.contains("nslookup"));
+        let ownership =
+            prepare_numeric_mount_ownership_command("/safe/current", &xray_runtime).unwrap();
+        assert!(ownership.contains("chown -R 10001:10001 /work"));
+        assert!(ownership.contains("'/safe/current/xray-state:/work'"));
+    }
+
+    #[test]
+    fn wireguard_like_identity_and_validation_are_backend_declared() {
+        let state = command_state(VpnBackendKind::AmneziaWg);
+        let runtime = AmneziaWgBackend
+            .runtime(&state.instance.backend_settings)
+            .unwrap();
+        assert_eq!(
+            runtime_container_path(&runtime, "vpn/awg0.conf.template").as_deref(),
+            Some("/etc/amneziawg/awg0.conf.template")
+        );
+        assert_eq!(
+            runtime_container_path(&runtime, "vpn-other/awg0.conf"),
+            None
+        );
+        assert_eq!(
+            runtime_host_path(&runtime, "/etc/amneziawg/awg0.conf").as_deref(),
+            Some("vpn/awg0.conf")
+        );
+        assert_eq!(
+            runtime_host_path(&runtime, "/etc/amneziawg-other/awg0.conf"),
+            None
+        );
+        let identity =
+            materialize_server_identity_command("/safe/current", "/safe/stage", &runtime).unwrap();
+        assert!(identity.contains("awg genkey"));
+        assert!(identity.contains("awg pubkey"));
+        assert!(identity.contains("/work/vpn/awg0.conf.template"));
+        assert!(identity.contains("__VAM_AWG_SERVER_PRIVATE_KEY__"));
+
+        let validation = validation_command("/safe/stage", &runtime, true);
+        assert!(validation.contains("awg-quick"));
+        assert!(validation.contains("/etc/amneziawg/awg0.conf"));
+        assert!(validation.contains(COREDNS_IMAGE));
+        assert!(validation.contains("docker compose --env-file .env config --quiet"));
     }
 
     #[tokio::test]
