@@ -6829,6 +6829,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "vam-backend-xray"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde_json",
+ "url",
+ "uuid",
+ "vam-backend",
+ "vam-core",
+ "vam-protocol",
+ "zeroize",
+]
+
+[[package]]
 name = "vam-core"
 version = "0.1.0"
 dependencies = [

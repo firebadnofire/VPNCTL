@@ -9,6 +9,7 @@ members = [
   "crates/backend-ikev2",
   "crates/backend-openvpn",
   "crates/backend-wireguard",
+  "crates/backend-xray",
   "crates/core",
   "crates/deployment",
   "crates/dns",
@@ -51,6 +52,7 @@ tokio-util = "0.7.16"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["v4", "serde"] }
+url = "2.5.8"
 wireguard-conf = { version = "1.0.1", default-features = false }
 zeroize = { version = "1.8.2", features = ["derive"] }
 

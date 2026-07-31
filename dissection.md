@@ -2554,4 +2554,257 @@ The full workspace gate also passed:
 
 Commit:
 
+- `598f2be refactor: model Xray server identity state`;
+- created with `git commit -S`;
+- `git verify-commit HEAD` reported a good EDDSA signature from William Jones
+  using key `7D6EF134D851C8DA0862D97494F31AF374E2EE3C`.
+
+### Unit 5b: Xray/VLESS backend
+
+Status: pure backend implementation and local Rust validation complete. Docker,
+POSIX-shell, and live client/server interoperability remain later Linux fixture
+gates.
+
+#### Backend and runtime contract
+
+Added `crates/backend-xray` as the fifth implementation of `VpnBackend`. Its
+capabilities explicitly describe Xray as an addressless proxy:
+
+- no allocated tunnel addresses;
+- no managed private DNS;
+- no quick credential refresh;
+- no live identity update;
+- no WireGuard-style traffic/handshake statistics;
+- no certificate authority;
+- QR-capable text export.
+
+The backend requests no Linux capabilities, devices, or sysctls. Its runtime
+uses:
+
+- fixed internal unprivileged port 8443;
+- TCP for raw TCP and XHTTP;
+- UDP for mKCP;
+- a read-only `/etc/xray` rendered-config mount;
+- writable durable `/var/lib/vam-xray` identity/runtime state;
+- structured-JSON validation and Xray-specific health declarations.
+
+The local image tag is
+`vpn-appliance-manager/xray:alpine3.23.5-v25.8.3`. The Dockerfile uses the
+same Alpine 3.23.5 SHA-256 base pin as the other locally built backends and
+installs fixed Alpine package versions. It accepts only Docker `TARGETARCH`
+values `amd64` and `arm64`, maps each to the official release asset and frozen
+digest from the Unit 5 plan, downloads with HTTPS/TLS 1.3, verifies with
+`sha256sum -c`, extracts only the Xray executable, and removes its download
+dependencies. Unsupported architectures fail the image build.
+
+The image creates fixed UID/GID 10001, declares `USER 10001:10001`, and makes
+Xray the final entrypoint process. There is no privileged mode, TUN device,
+`NET_ADMIN`, container firewall, host-wide sysctl tuning, process-kill loop,
+or keepalive `tail`.
+
+Static tests inspect all of those properties. They do not prove that Alpine
+still serves the exact pinned packages, Docker passes the expected architecture
+name, the release ZIP layout is unchanged, or the binary executes. Docker is
+not installed in this Windows environment.
+
+#### Remote-only REALITY bootstrap
+
+The server template contains empty `privateKey` and `shortIds` fields. The
+rendered POSIX entrypoint:
+
+- enables `set -eu` and umask `077`;
+- fails if the rendered template is unreadable or structurally incomplete;
+- creates a complete identity in a temporary mode-0700 directory only when the
+  durable identity directory is entirely absent;
+- runs the pinned `xray x25519`;
+- extracts values only from explicitly labeled `Private key`, `Public key`, or
+  later `Password` lines;
+- validates each X25519 value as exactly 43 unpadded base64url characters;
+- obtains eight bytes from `/dev/urandom` and validates the resulting 16
+  lowercase hex short ID;
+- writes all three files at mode `0600`;
+- renames the complete temporary directory into place;
+- rejects missing, partial, or malformed retained identity instead of rotating
+  it;
+- injects the private key and short ID into exact JSON paths with `jq`;
+- validates the materialized config with `xray run -test`;
+- `exec`s the real server only after validation passes.
+
+The security pass changed injection from `jq --arg` to `jq --rawfile`. The
+private key therefore does not appear in `jq`'s process arguments or a host
+`docker top` view. It is transiently held in the shell only for shape
+validation, then read by `jq` from the mode-0600 durable file. Temporary output
+is removed by traps. The public key is retained remotely for the later fixed
+discovery operation; the backend never renders or requests the private key as a
+local secret reference.
+
+The script uses only constant paths and structured JSON operations. It does not
+perform `sed` replacement, interpolate user strings into shell source, or
+assume an unlabeled second command-output line is safe.
+
+The current machine has neither `sh` nor Docker, so even `sh -n`, image build,
+and actual pinned-binary key output are unvalidated. A Linux fixture must check
+all three. It must also prove fixed UID 10001 can read the mode-0600 rendered
+template/TLS files and write the durable bind mount after generic ownership
+normalization.
+
+#### Strict settings and device validation
+
+The backend rejects desired state unless:
+
+- instance/backend/settings tags all select Xray;
+- the generic instance/network model is valid;
+- endpoint is a syntactically valid DNS name or IP address;
+- server name is a bounded ASCII DNS name;
+- fingerprint is one of the closed supported browser/random profiles and is
+  never `unsafe`;
+- XHTTP path is a bounded absolute ASCII path without whitespace, query, or
+  fragment;
+- REALITY uses only raw TCP or XHTTP;
+- REALITY contains neither TLS secret reference;
+- REALITY public key and short ID are either both absent during bootstrap or
+  both strictly valid;
+- TLS contains both certificate and private-key secret references and no
+  stale REALITY metadata;
+- every undeleted device has Xray data, a unique UUID, unique valid email/label,
+  and no tunnel address or managed DNS name;
+- flow is absent or exactly `xtls-rprx-vision`;
+- Vision flow is used only with raw TCP.
+
+The backend intentionally supplies no unprotected VLESS mode. TLS certificates
+and private keys are resolved only during server rendering; absent native
+secrets produce a typed missing-secret error. PEM shape is checked and both
+rendered files are marked sensitive at mode `0600`. Cryptographic
+certificate/private-key matching is not yet performed locally and must be
+proved by `xray run -test` in the integration fixture.
+
+#### Deterministic structured JSON
+
+Server JSON is constructed entirely with `serde_json::Value` and serialized by
+`serde_json`; there is no raw JSON setting or textual mutation.
+
+Enabled, undeleted clients are sorted by credential UUID. Each contains only
+the validated UUID, email/label, level, and permitted flow. The UUID-bearing
+template is itself marked sensitive so deployment/log surfaces redact it.
+Disabled or removed identities disappear from the next render, and replacement
+introduces only the newly generated UUID.
+
+The common server shape contains one VLESS inbound on port 8443,
+`decryption: "none"`, error-only logging, and one `freedom` outbound.
+
+REALITY renders:
+
+- typed raw TCP or XHTTP network;
+- the validated target/SNI on port 443;
+- one server name;
+- bounded client/server time difference;
+- empty key/short-ID slots for runtime structured injection.
+
+TLS renders:
+
+- typed raw TCP, XHTTP, or mKCP network;
+- certificate and key file paths;
+- strict SNI rejection;
+- explicit TLS minimum and maximum version 1.3;
+- `h2` and `http/1.1` ALPN;
+- no `allowInsecure` or trust-store bypass.
+
+XHTTP renders conservative `auto` mode plus the typed path. mKCP renders fixed
+bounded transport values and an un-obfuscated header. This does not claim that
+XHTTP or TLS-over-mKCP works with every client; live parity testing remains
+required.
+
+#### UUID lifecycle and VLESS export
+
+`XrayBackend::generate_identity` creates:
+
+- a random UUIDv4 credential;
+- a normalized label using the last 12 device UUID digits to avoid collisions
+  between deterministic/test UUIDs with common prefixes;
+- Vision flow for raw TCP and no flow for XHTTP/mKCP.
+
+The backend does not add any native secret reference for a device. UUID
+creation, disable, removal, and replacement are represented by desired state
+and deterministic reconciliation; a later application unit will restart and
+health-check the service after changes.
+
+Explicit export uses the `url` crate rather than manual query/fragment
+concatenation. The VLESS URI includes:
+
+- credential UUID as user information;
+- validated endpoint and custom port;
+- `encryption=none` under mandatory TLS/REALITY;
+- security, SNI, fingerprint, and transport;
+- flow only when valid;
+- REALITY public key, short ID, and spider path; or TLS ALPN;
+- XHTTP path/mode or mKCP header metadata;
+- percent-encoded display label.
+
+The result is a zeroizing text payload with a normalized `.vless.txt` filename
+and can be rendered as QR by the existing native path. REALITY export fails
+until both public metadata values have been retrieved from the remote host.
+Tests parse the URI back through `url::Url` and compare fields/query pairs
+instead of asserting an unparsed string.
+
+#### Change impact
+
+Backend switches and changes to security mode, REALITY public identity mirror,
+or TLS certificate/key references are `Reinstall` class. They can change the
+client-authenticated server identity and must be surfaced before apply.
+
+Transport, SNI/target, and XHTTP path changes require `ServiceRestart` and
+client re-export. An unchanged setting or fingerprint-only client metadata
+change is `LiveUpdate`. Tests pin each classification.
+
+#### Validation ledger
+
+The focused gate was intentionally stopped and corrected at each failure:
+
+1. compilation failed because deterministic sorting retained
+   `Result<Uuid, BackendError>` as its key; validation makes mismatched device
+   data impossible at that point, so the sort now extracts the proven UUID;
+2. test compilation then found the missing test-only `chrono` dependency and
+   two overlapping mutable/immutable test borrows; the dependency and borrow
+   scopes were corrected;
+3. two tests failed because a first-12-digits UUID suffix collided for small
+   fixture UUIDs and because the URI test confused the model device UUID with
+   its random Xray credential UUID; the suffix now uses the UUID tail and the
+   test reads the actual backend identity;
+4. URL parsing correctly returned the percent-encoded fragment, so the test was
+   corrected to assert `Work%20Laptop`;
+5. after all nine tests passed, clippy found one mergeable match arm; it was
+   simplified without behavior change.
+
+After the process-argument security correction and deterministic fixture
+cleanup, the focused gate passed:
+
+- `cargo fmt --all` and formatting check;
+- `cargo test -p vam-backend-xray`: 9 tests;
+- strict focused clippy for all targets with `-D warnings`.
+
+The full workspace gate passed:
+
+- `cargo check --workspace`;
+- `cargo test --workspace`: 83 tests;
+- `cargo clippy --workspace --all-targets -- -D warnings`;
+- `cargo fmt --all -- --check`;
+- `git diff --check`.
+
+Still unvalidated:
+
+- POSIX shell syntax and signal behavior;
+- Alpine package availability and image build for amd64/arm64;
+- release download, digest verification, ZIP extraction, and Xray invocation;
+- actual X25519 output parsing and durable identity initialization;
+- non-root read/write ownership on real bind mounts;
+- `xray run -test` for every supported matrix entry;
+- VLESS/REALITY/TLS client compatibility and TLS certificate-chain behavior;
+- XHTTP and mKCP data path;
+- custom host port publication and TCP/UDP firewall behavior;
+- UUID revocation/replacement after restart;
+- public-material discovery;
+- backup, restore, rollback, and identity preservation across image updates.
+
+Commit:
+
 - pending staged-patch inspection and signed commit.
