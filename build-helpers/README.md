@@ -45,6 +45,10 @@ Tagged Forgejo CI releases are also mirrored to
 `GH_KEY` with GitHub repository Contents read/write permission. Each packaging
 job safely synchronizes the immutable release tag and replaces only the assets
 it built; an existing GitHub tag pointing at another commit is never forced.
+Every published artifact is accompanied by a verified detached armored GPG
+signature named `<artifact>.asc`. Configure `CI_KEY` as the base64 encoding of
+exactly one GPG private key and set its passphrase in `CI_KEY_PASSPHRASE`.
+Signing uses an isolated temporary GPG home that is removed after each job.
 
 The clean helpers remove only these generated paths:
 
