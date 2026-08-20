@@ -8,6 +8,52 @@ validation evidence collected after every unit.
 The repository name remains `dnswg`. The product name remains **VPN Appliance
 Manager**.
 
+## Current implementation snapshot (audited 2026-08-19)
+
+This document is a chronological engineering record. Sections that describe an
+"initial" architecture, a target, a plan, or a limitation at the start of an
+implementation unit are retained as historical context; they are superseded by
+the completed units and validation ledger that follow them. The current checkout
+is `f92e619` (`docs: record live backend deployment validation`). That commit is
+the latest source of this document, and there are no later implementation commits
+for the dissection to incorporate.
+
+At this revision, VPN Appliance Manager has one shared Rust application service,
+a narrow Tauri bridge, a Svelte 5 desktop client, and a developer CLI. The backend
+registry contains functional WireGuard, AmneziaWG 2, OpenVPN, IKEv2, and
+Xray/VLESS implementations. The desktop exposes backend-aware creation, settings,
+clients, DNS where supported, reviewed deployment, backups, health, and activity
+workflows. Sections 12A-12R record the final UI work, live five-backend deployment
+matrix, fixes found during live validation, and the last full Windows release
+validation.
+
+The current persistence and trust model remains desktop-authoritative:
+
+- `apps/desktop/src-tauri/src/lib.rs` opens `state.sqlite` in the application data
+  directory and constructs `ApplicationService` with `KeychainSecretStore`;
+- `crates/storage/migrations/0001_initial.sql` through
+  `0003_desktop_activity_and_backups.sql` define the local SQLite model for
+  hosts, desired state, users, devices, DNS, deployments, backups, activity,
+  settings, host-key pins, and opaque secret references;
+- desktop-owned secret values are stored in the native OS credential store,
+  including integrity-checked chunking for values that exceed platform entry
+  limits; backend-owned CA and server identity material can be remote-only;
+- the SSH server stores deployed runtime configuration, manifests, protected
+  protocol authority/identity state, and remote backups beneath
+  `/opt/vpn-appliance-manager`, but it is not the canonical control-state store;
+- client artifacts are rendered on demand in Rust from local desired-state
+  metadata plus native-store and remote authority material. Raw artifact bytes
+  are written to a private local file only after an explicit export; QR-capable
+  profiles cross the Tauri boundary only as an SVG whose matrix encodes the
+  configuration.
+
+Consequently, a future server-authoritative persistence redesign is not already
+implemented by this revision. Moving desired state, client identity material,
+profiles, and history to each SSH server would replace—not merely extend—the
+SQLite/keychain authority described here. The last runtime and packaging results
+in section 12R are evidence from 2026-07-31 and have not been represented as a new
+2026-08-19 test run by this documentation-only audit.
+
 ## 1. Refactor objective and non-negotiable boundaries
 
 VPN Appliance Manager is being expanded from a WireGuard-specific appliance
@@ -5930,3 +5976,282 @@ Previous signed commit:
 
 Planned signed commit:
 `docs: record live backend deployment validation`.
+
+## 13. Server-authoritative persistence redesign (2026-08-19)
+
+Status: source audit and implementation plan complete. No authority-model code
+has been changed in this planning unit.
+
+### 13.1 Required authority boundary
+
+The new invariant is:
+
+> VPN Appliance Manager keeps only the information necessary to identify and
+> securely SSH into an appliance locally; the appliance owns its VPN state and
+> credentials, while the desktop retrieves and caches that state as a disposable
+> management view.
+
+The approved SSH host key cannot come from the host being authenticated and
+therefore remains local. The local connection/trust repository will own only the
+appliance UUID binding, friendly name, hostname, port, SSH username, private-key
+path, optional native-store passphrase reference, approved host public-key blob
+and fingerprint, plus disposable synchronization metadata. Deleting that local
+repository may require the operator to re-add and re-approve the appliance, but
+must not lose appliance configuration or rotate VPN credentials.
+
+Everything logically owned by a VPN appliance moves to its authority store:
+instances and typed settings, listeners, users, devices, tunnel addresses, DNS
+records and hostlists, identity metadata, VPN client secret values, imported TLS
+material, deployment snapshots and events, activity, backup metadata, and
+appliance settings. Existing backend-owned CA, identity, revocation, and runtime
+state remains remote and is brought under coherent management-state backup.
+
+The security tradeoff is explicit: privileged compromise of an appliance can
+expose the active client credentials managed by that appliance. Restrictive
+at-rest storage protects offline copies and accidental disclosure; it does not
+protect secrets from an attacker with equivalent root execution on the live
+host.
+
+### 13.2 Current ownership inventory
+
+The audit found these present-day coupling points:
+
+| State | Current owner | New owner |
+| --- | --- | --- |
+| SSH endpoint, private-key path, passphrase reference | local `docker_hosts` plus native credential store | local connection/trust store |
+| approved SSH key blob and fingerprint | local `known_host_keys` | local connection/trust store, unchanged |
+| instances, listeners, users, devices, DNS | local SQLite | appliance authority database |
+| deployment plans, events, snapshots, activity, backup metadata | local SQLite | appliance authority database |
+| WG/AWG private keys and PSKs | desktop native credential store | appliance authority secret store |
+| OpenVPN/IKEv2 client keys, certificates, CA copies, export passwords | desktop native credential store | appliance authority secret store |
+| Xray client UUID and imported TLS material | desktop native credential store | appliance authority secret store |
+| backend CA, revocation, server identity, active runtime | protected remote instance tree | protected remote runtime tree, unchanged |
+| rendered client artifacts | transient Rust value or explicit local export | reconstructed from appliance state; transient Rust value or explicit local export |
+| DNS hostlist cache and UI summaries | local settings/SQLite | appliance settings plus disposable local cache |
+
+`ApplicationService` currently calls concrete `Storage` and `SecretStore`
+methods throughout host, instance, device, DNS, deployment, backup, rollback,
+health, and export workflows. Device creation and replacement can also mutate a
+remote certificate authority before committing local metadata. Deployment and
+restore similarly perform remote side effects before final local history/state
+updates. Those operations require one server-side concurrency boundary; merely
+swapping the `Storage` implementation or copying SQLite files cannot make them
+safe.
+
+### 13.3 Remote helper and protocol
+
+Add a small `vam-server` Rust binary under `apps/server` and a shared
+`vam-authority` crate. The shared crate owns versioned request/response types,
+the normalized authority schema, validation, revision/lease rules, and the
+server-side store. The binary remains a thin command dispatcher. It is not an
+HTTP service, daemon, frontend, or second orchestration implementation.
+
+The helper protocol will use structured JSON envelopes containing an explicit
+protocol version, supported schema range, request UUID, appliance UUID, and a
+tagged operation. The minimal operation families are:
+
+- compatibility and current-revision inspection;
+- public/cache snapshot retrieval;
+- mutation-lease acquire, renew, abort, and transactional commit;
+- bounded protected credential retrieval for client rendering/export;
+- reviewed legacy migration preview and atomic import;
+- coherent management backup creation, listing, verification, and restore.
+
+Application-specific validation, backend rendering, deployment planning, health,
+and orchestration remain in `ApplicationService`. Authority commits carry typed
+aggregate changes and secret puts/retirements rather than arbitrary SQL or shell
+fragments. The helper validates ownership, references, revision, lease token,
+schema, and size bounds before one database transaction.
+
+The existing SSH transport has no stdin channel, and secret-bearing JSON must not
+appear in a shell argument or routine stdout. Requests and responses will
+therefore use per-request UUID files in a restricted exchange directory:
+
+1. VPNCTL uploads a `0600` request with bounded SFTP.
+2. VPNCTL executes the fixed helper path with only the validated request UUID.
+3. The helper runs through a narrowly installed noninteractive privilege rule,
+   validates the request path, writes a bounded `0600` response for the invoking
+   SSH UID, and removes the request.
+4. VPNCTL downloads the response with the existing bounded SFTP primitive.
+5. A helper cleanup operation removes the response; expired exchange files are
+   pruned idempotently.
+
+The helper emits only a small non-secret completion status on stdout. Private
+keys, PSKs, bearer UUIDs, passwords, imported key material, and complete client
+profiles remain inside the protected exchange file and zeroizing Rust buffers.
+Malformed envelopes, path escapes, unknown variants, incompatible versions, and
+oversized inputs fail closed.
+
+### 13.4 Remote storage and filesystem
+
+Retain `/opt/vpn-appliance-manager/instances/<uuid>` and the existing runtime,
+staging, trash, and deployment-backup semantics. Add separate protected roots:
+
+```text
+/opt/vpn-appliance-manager/
+|-- control/       # root-owned authority database, schema metadata, lock state
+|-- exchange/      # bounded per-request files, never durable authority
+|-- management-backups/ # coherent disaster-recovery generations
+|-- instances/     # existing active backend/runtime trees
+|-- backups/       # existing deployment rollback trees
+|-- staging/
+`-- trash/
+```
+
+The authority database is root-owned mode `0600`; protected directories are
+`0700`. Secret values use a dedicated BLOB table keyed by the existing opaque
+UUID references so state rows and secret writes can commit atomically. Complete
+profiles are reconstructed where feasible rather than redundantly persisted.
+This also makes the authority database plus required runtime state the coherent
+backup unit. No live SQLite, WAL, or shared-memory file is ever transferred to
+VPNCTL.
+
+The helper serializes database access and owns migrations. Management backups
+are immutable generations: while holding the appliance mutation lease, create a
+consistent SQLite snapshot, copy the protected runtime authority trees with the
+existing root-container boundary that preserves numeric ownership, write and
+verify a digest manifest, then atomically publish the generation. Restore
+verifies the complete generation and restores database and protected trees as
+one unit. This disaster-recovery flow remains distinct from per-deployment
+rollback.
+
+### 13.5 Revision and side-effect concurrency
+
+The authority database has one monotonically increasing appliance revision.
+Snapshot responses include it, and the local cache records it. Equal revisions
+skip a full refresh. Every successful authority mutation advances the revision
+exactly once; validation failures and rolled-back transactions do not advance it.
+
+Optimistic revision checks are paired with a short-lived persisted mutation
+lease because deployment, certificate issuance/revocation, runtime backup, and
+restore have side effects outside the database transaction. A mutating workflow
+is:
+
+1. refresh and obtain revision `N`;
+2. acquire a scoped lease only if the authority remains at `N`;
+3. execute the existing reviewed application orchestration while renewing the
+   lease during long operations;
+4. commit metadata and secret changes with the lease token and expected revision
+   `N`, advancing atomically to `N + 1`;
+5. abort the lease after a pre-commit failure, or run the existing remote rollback
+   before abort when side effects occurred.
+
+Another VPNCTL client receives a structured busy or revision-conflict result and
+must refresh. Leases have bounded expiry and operation identity so a crashed
+desktop cannot lock the appliance forever, while an expired lease cannot be used
+to commit. No offline mutation queue is introduced.
+
+### 13.6 Local repositories and application integration
+
+Replace the desktop bootstrap use of `state.sqlite` with explicit local stores:
+
+- `connections.sqlite`: authoritative only for connection and host-trust data;
+- `cache.sqlite`: disposable public appliance snapshots, revision, freshness,
+  and UI-only state.
+
+The old local-authority database remains readable only by the explicit migration
+workflow. New installations do not create its VPN-state tables. Native credential
+storage remains for SSH-key passphrases and is removed from ordinary VPN client
+identity persistence after successful migration.
+
+Introduce an `AuthorityClient` behind `ApplicationService`. It owns the verified
+SSH exchange, compatibility check, revision refresh, lease lifecycle, protected
+secret fetch, and typed commits. The application continues to own backend
+selection, key/CSR generation, rendering, state-hash review, deployment commands,
+rollback, redaction, and public presentation models. Ordinary list/detail views
+read synchronized cache data and expose freshness/offline state. Mutations require
+a live compatible authority and never report a local queued success.
+
+Client export loads the synchronized state and only the required protected
+credential components from the appliance into zeroizing Rust buffers, uses the
+existing backend renderer, and writes the explicit private export. QR generation
+remains the one tightly scoped Tauri response that encodes a complete supported
+profile; normal Svelte models remain secret-free.
+
+### 13.7 Reviewed one-way migration
+
+Migration is explicit and retryable, never an ordinary-startup side effect:
+
+1. detect legacy `state.sqlite` and referenced native secrets;
+2. require a reachable appliance with approved local host key and a compatible
+   helper;
+3. refresh revision and inspect both management and runtime state;
+4. build a redacted preview including entities, secret-reference completeness,
+   UUID preservation, conflicts, and backup impact;
+5. acquire the migration lease and create/verify a management backup;
+6. upload one bounded typed import generation containing desired state, history,
+   metadata, and required secret values;
+7. atomically import only if the expected revision and idempotency key still
+   match;
+8. re-read and verify entity hashes, secret digests, UUIDs, runtime references,
+   and one reconstructible export for every migrated identity/backend;
+9. switch the desktop to the synchronized cache;
+10. retire old VPN credential entries only after all verification passes, while
+    retaining SSH passphrases and a recoverable legacy database backup until the
+    operator explicitly completes retirement.
+
+Pre-commit failure leaves legacy authority usable. Repeating a committed import
+with the same idempotency key returns the recorded result; it does not duplicate
+rows, advance revision again, or rotate credentials.
+
+### 13.8 Functional implementation units
+
+The implementation will proceed in signed, independently validated units:
+
+1. **Authority protocol and store:** add `vam-authority`, remote migrations,
+   revision/lease/transaction logic, protected secret BLOBs, snapshot and commit
+   validation, compatibility errors, and focused persistence/concurrency tests.
+2. **Server helper and secure exchange:** add `vam-server`, filesystem
+   initialization, permission enforcement, bounded JSON files, request cleanup,
+   managed-root/path validation, helper installation assets, and hostile-input
+   tests.
+3. **Local connection/cache split:** add the bootstrap/trust repository and
+   disposable cache, rename new desktop use to `cache.sqlite`, preserve host-key
+   approval invariants, and prove cache destruction/reconstruction.
+4. **Application authority client:** integrate verified SSH exchange, revision
+   refresh, stale/offline presentation, leases, and typed commit handling while
+   retaining backend orchestration in `ApplicationService`.
+5. **Identity and export cutover:** move all five backends' client and imported
+   TLS secret persistence to appliance authority, re-export from a clean client,
+   and remove dead VPN uses of `KeychainSecretStore`.
+6. **Migration and disaster recovery:** add review/apply/verify/retire migration,
+   coherent management backups, generation restore, idempotent retries, and
+   failure recovery.
+7. **Desktop/CLI completion:** expose synchronization, freshness, conflicts,
+   migration review, management backup/restore, and actionable compatibility
+   errors without putting secrets in public models.
+8. **Documentation and acceptance:** update README, security, architecture,
+   remote format, deployment/backup docs, and this ledger; run the clean-client
+   recovery scenario and a create/export/reconnect workflow for all five
+   backends.
+
+Each unit must pass formatting, targeted tests, strict Clippy with `-D warnings`,
+and all affected workspace/frontend checks before its commit. The final unit runs
+the complete workspace verification and the Windows release helper. Live-server
+claims require a disposable approved appliance and exact recorded evidence; they
+will not be inferred from local tests.
+
+### 13.9 Files expected to change
+
+- `Cargo.toml`, `Cargo.lock`: register the authority library and server binary;
+- `crates/authority/`: protocol, schema, store, revision, lease, backup, and
+  migration primitives;
+- `apps/server/`: thin `vam-server` JSON/file dispatcher;
+- `crates/ssh/`: retain verification invariants and add only the exchange support
+  that cannot be composed from existing bounded upload/download/execute calls;
+- `crates/storage/`: isolate legacy import and disposable-cache responsibilities
+  from new appliance authority;
+- `crates/secrets/`: retain local SSH-passphrase storage, remove VPN authority
+  only after migration verification;
+- `crates/application/`: authority client integration and orchestration cutover;
+- `apps/cli/`, `apps/desktop/src-tauri/`, `apps/desktop/src/`: explicit sync,
+  offline/cache status, conflict handling, migration, and recovery UX;
+- `build-helpers/` and host provisioning: build/package/install/version
+  `vam-server` without weakening sudo or filesystem permissions;
+- `README.md`, `SECURITY.md`, `docs/architecture.md`, `docs/remote-format.md`,
+  `docs/deployment.md`, and this file: replace local-first claims and record
+  validation evidence.
+
+No unit will copy SQLite/WAL files between client and server, trust a host-supplied
+host-key pin, queue offline writes, put secret JSON in shell arguments or logs,
+or broaden remote permissions to make the helper convenient.
