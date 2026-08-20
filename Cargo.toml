@@ -6,6 +6,7 @@ members = [
   "apps/server",
   "crates/application",
   "crates/authority",
+  "crates/authority-client",
   "crates/backend",
   "crates/backend-amneziawg",
   "crates/backend-ikev2",

@@ -211,14 +211,21 @@ impl ServerRuntime {
         Ok(response_path)
     }
 
-    pub fn remove_response(
+    pub fn cleanup_exchange(
         &self,
         caller: CallerIdentity,
         request_id: Uuid,
     ) -> Result<(), ServerError> {
-        let response_path = self.paths.response(caller, request_id);
-        validate_caller_file(&response_path, caller, self.max_response_bytes)?;
-        std::fs::remove_file(response_path)?;
+        remove_caller_file_if_present(
+            &self.paths.request(caller, request_id),
+            caller,
+            self.max_request_bytes,
+        )?;
+        remove_caller_file_if_present(
+            &self.paths.response(caller, request_id),
+            caller,
+            self.max_response_bytes,
+        )?;
         Ok(())
     }
 }
@@ -414,6 +421,20 @@ fn validate_request_file(path: &Path, caller: CallerIdentity) -> Result<(), Serv
     validate_caller_file(path, caller, MAX_REQUEST_BYTES)
 }
 
+fn remove_caller_file_if_present(
+    path: &Path,
+    caller: CallerIdentity,
+    max_bytes: usize,
+) -> Result<(), ServerError> {
+    match validate_caller_file(path, caller, max_bytes) {
+        Ok(()) => std::fs::remove_file(path).map_err(ServerError::from),
+        Err(ServerError::Filesystem(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
 fn validate_caller_file(
     path: &Path,
     caller: CallerIdentity,
@@ -589,7 +610,9 @@ mod tests {
             .await
             .unwrap();
         let response = serde_json::from_slice(&std::fs::read(&response_path).unwrap()).unwrap();
-        runtime.remove_response(caller, request.request_id).unwrap();
+        runtime
+            .cleanup_exchange(caller, request.request_id)
+            .unwrap();
         response
     }
 
@@ -618,7 +641,7 @@ mod tests {
         let AuthorityResponse::Info(first) = response.result.unwrap() else {
             panic!("expected info response");
         };
-        runtime.remove_response(caller, request_id).unwrap();
+        runtime.cleanup_exchange(caller, request_id).unwrap();
         assert!(!response_path.exists());
 
         let second_id = Uuid::new_v4();
@@ -803,5 +826,30 @@ mod tests {
             .unwrap(),
             Command::Cleanup(request_id)
         );
+    }
+
+    #[test]
+    fn cleanup_removes_request_and_response_and_is_idempotent() {
+        let directory = tempfile::tempdir().unwrap();
+        let runtime = ServerRuntime::new(directory.path());
+        let caller = caller();
+        let request_id = Uuid::new_v4();
+        runtime.prepare_exchange(caller).unwrap();
+        create_private_file(
+            &runtime.paths().request(caller, request_id),
+            b"protected request",
+        )
+        .unwrap();
+        write_response(
+            &runtime.paths().response(caller, request_id),
+            b"protected response",
+            caller,
+        )
+        .unwrap();
+
+        runtime.cleanup_exchange(caller, request_id).unwrap();
+        assert!(!runtime.paths().request(caller, request_id).exists());
+        assert!(!runtime.paths().response(caller, request_id).exists());
+        runtime.cleanup_exchange(caller, request_id).unwrap();
     }
 }

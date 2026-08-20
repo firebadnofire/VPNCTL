@@ -6489,3 +6489,62 @@ Validation and diagnosis:
 This sub-unit establishes the storage boundary but does not yet claim that the
 desktop is a dumb SSH client. That claim requires the next authority-client and
 bootstrap cutover, followed by the reviewed legacy migration.
+
+### 13.13 Verified SSH authority exchange client
+
+Status: the transport half of functional unit 4 is complete with mocked
+end-to-end exchange validation. Application synchronization and bootstrap
+cutover remain next; no live appliance claim is made.
+
+Added `vam-authority-client` as the shared desktop/CLI RPC client. It composes
+only the existing `SshTransport` operations, so real use continues through
+`russh`/`russh-sftp` with the locally approved public host key and optional local
+SSH-key passphrase. It never probes or accepts a host key during an authority
+exchange and introduces no HTTP listener, port, daemon socket, or TLS exception.
+
+The client runs three fixed absolute helper commands through noninteractive
+sudo: `prepare`, `rpc <generated-uuid>`, and `cleanup <generated-uuid>`. Only the
+UUID enters a command string. It parses the nonsecret numeric UID marker, uploads
+an exact `0600` bounded JSON request beneath that UID's fixed request directory,
+checks the exact response-ready marker, downloads from the fixed response path
+with a 64 MiB bound, and verifies protocol plus request UUID before returning a
+typed response. Serialized request buffers and downloaded response buffers use
+zeroizing allocations because either can contain protected values.
+
+Cleanup now covers both request and response files and is idempotent. After
+`prepare` succeeds, the client attempts cleanup after upload failure, helper
+failure, download failure, invalid JSON, response mismatch, and success. It uses
+a fresh internal cancellation token for cleanup so a user cancellation cannot
+strand a secret-bearing file. Cleanup failure is surfaced as the operation
+error rather than silently reporting success. The helper validates owner, exact
+file mode, regular-file type, and size before removing either UUID-scoped file.
+
+Files changed:
+
+- `Cargo.toml` and `Cargo.lock`: register `vam-authority-client`;
+- `crates/authority-client/Cargo.toml`: explicit authority, core, SSH,
+  zeroization, cancellation, and test dependencies;
+- `crates/authority-client/src/lib.rs`: bounded verified exchange, fixed helper
+  command/path composition, response correlation, unconditional cleanup, and
+  mock-transport tests;
+- `apps/server/src/lib.rs` and `apps/server/src/main.rs`: idempotent cleanup of
+  both protected request and response files and its nonsecret status marker.
+
+Validation and diagnosis:
+
+- the first test build stopped because the mock's `HostKeyInfo` type needed a
+  direct test-only protocol dependency; the manifest now declares it explicitly;
+- strict Clippy stopped on two equality assertions written as boolean asserts;
+  they were converted to idiomatic equality assertions without production-code
+  changes;
+- three authority-client tests prove exact fixed commands and paths, reuse of
+  the local approved host key for execute/upload/download, `0600` upload mode,
+  correlated typed responses, invalid-JSON rejection, and uncancelled cleanup
+  after a simulated partial upload failure;
+- six helper tests now include removal of both exchange files followed by a
+  second successful no-op cleanup;
+- targeted formatting, tests, and strict Clippy pass.
+
+The helper is not installed by this change, and the existing application still
+uses legacy `Storage` until the next synchronization/cutover work can preserve
+the explicit migration gate.

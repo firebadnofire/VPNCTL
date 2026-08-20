@@ -1,0 +1,24 @@
+[package]
+name = "vam-authority-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+thiserror.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+zeroize.workspace = true
+vam-authority = { path = "../authority" }
+vam-core = { path = "../core" }
+vam-ssh = { path = "../ssh" }
+
+[dev-dependencies]
+async-trait.workspace = true
+tokio.workspace = true
+vam-protocol = { path = "../protocol" }
+
+[lints]
+workspace = true

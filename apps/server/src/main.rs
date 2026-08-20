@@ -33,8 +33,8 @@ async fn run() -> Result<String, vam_server::ServerError> {
             Ok(format!("response_ready={request_id}"))
         }
         Command::Cleanup(request_id) => {
-            runtime.remove_response(caller, request_id)?;
-            Ok(format!("response_removed={request_id}"))
+            runtime.cleanup_exchange(caller, request_id)?;
+            Ok(format!("exchange_removed={request_id}"))
         }
     }
 }

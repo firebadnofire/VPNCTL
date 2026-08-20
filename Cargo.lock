@@ -6789,6 +6789,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "vam-authority-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde_json",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "vam-authority",
+ "vam-core",
+ "vam-protocol",
+ "vam-ssh",
+ "zeroize",
+]
+
+[[package]]
 name = "vam-backend"
 version = "0.1.0"
 dependencies = [
