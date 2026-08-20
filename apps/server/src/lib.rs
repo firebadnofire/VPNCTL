@@ -539,10 +539,10 @@ fn create_directory(path: &Path, mode: u32, owner: CallerIdentity) -> Result<(),
 fn effective_identity() -> CallerIdentity {
     #[cfg(unix)]
     {
-        return CallerIdentity {
+        CallerIdentity {
             uid: nix::unistd::Uid::effective().as_raw(),
             gid: nix::unistd::Gid::effective().as_raw(),
-        };
+        }
     }
     #[cfg(not(unix))]
     CallerIdentity { uid: 0, gid: 0 }
@@ -572,10 +572,10 @@ mod tests {
     fn caller() -> CallerIdentity {
         #[cfg(unix)]
         {
-            return CallerIdentity {
+            CallerIdentity {
                 uid: nix::unistd::Uid::effective().as_raw(),
                 gid: nix::unistd::Gid::effective().as_raw(),
-            };
+            }
         }
         #[cfg(not(unix))]
         CallerIdentity {
