@@ -143,7 +143,7 @@ jobs:
           - name: Windows (Ubuntu cross-build)
             runs_on: ubuntu-22.04
             build_shell: bash
-            required_tools: base64 cargo cargo-xwin clang-cl cmake curl git gpg jq lld-link llvm-rc makensis nasm node pnpm rustc rustup zip
+            required_tools: base64 cargo cargo-xwin clang-cl cmake curl git gpg jq lld-link llvm-lib llvm-rc makensis nasm node pnpm rustc rustup zip
             prepare_checkout_command: |
               set -euo pipefail
 
@@ -206,20 +206,21 @@ jobs:
               echo "$tool_bin" >> "${GITHUB_PATH:-/tmp/github_path}"
               echo "${CARGO_HOME}/bin" >> "${GITHUB_PATH:-/tmp/github_path}"
 
-              link_versioned_tool() {
+              link_llvm_14_tool() {
                 tool_name="$1"
-                for candidate in "/usr/bin/${tool_name}-"* "/usr/local/bin/${tool_name}-"*; do
+                for candidate in "/usr/bin/${tool_name}-14" "/usr/local/bin/${tool_name}-14"; do
                   if [ -x "$candidate" ]; then
                     ln -sf "$candidate" "${tool_bin}/${tool_name}"
                     return 0
                   fi
                 done
+                echo "Missing LLVM 14 executable for ${tool_name}." >&2
                 return 1
               }
 
-              for tool in clang-cl llvm-rc lld-link; do
+              for tool in clang-cl lld-link llvm-lib llvm-rc; do
                 if ! command -v "$tool" >/dev/null 2>&1; then
-                  link_versioned_tool "$tool" || true
+                  link_llvm_14_tool "$tool"
                 fi
               done
 
@@ -261,7 +262,7 @@ jobs:
               corepack enable pnpm --install-directory "$tool_bin"
               corepack install --global pnpm@11.9.0
 
-              for tool in cargo-xwin clang-cl cmake lld-link llvm-rc makensis nasm; do
+              for tool in cargo-xwin clang-cl cmake lld-link llvm-lib llvm-rc makensis nasm; do
                 if ! command -v "$tool" >/dev/null 2>&1; then
                   echo "Missing Windows cross-build tool after setup: ${tool}" >&2
                   exit 1
