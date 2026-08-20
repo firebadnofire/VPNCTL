@@ -3,6 +3,7 @@ resolver = "2"
 members = [
   "apps/cli",
   "apps/desktop/src-tauri",
+  "apps/server",
   "crates/application",
   "crates/authority",
   "crates/backend",
@@ -32,6 +33,7 @@ base64 = "0.22.1"
 chrono = { version = "0.4.42", features = ["serde"] }
 clap = { version = "4.5.48", features = ["derive"] }
 ipnet = { version = "2.11.0", features = ["serde"] }
+nix = { version = "0.31.3", default-features = false, features = ["fs", "user"] }
 keyring = { version = "4.1.5", default-features = false, features = ["v1", "apple-native-keyring-store"] }
 p12-keystore = { version = "0.3.1", default-features = false }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }

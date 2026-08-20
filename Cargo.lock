@@ -6961,6 +6961,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vam-server"
+version = "0.1.0"
+dependencies = [
+ "nix",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+ "vam-authority",
+]
+
+[[package]]
 name = "vam-ssh"
 version = "0.1.0"
 dependencies = [

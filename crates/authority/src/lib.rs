@@ -177,6 +177,7 @@ pub enum AuthorityOperation {
         changes: Box<AuthorityChangeSet>,
     },
     GetSecrets {
+        expected_revision: u64,
         ids: Vec<Uuid>,
     },
 }
@@ -206,6 +207,7 @@ pub struct AuthorityInfo {
     pub revision: u64,
     pub protocol_version: u32,
     pub schema_version: u32,
+    pub software_version: String,
 }
 
 impl AuthorityInfo {
@@ -488,40 +490,49 @@ impl AuthorityStore {
     }
 
     pub async fn snapshot(&self) -> Result<AuthoritySnapshot, AuthorityError> {
-        let info = self.info().await?;
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query(
+            "SELECT appliance_id, revision, protocol_version, schema_version
+             FROM authority_meta WHERE singleton = 1",
+        )
+        .fetch_optional(&mut *transaction)
+        .await?
+        .ok_or(AuthorityError::NotFound)?;
+        let info = authority_info(&row)?;
         info.ensure_compatible()?;
         let instances = json_models(
             sqlx::query("SELECT model_json FROM vpn_instances ORDER BY id")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *transaction)
                 .await?,
         )?;
         let users = json_models(
             sqlx::query("SELECT model_json FROM users ORDER BY id")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *transaction)
                 .await?,
         )?;
         let devices = json_models(
             sqlx::query("SELECT model_json FROM devices ORDER BY id")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *transaction)
                 .await?,
         )?;
         let dns_records = json_models(
             sqlx::query("SELECT model_json FROM dns_records ORDER BY id")
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *transaction)
                 .await?,
         )?;
         let setting_rows = sqlx::query("SELECT key, value_json FROM settings ORDER BY key")
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *transaction)
             .await?;
         let settings = setting_rows
             .into_iter()
             .map(|row| Ok((row.get("key"), serde_json::from_str(row.get("value_json"))?)))
             .collect::<Result<_, AuthorityError>>()?;
-        let deployments = deployment_rows(&self.pool).await?;
-        let deployment_events = deployment_event_rows(&self.pool).await?;
-        let backups = backup_rows(&self.pool).await?;
-        let activity = activity_rows(&self.pool).await?;
-        let secrets = secret_metadata_rows(&self.pool).await?;
+        let deployments = deployment_rows(&mut transaction).await?;
+        let deployment_events = deployment_event_rows(&mut transaction).await?;
+        let backups = backup_rows(&mut transaction).await?;
+        let activity = activity_rows(&mut transaction).await?;
+        let secrets = secret_metadata_rows(&mut transaction).await?;
+        transaction.commit().await?;
         Ok(AuthoritySnapshot {
             info,
             instances,
@@ -764,11 +775,32 @@ impl AuthorityStore {
     }
 
     pub async fn get_secrets(&self, ids: &[Uuid]) -> Result<Vec<SecretPut>, AuthorityError> {
+        let revision = self.info().await?.revision;
+        self.get_secrets_at_revision(revision, ids).await
+    }
+
+    pub async fn get_secrets_at_revision(
+        &self,
+        expected_revision: u64,
+        ids: &[Uuid],
+    ) -> Result<Vec<SecretPut>, AuthorityError> {
+        let mut transaction = self.pool.begin().await?;
+        let row = sqlx::query("SELECT revision FROM authority_meta WHERE singleton=1")
+            .fetch_one(&mut *transaction)
+            .await?;
+        let actual = to_u64(row.get("revision"), "revision")?;
+        if actual != expected_revision {
+            transaction.rollback().await?;
+            return Err(AuthorityError::RevisionConflict {
+                expected: expected_revision,
+                actual,
+            });
+        }
         let mut secrets = Vec::with_capacity(ids.len());
         for id in ids {
             let row = sqlx::query("SELECT id, owner_id, purpose, value FROM secrets WHERE id=?")
                 .bind(id.to_string())
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *transaction)
                 .await?
                 .ok_or(AuthorityError::NotFound)?;
             secrets.push(SecretPut {
@@ -778,6 +810,7 @@ impl AuthorityStore {
                 value: SecretValue::new(row.get("value")),
             });
         }
+        transaction.commit().await?;
         Ok(secrets)
     }
 
@@ -994,13 +1027,15 @@ async fn apply_changes(
     Ok(())
 }
 
-async fn deployment_rows(pool: &SqlitePool) -> Result<Vec<StoredDeployment>, AuthorityError> {
+async fn deployment_rows(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+) -> Result<Vec<StoredDeployment>, AuthorityError> {
     let rows = sqlx::query(
         "SELECT id, instance_id, status, desired_state_json, plan_json,
                 backup_name, started_at, finished_at
          FROM deployments ORDER BY started_at, id",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut **transaction)
     .await?;
     rows.into_iter()
         .map(|row| {
@@ -1022,13 +1057,13 @@ async fn deployment_rows(pool: &SqlitePool) -> Result<Vec<StoredDeployment>, Aut
 }
 
 async fn deployment_event_rows(
-    pool: &SqlitePool,
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
 ) -> Result<Vec<StoredDeploymentEvent>, AuthorityError> {
     let rows = sqlx::query(
         "SELECT deployment_id, sequence, timestamp, level, phase, message, technical_detail
          FROM deployment_events ORDER BY timestamp, deployment_id, sequence",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut **transaction)
     .await?;
     rows.into_iter()
         .map(|row| {
@@ -1047,13 +1082,15 @@ async fn deployment_event_rows(
         .collect()
 }
 
-async fn backup_rows(pool: &SqlitePool) -> Result<Vec<BackupRecord>, AuthorityError> {
+async fn backup_rows(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+) -> Result<Vec<BackupRecord>, AuthorityError> {
     let rows = sqlx::query(
         "SELECT instance_id, name, backend, reason, protects_identity,
                 deployment_id, created_at
          FROM backup_records ORDER BY created_at, instance_id, name",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut **transaction)
     .await?;
     rows.into_iter()
         .map(|row| {
@@ -1071,13 +1108,15 @@ async fn backup_rows(pool: &SqlitePool) -> Result<Vec<BackupRecord>, AuthorityEr
         .collect()
 }
 
-async fn activity_rows(pool: &SqlitePool) -> Result<Vec<ActivityRecord>, AuthorityError> {
+async fn activity_rows(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+) -> Result<Vec<ActivityRecord>, AuthorityError> {
     let rows = sqlx::query(
         "SELECT id, timestamp, severity, operation, title, message, technical_detail,
                 instance_id, backend, deployment_id
          FROM activity_events ORDER BY timestamp, id",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut **transaction)
     .await?;
     rows.into_iter()
         .map(|row| {
@@ -1099,11 +1138,13 @@ async fn activity_rows(pool: &SqlitePool) -> Result<Vec<ActivityRecord>, Authori
         .collect()
 }
 
-async fn secret_metadata_rows(pool: &SqlitePool) -> Result<Vec<SecretMetadata>, AuthorityError> {
+async fn secret_metadata_rows(
+    transaction: &mut Transaction<'_, sqlx::Sqlite>,
+) -> Result<Vec<SecretMetadata>, AuthorityError> {
     let rows = sqlx::query(
         "SELECT id, owner_id, purpose, created_at, updated_at FROM secrets ORDER BY id",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut **transaction)
     .await?;
     rows.into_iter()
         .map(|row| {
@@ -1124,6 +1165,7 @@ fn authority_info(row: &sqlx::sqlite::SqliteRow) -> Result<AuthorityInfo, Author
         revision: to_u64(row.get("revision"), "revision")?,
         protocol_version: to_u32(row.get("protocol_version"), "protocol version")?,
         schema_version: to_u32(row.get("schema_version"), "schema version")?,
+        software_version: env!("CARGO_PKG_VERSION").into(),
     })
 }
 
@@ -1281,6 +1323,13 @@ mod tests {
         assert!(!serialized.contains("private-value"));
         let secrets = reopened.get_secrets(&[secret_id]).await.unwrap();
         assert_eq!(secrets[0].value.as_bytes(), b"private-value");
+        assert!(matches!(
+            reopened.get_secrets_at_revision(0, &[secret_id]).await,
+            Err(AuthorityError::RevisionConflict {
+                expected: 0,
+                actual: 1
+            })
+        ));
     }
 
     #[tokio::test]
@@ -1421,6 +1470,7 @@ mod tests {
             revision: 0,
             protocol_version: AUTHORITY_PROTOCOL_VERSION,
             schema_version: AUTHORITY_SCHEMA_VERSION,
+            software_version: env!("CARGO_PKG_VERSION").into(),
         }
         .ensure_compatible()
         .unwrap();
@@ -1429,6 +1479,7 @@ mod tests {
             revision: 0,
             protocol_version: AUTHORITY_PROTOCOL_VERSION + 1,
             schema_version: AUTHORITY_SCHEMA_VERSION,
+            software_version: env!("CARGO_PKG_VERSION").into(),
         }
         .ensure_compatible()
         .unwrap_err();

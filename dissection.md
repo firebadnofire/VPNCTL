@@ -6335,3 +6335,94 @@ Validation and diagnosis:
   authority protocol/store implementation.
 
 No local desktop authority path or remote runtime was changed in this unit.
+
+### 13.11 Privileged appliance helper and protected exchange
+
+Status: functional unit 2 complete with Windows-hosted automated validation and
+static Unix API/script checks. Native Linux compilation and a live SSH exchange
+remain unverified because this checkout has neither a Linux Rust target nor Rust
+inside its available WSL distribution. No target or toolchain was installed as
+an implicit system change.
+
+Added the deliberately small `vam-server` binary. It accepts only `prepare`,
+`rpc <request-uuid>`, and `cleanup <request-uuid>`; requires effective root plus
+the original `SUDO_UID`/`SUDO_GID`; and uses a fixed management root. Request
+UUIDs select files inside the managed exchange tree, so callers cannot supply a
+filesystem path or place JSON/secret values in a command line. Standard output
+contains only an exchange UID or request UUID readiness/removal marker. Detailed
+authority failures stay in the protected response envelope.
+
+The authoritative control database and stable appliance UUID live under
+`/var/lib/vpn-appliance-manager/control`, not `/opt/vpn-appliance-manager`.
+The latter is the existing deployment runtime and can be user-writable; placing
+root authority beneath it would make its parent a privilege-escalation boundary.
+The new root is therefore separate and root-controlled without changing the
+existing runtime layout in this unit.
+
+The exchange is `/var/lib/vpn-appliance-manager/exchange/<uid>`. Its root and
+per-UID parent are helper-owned traversal-only directories, the request leaf is
+`0700` and owned by the SSH caller, and the response leaf remains helper-owned
+and traversal-only. Request and response files are exact `0600` regular files
+owned by the caller. Directory creation rejects non-directories and unexpected
+owners before changing modes; this prevents a caller from swapping a writable
+parent for a symlink and inducing privileged `chmod`/`chown`. Requests are
+bounded before parsing and removed after reading. Responses are written through
+exclusive `0600` temporary files, atomically renamed, downloaded with the
+existing bounded SFTP primitive in the future client unit, and explicitly
+removed through `cleanup`. One message is limited to 64 MiB and one secret read
+to 4,096 identifiers.
+
+The dispatcher performs exact protocol compatibility and appliance-identity
+checks, then exposes the authority store's snapshot, lease, commit, and protected
+secret operations. Snapshot table reads now share one SQLite transaction so a
+cache generation cannot mix revisions. Secret reads require an exact expected
+revision and run inside one transaction, preventing a caller from combining
+secret values from a newer generation with stale public state. Authority
+information now reports the helper/library software version alongside protocol
+and schema versions.
+
+Added `build-helpers/server/build.sh` as a rerunnable, non-installing Linux
+packaging helper. It performs a locked release build, copies the binary to a
+host-triple-specific directory under `target/vam-server-dist`, sets executable
+mode, and atomically replaces its SHA-256 sidecar. Installation, sudo policy,
+remote upload, and live initialization remain later reviewed work.
+
+Files changed:
+
+- `Cargo.toml` and `Cargo.lock`: register the `vam-server` workspace binary and
+  Unix-only `nix` ownership APIs;
+- `apps/server/Cargo.toml`: helper manifest and platform-specific dependency;
+- `apps/server/src/lib.rs`: fixed paths/invocations, privilege and caller checks,
+  protected exchange lifecycle, bounded dispatcher, and hostile-input tests;
+- `apps/server/src/main.rs`: nonsecret command-line entry point;
+- `build-helpers/server/build.sh`: locked host-native package/checksum helper;
+- `crates/authority/src/lib.rs`: transactional snapshots, revision-bound secret
+  reads, and reported software version.
+
+Validation and diagnosis:
+
+- five helper tests pass, covering fixed invocation parsing, path-like argument
+  rejection, stable appliance identity, private exchange round-trip and cleanup,
+  malformed/mismatched JSON, request-size enforcement, transactional lease and
+  commit dispatch, and stale secret-read rejection;
+- security review found that making the per-UID parent caller-owned would permit
+  a directory-to-symlink replacement before privileged mode/owner repair; the
+  tree was changed to keep that parent and response leaf helper-owned, validate
+  types/owners/modes, and expose only the request leaf for caller writes;
+- the first strict check after that hardening stopped on Windows-only unused
+  Unix ownership state; the conditional state was isolated and the targeted
+  test and strict-Clippy gates then passed;
+- `cargo fmt --all -- --check` passes;
+- `cargo test -p vam-server` passes 5/5 tests plus doc tests;
+- `cargo clippy -p vam-server --all-targets -- -D warnings` passes;
+- `cargo test --workspace` passes all Rust tests and documentation targets;
+- `cargo clippy --workspace --all-targets -- -D warnings` passes;
+- `git diff --check` passes (Git reports only the checkout's configured future
+  LF-to-CRLF normalization warnings);
+- WSL `bash -n build-helpers/server/build.sh` passes;
+- the fetched `nix` 0.31.3 source was checked for the used effective UID/GID,
+  raw-ID conversion, and `chown` APIs, but this is not a native Linux build or
+  runtime claim.
+
+No desktop bootstrap, SSH transport, remote installation, sudo policy, existing
+VPN runtime, or local legacy authority path is changed by this unit.
