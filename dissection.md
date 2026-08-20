@@ -6426,3 +6426,66 @@ Validation and diagnosis:
 
 No desktop bootstrap, SSH transport, remote installation, sudo policy, existing
 VPN runtime, or local legacy authority path is changed by this unit.
+
+### 13.12 Local connection authority and disposable cache stores
+
+Status: the persistence half of functional unit 3 is complete with local
+automated validation. Desktop/CLI bootstrap cutover intentionally waits for the
+authority client: opening these empty stores before synchronization exists would
+make existing installations appear to lose their locally authoritative state
+without offering the required reviewed migration.
+
+Added two schemas with deliberately separate database handles and files. The
+durable `ConnectionStore` is limited to local connection identity, SSH endpoint,
+private-key path, optional local passphrase reference, and locally approved host
+keys. A local connection UUID can bind to one discovered appliance UUID, and a
+database uniqueness constraint prevents two connection records from silently
+claiming the same appliance. Host-key approval remains keyed by the local
+connection and cannot be populated by a server snapshot.
+
+The replace-only `AuthorityCache` stores a complete public `AuthoritySnapshot`,
+its appliance UUID/revision/compatibility versions, and synchronization time.
+Its API accepts the value-free snapshot type rather than protected secret
+responses, rejects incompatible protocol/schema generations, checks the
+serialized appliance identity on read, and never allows an older revision to
+replace a newer cached generation. It exposes remove/clear operations because
+the file is disposable; it has no mutation API for individual VPN entities.
+
+Both file-backed stores create missing parent directories, run only their own
+migration set, enable SQLite foreign keys, and restrict their database file to
+`0600` on Unix. The existing monolithic `Storage`, its schema, and its native
+secret references remain unchanged and readable for the later explicit
+migration. New desktop startup does not switch yet, and no existing user data is
+copied, deleted, or reclassified in this sub-unit.
+
+Files changed:
+
+- `crates/storage/Cargo.toml` and `Cargo.lock`: make the public snapshot type
+  available to the local cache;
+- `crates/storage/migrations/connections/0001_connections.sql`: local-only SSH
+  connection, appliance binding, and approved-host-key schema;
+- `crates/storage/migrations/cache/0001_cache.sql`: replace-only public snapshot
+  generation schema;
+- `crates/storage/src/local.rs`: connection/trust and cache repositories,
+  identity/compatibility/revision validation, file protection, and tests;
+- `crates/storage/src/lib.rs`: export the explicit new repository types while
+  retaining legacy `Storage`.
+
+Validation and diagnosis:
+
+- the initial compile passed, while formatting and strict Clippy stopped on a
+  Windows no-op Unix permission shim; the shim was removed and its call is now
+  compiled only on Unix;
+- 19 storage tests pass: the 14 legacy tests plus connection/appliance binding,
+  local host trust, unique appliance ownership, incompatible-cache rejection,
+  monotonic cache revision, and physical cache deletion/reconstruction without
+  connection loss;
+- the cache reconstruction test closes and deletes `cache.sqlite`, recreates it
+  empty, synchronizes a newer snapshot, and verifies `connections.sqlite` still
+  contains the original appliance binding;
+- `cargo fmt --all -- --check`, targeted strict Clippy, and patch checks pass
+  after the diagnosed formatting-only fixture correction.
+
+This sub-unit establishes the storage boundary but does not yet claim that the
+desktop is a dumb SSH client. That claim requires the next authority-client and
+bootstrap cutover, followed by the reviewed legacy migration.

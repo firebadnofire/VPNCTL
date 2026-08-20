@@ -7001,6 +7001,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "uuid",
+ "vam-authority",
  "vam-core",
  "vam-protocol",
 ]

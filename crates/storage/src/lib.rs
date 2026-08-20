@@ -1,3 +1,7 @@
+mod local;
+
+pub use local::{AuthorityCache, CachedAuthoritySnapshot, ConnectionRecord, ConnectionStore};
+
 use std::{collections::HashSet, path::Path, str::FromStr};
 
 use chrono::{DateTime, Utc};
