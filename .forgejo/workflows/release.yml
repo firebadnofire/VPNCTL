@@ -10,15 +10,11 @@ env:
     Automated release assets for VPN Appliance Manager.
 
     Assets:
+    - Windows portable: `vpn-appliance-manager-windows-x86_64-portable.zip`
+    - Windows installer: `vpn-appliance-manager-windows-x86_64-installer.exe`
     - macOS app: `vpn-appliance-manager-macos-app.zip`
     - Linux AppImage: `vpn-appliance-manager-linux-x86_64.AppImage`
     - Linux deb: `vpn-appliance-manager-linux-x86_64.deb`
-
-    Windows note:
-    Windows packaging is intentionally not automated here yet because the current
-    release path uses MSVC, WebView2, NASM, and NSIS on a Windows host. Build it
-    manually with `build-helpers/windows/build.ps1` until a Windows-native
-    Forgejo runner is available.
 
 jobs:
   package:
@@ -129,6 +125,195 @@ jobs:
               rm -f dist/releases/vpn-appliance-manager-macos-app.zip
               ditto -c -k --sequesterRsrc --keepParent "$app_bundle" dist/releases/vpn-appliance-manager-macos-app.zip
             artifact_paths: dist/releases/vpn-appliance-manager-macos-app.zip
+
+          - name: Windows (Ubuntu cross-build)
+            runs_on: ubuntu-22.04
+            build_shell: bash
+            required_tools: base64 cargo cargo-xwin clang-cl cmake curl git jq lld-link llvm-rc makensis nasm node pnpm rustc rustup zip
+            prepare_checkout_command: |
+              set -euo pipefail
+
+              missing_tools=""
+              for tool in base64 curl git jq; do
+                if ! command -v "$tool" >/dev/null 2>&1; then
+                  missing_tools="${missing_tools} ${tool}"
+                fi
+              done
+
+              if [ -n "$missing_tools" ]; then
+                apt_get="apt-get"
+                if command -v sudo >/dev/null 2>&1; then
+                  apt_get="sudo apt-get"
+                fi
+                $apt_get update
+                $apt_get install -y --no-install-recommends ca-certificates coreutils curl git jq
+              fi
+
+              for tool in base64 curl git jq; do
+                if ! command -v "$tool" >/dev/null 2>&1; then
+                  echo "Missing required checkout tool after bootstrap: ${tool}" >&2
+                  exit 1
+                fi
+              done
+            setup_command: |
+              set -euo pipefail
+
+              apt_get="apt-get"
+              if command -v sudo >/dev/null 2>&1; then
+                apt_get="sudo apt-get"
+              fi
+
+              export DEBIAN_FRONTEND=noninteractive
+              $apt_get update
+              $apt_get install -y --no-install-recommends \
+                build-essential \
+                ca-certificates \
+                clang \
+                cmake \
+                coreutils \
+                curl \
+                git \
+                jq \
+                lld \
+                llvm \
+                nasm \
+                nsis \
+                perl \
+                zip
+
+              export HOME="${HOME:-/root}"
+              export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+              export RUSTUP_HOME="${RUSTUP_HOME:-${HOME}/.rustup}"
+              tool_bin="${HOME}/.local/bin"
+              mkdir -p "$tool_bin"
+              export PATH="${tool_bin}:${CARGO_HOME}/bin:${PATH}"
+              echo "$tool_bin" >> "${GITHUB_PATH:-/tmp/github_path}"
+              echo "${CARGO_HOME}/bin" >> "${GITHUB_PATH:-/tmp/github_path}"
+
+              link_versioned_tool() {
+                tool_name="$1"
+                for candidate in "/usr/bin/${tool_name}-"* "/usr/local/bin/${tool_name}-"*; do
+                  if [ -x "$candidate" ]; then
+                    ln -sf "$candidate" "${tool_bin}/${tool_name}"
+                    return 0
+                  fi
+                done
+                return 1
+              }
+
+              for tool in clang-cl llvm-rc lld-link; do
+                if ! command -v "$tool" >/dev/null 2>&1; then
+                  link_versioned_tool "$tool" || true
+                fi
+              done
+
+              node_version="v24.18.0"
+              node_dir="${HOME}/.local/node-${node_version}"
+              if ! command -v node >/dev/null 2>&1 || [ "$(node --version)" != "$node_version" ]; then
+                node_arch="$(uname -m)"
+                case "$node_arch" in
+                  x86_64) node_arch="x64" ;;
+                  aarch64) node_arch="arm64" ;;
+                  *)
+                    echo "Unsupported Linux Node architecture: ${node_arch}" >&2
+                    exit 1
+                    ;;
+                esac
+                node_archive="${RUNNER_TEMP:-/tmp}/node-${node_version}-linux-${node_arch}.tar.gz"
+                rm -rf "$node_dir"
+                mkdir -p "$node_dir"
+                curl --proto '=https' --tlsv1.2 --fail --silent --show-error \
+                  "https://nodejs.org/dist/${node_version}/node-${node_version}-linux-${node_arch}.tar.gz" \
+                  --output "$node_archive"
+                tar -xzf "$node_archive" --strip-components=1 -C "$node_dir"
+              fi
+              export PATH="${node_dir}/bin:${PATH}"
+              echo "${node_dir}/bin" >> "${GITHUB_PATH:-/tmp/github_path}"
+
+              if ! command -v rustup >/dev/null 2>&1; then
+                curl --proto '=https' --tlsv1.2 --fail --silent --show-error https://sh.rustup.rs \
+                  | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.97.1
+              fi
+              rustup toolchain install 1.97.1 --profile minimal --component clippy --component rustfmt
+              rustup default 1.97.1
+              rustup target add x86_64-pc-windows-msvc
+
+              if ! command -v cargo-xwin >/dev/null 2>&1; then
+                cargo install --locked cargo-xwin
+              fi
+
+              corepack enable pnpm --install-directory "$tool_bin"
+              corepack install --global pnpm@11.9.0
+
+              for tool in cargo-xwin clang-cl cmake lld-link llvm-rc makensis nasm; do
+                if ! command -v "$tool" >/dev/null 2>&1; then
+                  echo "Missing Windows cross-build tool after setup: ${tool}" >&2
+                  exit 1
+                fi
+              done
+              if [ "$(node --version)" != "v24.18.0" ]; then
+                echo "Node v24.18.0 is required; found $(node --version)" >&2
+                exit 1
+              fi
+              if [ "$(pnpm --version)" != "11.9.0" ]; then
+                echo "pnpm 11.9.0 is required; found $(pnpm --version)" >&2
+                exit 1
+              fi
+              if [ "$(rustc --version | awk '{print $2}')" != "1.97.1" ]; then
+                echo "Rust 1.97.1 is required; found $(rustc --version)" >&2
+                exit 1
+              fi
+            build_command: |
+              set -euo pipefail
+
+              export HOME="${HOME:-/root}"
+              export CARGO_HOME="${CARGO_HOME:-${HOME}/.cargo}"
+              export PATH="${HOME}/.local/node-v24.18.0/bin:${HOME}/.local/bin:${CARGO_HOME}/bin:${PATH}"
+              export CI=true
+              export XWIN_CACHE_DIR="${XWIN_CACHE_DIR:-${HOME}/.cache/xwin}"
+
+              pnpm install --frozen-lockfile
+              pnpm --dir apps/desktop check
+              pnpm --dir apps/desktop test
+              pnpm --dir apps/desktop build:web
+              cargo fetch --locked --target x86_64-pc-windows-msvc
+              pnpm --dir apps/desktop tauri build \
+                --ci \
+                --bundles nsis \
+                --config src-tauri/tauri.windows.conf.json \
+                --runner cargo-xwin \
+                --target x86_64-pc-windows-msvc
+
+              windows_release_bin="target/x86_64-pc-windows-msvc/release/vpn-appliance-manager.exe"
+              if [ ! -f "$windows_release_bin" ]; then
+                echo "Windows cross-build did not produce ${windows_release_bin}." >&2
+                find target -type f -name '*.exe' -print | sort >&2
+                exit 1
+              fi
+
+              windows_webview2_loader="$(find target/x86_64-pc-windows-msvc -type f -path '*/out/x64/WebView2Loader.dll' -print | sort | head -n 1)"
+              if [ -z "$windows_webview2_loader" ] || [ ! -f "$windows_webview2_loader" ]; then
+                echo "Windows cross-build did not produce WebView2Loader.dll." >&2
+                find target/x86_64-pc-windows-msvc -type f -name 'WebView2Loader.dll' -print | sort >&2
+                exit 1
+              fi
+
+              windows_installer="$(find target/x86_64-pc-windows-msvc/release/bundle/nsis -maxdepth 1 -type f -name '*.exe' -print | sort | head -n 1)"
+              if [ -z "$windows_installer" ] || [ ! -f "$windows_installer" ]; then
+                echo "Windows cross-build did not produce an NSIS installer." >&2
+                exit 1
+              fi
+
+              mkdir -p dist/releases dist/windows/x86_64
+              rm -f dist/releases/vpn-appliance-manager-windows-x86_64-portable.zip
+              rm -f dist/releases/vpn-appliance-manager-windows-x86_64-installer.exe
+              install -m 0755 "$windows_release_bin" dist/windows/x86_64/vpn-appliance-manager.exe
+              install -m 0644 "$windows_webview2_loader" dist/windows/x86_64/WebView2Loader.dll
+              zip -j dist/releases/vpn-appliance-manager-windows-x86_64-portable.zip \
+                dist/windows/x86_64/vpn-appliance-manager.exe \
+                dist/windows/x86_64/WebView2Loader.dll
+              install -m 0755 "$windows_installer" dist/releases/vpn-appliance-manager-windows-x86_64-installer.exe
+            artifact_paths: dist/releases/vpn-appliance-manager-windows-x86_64-portable.zip dist/releases/vpn-appliance-manager-windows-x86_64-installer.exe
 
           - name: Linux
             runs_on: ubuntu-latest
