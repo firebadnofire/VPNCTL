@@ -40,6 +40,12 @@ multi-platform Node 24.18.0 Bookworm image digest and pins Rust 1.97.1 and pnpm
 11.9.0. Set `VAM_DOCKER_PLATFORM` to `linux/amd64` or `linux/arm64` to select a
 platform explicitly.
 
+Tagged Forgejo CI releases are also mirrored to
+`https://github.com/firebadnofire/VPNCTL`. Configure the Forgejo Actions secret
+`GH_KEY` with GitHub repository Contents read/write permission. Each packaging
+job safely synchronizes the immutable release tag and replaces only the assets
+it built; an existing GitHub tag pointing at another commit is never forced.
+
 The clean helpers remove only these generated paths:
 
 - `target`
