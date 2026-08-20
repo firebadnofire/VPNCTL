@@ -62,6 +62,10 @@ use vam_secrets::{SecretStore, SecretStoreError};
 use vam_ssh::DownloadRequest;
 use vam_ssh::{CommandResult, RusshTransport, SshError, SshTransport, UploadRequest};
 use vam_storage::{ActivityRecord, BackupRecord, Storage, StorageError};
+
+mod authority_sync;
+
+pub use authority_sync::{AuthoritySyncError, AuthoritySynchronizer, SynchronizationResult};
 use zeroize::Zeroizing;
 
 const APP_ROOT: &str = "/opt/vpn-appliance-manager";

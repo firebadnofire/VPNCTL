@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -37,6 +38,16 @@ pub struct AuthoritySshSession<'a> {
     pub config: &'a SshConnectionConfig,
     pub trusted_key_base64: &'a str,
     pub passphrase: Option<&'a Zeroizing<String>>,
+}
+
+#[async_trait]
+pub trait AuthorityExchange: Send + Sync {
+    async fn exchange(
+        &self,
+        session: &AuthoritySshSession<'_>,
+        request: &AuthorityRequestEnvelope,
+        cancellation: &CancellationToken,
+    ) -> Result<AuthorityResponseEnvelope, AuthorityClientError>;
 }
 
 #[derive(Clone)]
@@ -172,6 +183,18 @@ impl AuthorityClient {
         }
         let stdout = result.stdout_text()?;
         Ok(stdout.trim().to_owned())
+    }
+}
+
+#[async_trait]
+impl AuthorityExchange for AuthorityClient {
+    async fn exchange(
+        &self,
+        session: &AuthoritySshSession<'_>,
+        request: &AuthorityRequestEnvelope,
+        cancellation: &CancellationToken,
+    ) -> Result<AuthorityResponseEnvelope, AuthorityClientError> {
+        Self::exchange(self, session, request, cancellation).await
     }
 }
 

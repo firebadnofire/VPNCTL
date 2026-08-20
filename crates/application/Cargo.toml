@@ -18,6 +18,8 @@ thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 uuid.workspace = true
+vam-authority = { path = "../authority" }
+vam-authority-client = { path = "../authority-client" }
 vam-backend-amneziawg = { path = "../backend-amneziawg" }
 vam-backend-ikev2 = { path = "../backend-ikev2" }
 vam-backend-openvpn = { path = "../backend-openvpn" }

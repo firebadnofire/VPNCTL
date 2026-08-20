@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio-util.workspace = true
@@ -16,7 +17,6 @@ vam-core = { path = "../core" }
 vam-ssh = { path = "../ssh" }
 
 [dev-dependencies]
-async-trait.workspace = true
 tokio.workspace = true
 vam-protocol = { path = "../protocol" }
 

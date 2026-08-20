@@ -6753,6 +6753,8 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
+ "vam-authority",
+ "vam-authority-client",
  "vam-backend",
  "vam-backend-amneziawg",
  "vam-backend-ikev2",

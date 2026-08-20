@@ -6548,3 +6548,57 @@ Validation and diagnosis:
 The helper is not installed by this change, and the existing application still
 uses legacy `Storage` until the next synchronization/cutover work can preserve
 the explicit migration gate.
+
+### 13.14 Revision-aware synchronization coordinator
+
+Status: the read/synchronize portion of functional unit 4 is complete with
+application-layer automated validation. Mutation routing, public stale/offline
+models, and desktop bootstrap cutover remain incomplete.
+
+Added `AuthoritySynchronizer` at the application boundary. Given a local
+connection UUID, it loads only the connection record, locally approved host key,
+and optional SSH-key passphrase; performs a verified `Info` exchange; enforces
+exact protocol/schema compatibility; and permanently binds a previously
+unbound local connection to the discovered appliance UUID. A later response
+from a different appliance is rejected before any snapshot request, even if the
+SSH host key is otherwise approved.
+
+Synchronization reads the cached appliance revision and requests a snapshot
+with that `known_revision`. A matching `NotModified` response avoids a state
+transfer and cache write. A differing complete snapshot is identity-checked and
+atomically replaces the public cache generation. Remote structured failures,
+missing local trust, invalid local passphrase bytes, appliance identity changes,
+unexpected response variants, storage errors, and exchange errors remain
+distinct; no offline write or manufactured success is introduced.
+
+The client now also implements a narrow `AuthorityExchange` trait. This exists
+only at the application/transport seam so synchronization and later mutation
+coordination can be tested without network access; the production implementation
+continues to be the verified SSH client rather than a second protocol path.
+
+Files changed:
+
+- `crates/authority-client/Cargo.toml` and `src/lib.rs`: public asynchronous
+  exchange seam implemented by the verified SSH client;
+- `crates/application/Cargo.toml`: authority protocol/client dependencies;
+- `crates/application/src/authority_sync.rs`: trust-gated appliance discovery,
+  stable identity binding, revision-aware cache refresh, typed results/errors,
+  and tests;
+- `crates/application/src/lib.rs`: exports the coordinator without changing the
+  existing `ApplicationService` constructor yet;
+- `Cargo.lock`: dependency graph update.
+
+Validation and diagnosis:
+
+- the first coordinator compile passed but strict Clippy stopped on one unused
+  import; it was removed before tests were added;
+- three application tests prove first-client binding and cache fill, equal-
+  revision `NotModified` behavior with `known_revision`, and refusal to request
+  state after a bound connection reaches a different appliance identity;
+- the targeted application/client suite passes 48 tests plus documentation
+  targets;
+- targeted formatting and strict Clippy pass.
+
+The desktop still opens legacy `state.sqlite`; this coordinator is not presented
+as an end-user cutover until explicit connection creation, helper readiness,
+migration review, and cached public-model routing can be delivered together.
