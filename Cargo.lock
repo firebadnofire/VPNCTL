@@ -6770,6 +6770,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "vam-authority"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "uuid",
+ "vam-core",
+ "vam-protocol",
+ "zeroize",
+]
+
+[[package]]
 name = "vam-backend"
 version = "0.1.0"
 dependencies = [

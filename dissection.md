@@ -6255,3 +6255,83 @@ will not be inferred from local tests.
 No unit will copy SQLite/WAL files between client and server, trust a host-supplied
 host-key pin, queue offline writes, put secret JSON in shell arguments or logs,
 or broaden remote permissions to make the helper convenient.
+
+### 13.10 Authority protocol and transactional store
+
+Status: functional unit 1 complete with local automated validation. The store is
+not yet reachable over SSH; helper/exchange integration is the next unit.
+
+Added the `vam-authority` library as the shared client/helper authority boundary.
+Its versioned JSON envelope contains a request UUID, optional expected appliance
+UUID, exact protocol version, and tagged operation. The first protocol supports
+information/compatibility inspection, revision-aware snapshots, mutation lease
+acquire/renew/abort, atomic commit, and bounded-reference secret retrieval.
+Response failures are structured as invalid request, incompatible, conflict,
+busy, invalid lease, missing record, or internal failure. Database/filesystem
+errors are reduced to a generic remote message rather than returning sensitive
+implementation detail.
+
+The authority schema is separate from the legacy desktop schema. It stores one
+stable appliance UUID, monotonic revision, protocol/schema version, and optional
+lease; normalized instance, user, device, DNS, deployment, event, backup,
+activity, setting, secret, and idempotency tables; and foreign keys that prevent
+orphaned appliance aggregates. It intentionally contains no SSH endpoint,
+private-key path, passphrase reference, or approved host key.
+
+`AuthorityStore` creates/migrates the database, verifies that a reopened file
+belongs to the expected appliance, enables SQLite foreign keys and full
+synchronous writes, uses WAL only inside the appliance store, and enforces
+`0700` parent-directory plus `0600` database modes on Unix. No SQLite file is an
+interchange payload.
+
+Secret values are BLOBs keyed by the existing UUID references. The protocol
+serializes them as base64 only inside protected request/response files; custom
+`Debug` output always shows `[REDACTED]`, and their byte buffers zeroize on drop.
+Snapshots include only secret metadata and never values. Secret inserts/updates
+share the same database transaction and revision increment as their owning state
+change.
+
+Mutation leases are persisted and conditional on the exact current revision.
+Active overlapping leases return a structured busy result; stale revisions
+return the expected/current pair. Commit applies the typed change set and clears
+the unexpired matching lease only while incrementing the revision. A foreign-key
+or other transaction failure rolls back the changes, leaves the revision
+unchanged, and preserves the lease so application rollback/retry remains
+possible. Reusing a committed lease returns a revision conflict and cannot
+advance the revision twice.
+
+Files changed:
+
+- `Cargo.toml` and `Cargo.lock`: register `vam-authority` and its existing
+  workspace dependencies;
+- `crates/authority/Cargo.toml`: isolated library manifest;
+- `crates/authority/migrations/0001_authority.sql`: authority metadata, lease,
+  aggregate, protected-secret, and idempotency schema;
+- `crates/authority/src/lib.rs`: protocol types, redacted secret buffers,
+  compatibility mapping, snapshot reads, lease lifecycle, atomic change-set
+  commits, protected secret fetch, permission enforcement, and tests.
+
+Validation and diagnosis:
+
+- the first test build stopped because the current `NetworkConfig` fixture also
+  requires explicit optional IPv6 subnet and gateway fields; the fixture was
+  corrected without changing the production model;
+- strict Clippy stopped on unnecessary `Result` returns in Windows-only no-op
+  permission shims; permission calls are now compiled only on Unix and the shims
+  were removed;
+- strict Clippy then stopped on the size of the commit operation enum variant;
+  boxing its change set keeps normal protocol envelopes compact without changing
+  JSON;
+- six focused authority tests pass, covering disk reopen, appliance identity,
+  value-free snapshots, protected secret retrieval, base64 protocol round-trip,
+  redacted debug output, exact compatibility, overlapping and stale leases,
+  exact-once revision advancement, and failed-transaction rollback;
+- `cargo fmt --all -- --check` passes;
+- `cargo clippy -p vam-authority --all-targets -- -D warnings` passes;
+- `cargo test -p vam-authority` passes 6/6 tests plus doc tests;
+- `cargo test --workspace` passed every pre-existing Rust test plus all six
+  authority tests and documentation targets;
+- `cargo clippy --workspace --all-targets -- -D warnings` passed after the
+  authority protocol/store implementation.
+
+No local desktop authority path or remote runtime was changed in this unit.

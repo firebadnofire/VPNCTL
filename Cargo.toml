@@ -4,6 +4,7 @@ members = [
   "apps/cli",
   "apps/desktop/src-tauri",
   "crates/application",
+  "crates/authority",
   "crates/backend",
   "crates/backend-amneziawg",
   "crates/backend-ikev2",
