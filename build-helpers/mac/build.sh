@@ -107,4 +107,4 @@ if [[ "${VAM_SIGN:-0}" != "1" ]]; then
 fi
 
 pnpm --dir apps/desktop tauri "${tauri_args[@]}"
-echo "macOS bundle: ${repo_root}/target/release/bundle/macos/VPN Appliance Manager.app"
+echo "macOS bundle: ${repo_root}/target/release/bundle/macos/VPNCTL.app"

@@ -243,13 +243,13 @@ services:
     if !runtime.mounts.is_empty() {
         output.push_str("    volumes:\n");
         for mount in &runtime.mounts {
-            let read_only = if mount.read_only { ":ro" } else { "" };
+            let options = if mount.read_only { ":ro,z" } else { ":z" };
             writeln!(
                 output,
                 "      - \"./{}:{}{}\"",
                 yaml_escape(mount.host_path),
                 yaml_escape(mount.container_path),
-                read_only
+                options
             )
             .expect("writing to a String cannot fail");
         }
@@ -264,9 +264,9 @@ services:
     depends_on:
       - gateway
     volumes:
-      - "./dns/Corefile:/etc/coredns/Corefile:ro"
-      - "./dns/zones:/etc/coredns/zones:ro"
-      - "./dns/hosts:/etc/coredns/hosts:ro"
+      - "./dns/Corefile:/etc/coredns/Corefile:ro,z"
+      - "./dns/zones:/etc/coredns/zones:ro,z"
+      - "./dns/hosts:/etc/coredns/hosts:ro,z"
     command:
       - "-conf"
       - "/etc/coredns/Corefile"
@@ -676,7 +676,8 @@ mod tests {
         assert!(first.contains(WIREGUARD_IMAGE));
         assert!(first.contains(COREDNS_IMAGE));
         assert!(first.contains("network_mode: service:gateway"));
-        assert!(first.contains("\"./dns/hosts:/etc/coredns/hosts:ro\""));
+        assert!(first.contains("\"./dns/hosts:/etc/coredns/hosts:ro,z\""));
+        assert!(first.contains("\"./vpn:/config/wg_confs:z\""));
         assert!(first.contains("\"LOG_CONFS\": \"false\""));
         assert!(first.contains("\"${VAM_LISTENER_0_PORT}:51820/udp\""));
         assert!(first.contains("NET_ADMIN"));

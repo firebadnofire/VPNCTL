@@ -131,7 +131,7 @@ fi
 pnpm --dir apps/desktop tauri "${tauri_args[@]}"
 
 bundle_root="${repo_root}/target/universal-apple-darwin/release/bundle"
-echo "Universal app: ${bundle_root}/macos/VPN Appliance Manager.app"
+echo "Universal app: ${bundle_root}/macos/VPNCTL.app"
 
 dmg_files=("${bundle_root}/dmg/"*.dmg)
 if [[ -e "${dmg_files[0]}" ]]; then

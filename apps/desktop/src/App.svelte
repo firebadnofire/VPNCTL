@@ -81,7 +81,7 @@
   let activeDnsPanel: DnsPanel = "Records";
   let modal: Modal = null;
   let appInfo: AppInfo = {
-    name: "VPN Appliance Manager",
+    name: "VPNCTL",
     version: "0.1.0",
     status: "starting",
     system_username: "",
@@ -1135,13 +1135,13 @@
   }
 </script>
 
-<svelte:head><title>{active} · VPN Appliance Manager</title></svelte:head>
+<svelte:head><title>{active} · VPNCTL</title></svelte:head>
 
 <div class="shell">
   <aside>
     <div class="brand">
-      <div class="mark">VA</div>
-      <div><strong>VPN Appliance</strong><span>Manager</span></div>
+      <div class="mark">V</div>
+      <div><strong>VPNCTL</strong></div>
     </div>
     <nav aria-label="Primary">
       {#each sections as section}

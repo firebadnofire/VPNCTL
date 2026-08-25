@@ -8,14 +8,14 @@ name: Release Packaging
 env:
   GITHUB_MIRROR_REPOSITORY: firebadnofire/VPNCTL
   RELEASE_BODY: |
-    Automated release assets for VPN Appliance Manager.
+    Automated release assets for VPNCTL.
 
     Assets:
-    - Windows portable: `vpn-appliance-manager-windows-x86_64-portable.zip`
-    - Windows installer: `vpn-appliance-manager-windows-x86_64-installer.exe`
-    - macOS app: `vpn-appliance-manager-macos-app.zip`
-    - Linux AppImage: `vpn-appliance-manager-linux-x86_64.AppImage`
-    - Linux deb: `vpn-appliance-manager-linux-x86_64.deb`
+    - Windows portable: `vpnctl-windows-x86_64-portable.zip`
+    - Windows installer: `vpnctl-windows-x86_64-installer.exe`
+    - macOS app: `vpnctl-macos-app.zip`
+    - Linux AppImage: `vpnctl-linux-x86_64.AppImage`
+    - Linux deb: `vpnctl-linux-x86_64.deb`
 
     Every artifact includes a detached armored GPG signature with the same
     filename plus `.asc`. Download both files, recover the signing key
@@ -39,8 +39,8 @@ env:
     successful signature verification.
 
     macOS note:
-    After unzipping `VPN Appliance Manager.app`, remove the quarantine flag before first launch:
-    `xattr -dr com.apple.quarantine "/path/to/VPN Appliance Manager.app"`
+    After unzipping `VPNCTL.app`, remove the quarantine flag before first launch:
+    `xattr -dr com.apple.quarantine "/path/to/VPNCTL.app"`
 
 jobs:
   package:
@@ -150,17 +150,17 @@ jobs:
 
               bash ./build-helpers/mac/build.sh
 
-              app_bundle="target/release/bundle/macos/VPN Appliance Manager.app"
+              app_bundle="target/release/bundle/macos/VPNCTL.app"
               if [ ! -d "$app_bundle" ]; then
                 echo "macOS build did not produce ${app_bundle}." >&2
                 exit 1
               fi
 
               mkdir -p dist/releases
-              rm -f dist/releases/vpn-appliance-manager-macos-app.zip
-              ditto -c -k --sequesterRsrc --keepParent "$app_bundle" dist/releases/vpn-appliance-manager-macos-app.zip
-            artifact_paths: dist/releases/vpn-appliance-manager-macos-app.zip
-            release_asset_paths: dist/releases/vpn-appliance-manager-macos-app.zip dist/releases/vpn-appliance-manager-macos-app.zip.asc
+              rm -f dist/releases/vpnctl-macos-app.zip
+              ditto -c -k --sequesterRsrc --keepParent "$app_bundle" dist/releases/vpnctl-macos-app.zip
+            artifact_paths: dist/releases/vpnctl-macos-app.zip
+            release_asset_paths: dist/releases/vpnctl-macos-app.zip dist/releases/vpnctl-macos-app.zip.asc
 
           - name: Windows (Ubuntu cross-build)
             runs_on: ubuntu-22.04
@@ -344,16 +344,16 @@ jobs:
               fi
 
               mkdir -p dist/releases dist/windows/x86_64
-              rm -f dist/releases/vpn-appliance-manager-windows-x86_64-portable.zip
-              rm -f dist/releases/vpn-appliance-manager-windows-x86_64-installer.exe
-              install -m 0755 "$windows_release_bin" dist/windows/x86_64/vpn-appliance-manager.exe
+              rm -f dist/releases/vpnctl-windows-x86_64-portable.zip
+              rm -f dist/releases/vpnctl-windows-x86_64-installer.exe
+              install -m 0755 "$windows_release_bin" dist/windows/x86_64/vpnctl.exe
               install -m 0644 "$windows_webview2_loader" dist/windows/x86_64/WebView2Loader.dll
-              zip -j dist/releases/vpn-appliance-manager-windows-x86_64-portable.zip \
-                dist/windows/x86_64/vpn-appliance-manager.exe \
+              zip -j dist/releases/vpnctl-windows-x86_64-portable.zip \
+                dist/windows/x86_64/vpnctl.exe \
                 dist/windows/x86_64/WebView2Loader.dll
-              install -m 0755 "$windows_installer" dist/releases/vpn-appliance-manager-windows-x86_64-installer.exe
-            artifact_paths: dist/releases/vpn-appliance-manager-windows-x86_64-portable.zip dist/releases/vpn-appliance-manager-windows-x86_64-installer.exe
-            release_asset_paths: dist/releases/vpn-appliance-manager-windows-x86_64-portable.zip dist/releases/vpn-appliance-manager-windows-x86_64-portable.zip.asc dist/releases/vpn-appliance-manager-windows-x86_64-installer.exe dist/releases/vpn-appliance-manager-windows-x86_64-installer.exe.asc
+              install -m 0755 "$windows_installer" dist/releases/vpnctl-windows-x86_64-installer.exe
+            artifact_paths: dist/releases/vpnctl-windows-x86_64-portable.zip dist/releases/vpnctl-windows-x86_64-installer.exe
+            release_asset_paths: dist/releases/vpnctl-windows-x86_64-portable.zip dist/releases/vpnctl-windows-x86_64-portable.zip.asc dist/releases/vpnctl-windows-x86_64-installer.exe dist/releases/vpnctl-windows-x86_64-installer.exe.asc
 
           - name: Linux
             runs_on: ubuntu-latest
@@ -496,12 +496,12 @@ jobs:
               fi
 
               mkdir -p dist/releases
-              rm -f dist/releases/vpn-appliance-manager-linux-x86_64.AppImage
-              rm -f dist/releases/vpn-appliance-manager-linux-x86_64.deb
-              install -m 0755 "$linux_appimage" dist/releases/vpn-appliance-manager-linux-x86_64.AppImage
-              install -m 0644 "$linux_deb" dist/releases/vpn-appliance-manager-linux-x86_64.deb
-            artifact_paths: dist/releases/vpn-appliance-manager-linux-x86_64.AppImage dist/releases/vpn-appliance-manager-linux-x86_64.deb
-            release_asset_paths: dist/releases/vpn-appliance-manager-linux-x86_64.AppImage dist/releases/vpn-appliance-manager-linux-x86_64.AppImage.asc dist/releases/vpn-appliance-manager-linux-x86_64.deb dist/releases/vpn-appliance-manager-linux-x86_64.deb.asc
+              rm -f dist/releases/vpnctl-linux-x86_64.AppImage
+              rm -f dist/releases/vpnctl-linux-x86_64.deb
+              install -m 0755 "$linux_appimage" dist/releases/vpnctl-linux-x86_64.AppImage
+              install -m 0644 "$linux_deb" dist/releases/vpnctl-linux-x86_64.deb
+            artifact_paths: dist/releases/vpnctl-linux-x86_64.AppImage dist/releases/vpnctl-linux-x86_64.deb
+            release_asset_paths: dist/releases/vpnctl-linux-x86_64.AppImage dist/releases/vpnctl-linux-x86_64.AppImage.asc dist/releases/vpnctl-linux-x86_64.deb dist/releases/vpnctl-linux-x86_64.deb.asc
 
     steps:
       - name: Prepare checkout runtime
@@ -819,7 +819,7 @@ jobs:
           owner="${repository%%/*}"
           repo="${repository#*/}"
           asset_paths="${RELEASE_ASSET_PATHS:?Missing release asset paths}"
-          release_name="VPN Appliance Manager ${tag}"
+          release_name="VPNCTL ${tag}"
           release_body="${INPUT_RELEASE_BODY:-Automated release for ${tag}.}"
 
           case "$api_url" in
@@ -963,7 +963,7 @@ jobs:
             tag="${tag#refs/tags/}"
           fi
           asset_paths="${RELEASE_ASSET_PATHS:?Missing release asset paths}"
-          release_name="VPN Appliance Manager ${tag}"
+          release_name="VPNCTL ${tag}"
           release_body="${INPUT_RELEASE_BODY:-Automated release for ${tag}.}"
           response_dir="$(mktemp -d)"
           trap 'rm -rf "$response_dir"' EXIT

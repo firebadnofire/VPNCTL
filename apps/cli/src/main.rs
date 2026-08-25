@@ -11,7 +11,7 @@ use vam_core::{DEFAULT_DNS_ZONE, DEFAULT_SUBNET, DnsRecordType, VpnBackendKind};
 use vam_secrets::KeychainSecretStore;
 
 #[derive(Debug, Parser)]
-#[command(name = "vam-dev", about = "VPN Appliance Manager developer harness")]
+#[command(name = "vam-dev", about = "VPNCTL developer harness")]
 struct Cli {
     #[arg(long, default_value = "vam-dev.sqlite")]
     database: PathBuf,
@@ -224,7 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let service = ApplicationService::new(storage, Arc::new(KeychainSecretStore));
     match cli.command {
         Command::Info => {
-            println!("VPN Appliance Manager developer harness");
+            println!("VPNCTL developer harness");
             println!("database: {}", cli.database.display());
             println!(
                 "WireGuard image: {}",

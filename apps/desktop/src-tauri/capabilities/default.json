@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capabilities for the main VPN Appliance Manager window",
+  "description": "Capabilities for the main VPNCTL window",
   "windows": ["main"],
   "permissions": [
     "core:default",

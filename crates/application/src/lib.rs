@@ -5523,7 +5523,7 @@ install -d {instances} {staging_root} {backups} {trash} {stage}
         }
         let cleanup_stage = format!(
             "docker run --rm --user 0:0 --entrypoint sh -v {root_mount} {image} -c {script}",
-            root_mount = shell_quote(&format!("{APP_ROOT}:/vam")),
+            root_mount = shell_quote(&format!("{APP_ROOT}:/vam:z")),
             image = shell_quote(runtime_image_reference(&runtime)),
             script = shell_quote(&format!(
                 "rm -rf -- /vam/staging/{}-{}",
@@ -5833,7 +5833,7 @@ fn authority_mount<'a>(
         .find(|mount| path_is_within(first_path, mount.host_path) && !mount.read_only)
         .ok_or("The certificate backend has no writable mount for its persistent authority.")?;
     Ok((
-        format!("{stage}/{}:{}", mount.host_path, mount.container_path),
+        format!("{stage}/{}:{}:z", mount.host_path, mount.container_path),
         mount.container_path,
     ))
 }
@@ -6361,7 +6361,7 @@ fn copy_managed_tree_command(
         .ok_or("The backup destination is outside the managed application root.")?;
     Ok(format!(
         "docker run --rm --user 0:0 --entrypoint cp -v {mount} {image} -a -- {source} {destination}",
-        mount = shell_quote(&format!("{APP_ROOT}:/vam")),
+        mount = shell_quote(&format!("{APP_ROOT}:/vam:z")),
         image = shell_quote(runtime_image_reference(runtime)),
         source = shell_quote(&source),
         destination = shell_quote(&destination),
@@ -6578,7 +6578,7 @@ fn prepare_numeric_mount_ownership_command(
         let ContainerMountOwnership::Numeric { uid, gid } = mount.ownership else {
             unreachable!("the iterator retains only numeric ownership")
         };
-        let bind = format!("{current}/{}:/work", mount.host_path);
+        let bind = format!("{current}/{}:/work:z", mount.host_path);
         write!(
             command,
             "; docker run --rm --user 0:0 --entrypoint sh -v {} {} -c {}",
@@ -6603,7 +6603,7 @@ fn normalize_host_mount_ownership_command(
         .iter()
         .filter(|mount| !mount.read_only && mount.ownership == ContainerMountOwnership::HostUser)
     {
-        let bind = format!("{current}/{}:/work", mount.host_path);
+        let bind = format!("{current}/{}:/work:z", mount.host_path);
         write!(
             command,
             "; docker run --rm --user 0:0 --entrypoint sh -e VAM_UID=\"$(id -u)\" -e VAM_GID=\"$(id -g)\" -v {} {} -c {}",
@@ -6672,7 +6672,7 @@ printf 'server_public_key=%s\n' "$public_key"
     };
     Some(format!(
         "set -eu; {preserve}docker run --rm --entrypoint sh -v {stage_mount} {image} -c {script}",
-        stage_mount = shell_quote(&format!("{stage}:/work")),
+        stage_mount = shell_quote(&format!("{stage}:/work:z")),
         image = shell_quote(runtime_image_reference(runtime)),
         script = shell_quote(&script),
     ))
@@ -6720,7 +6720,7 @@ fn validation_command(stage: &str, runtime: &BackendRuntimeSpec, managed_dns: bo
                 .iter()
                 .find(|mount| config_path.starts_with(mount.host_path))
                 .expect("backend validation path must be under a declared mount");
-            let mount_value = format!("{stage}/{}:{}:ro", mount.host_path, mount.container_path);
+            let mount_value = format!("{stage}/{}:{}:ro,z", mount.host_path, mount.container_path);
             let script = format!(
                 "{} strip {} >/dev/null",
                 tool,
@@ -6743,7 +6743,7 @@ fn validation_command(stage: &str, runtime: &BackendRuntimeSpec, managed_dns: bo
                 .iter()
                 .find(|mount| config_path.starts_with(mount.host_path))
                 .expect("backend validation path must be under a declared mount");
-            let mount_value = format!("{stage}/{}:{}", mount.host_path, mount.container_path);
+            let mount_value = format!("{stage}/{}:{}:z", mount.host_path, mount.container_path);
             write!(
                 command,
                 "; openvpn_probe=\"$(docker run -d --cap-add NET_ADMIN --device /dev/net/tun --entrypoint openvpn -v {} {} --config {} --verb 3)\"; cleanup_openvpn_probe() {{ docker rm -f \"$openvpn_probe\" >/dev/null 2>&1 || true; }}; trap cleanup_openvpn_probe EXIT INT TERM HUP; sleep 2; openvpn_running=\"$(docker inspect --format '{{{{.State.Running}}}}' \"$openvpn_probe\" 2>/dev/null || printf false)\"; if test \"$openvpn_running\" != true; then docker logs \"$openvpn_probe\" >&2 || true; exit 1; fi; cleanup_openvpn_probe; trap - EXIT INT TERM HUP",
@@ -6754,7 +6754,7 @@ fn validation_command(stage: &str, runtime: &BackendRuntimeSpec, managed_dns: bo
             .expect("writing to a String cannot fail");
         }
         BackendValidation::Ikev2 => {
-            let mount_value = format!("{stage}/ikev2:/etc/swanctl:ro");
+            let mount_value = format!("{stage}/ikev2:/etc/swanctl:ro,z");
             write!(
                 command,
                 "; test -s {}; ikev2_probe=\"$(docker run -d --cap-add NET_ADMIN --sysctl net.ipv4.ip_forward=1 -v {} {})\"; cleanup_ikev2_probe() {{ docker rm -f \"$ikev2_probe\" >/dev/null 2>&1 || true; }}; trap cleanup_ikev2_probe EXIT INT TERM HUP; sleep 2; ikev2_running=\"$(docker inspect --format '{{{{.State.Running}}}}' \"$ikev2_probe\" 2>/dev/null || printf false)\"; if test \"$ikev2_running\" != true; then docker logs \"$ikev2_probe\" >&2 || true; exit 1; fi; if ! docker exec \"$ikev2_probe\" sh -c 'pidof charon >/dev/null && swanctl --list-conns >/dev/null'; then docker logs \"$ikev2_probe\" >&2 || true; exit 1; fi; cleanup_ikev2_probe; trap - EXIT INT TERM HUP",
@@ -6775,7 +6775,7 @@ fn validation_command(stage: &str, runtime: &BackendRuntimeSpec, managed_dns: bo
         }
     }
     if managed_dns {
-        let dns_mount = format!("{stage}/dns:/etc/coredns:ro");
+        let dns_mount = format!("{stage}/dns:/etc/coredns:ro,z");
         write!(
             command,
             r#"; cid="$(docker run -d --rm -v {dns_mount} {dns_image} -conf /etc/coredns/Corefile)"; trap 'docker rm -f "$cid" >/dev/null 2>&1 || true' EXIT HUP INT TERM; sleep 1; test "$(docker inspect -f '{{{{.State.Running}}}}' "$cid")" = true; docker rm -f "$cid" >/dev/null; cid=; trap - EXIT HUP INT TERM"#,
@@ -8808,7 +8808,7 @@ mod tests {
         let command = copy_managed_tree_command(&source, &destination, &runtime).unwrap();
 
         assert!(command.contains("docker run --rm --user 0:0 --entrypoint cp"));
-        assert!(command.contains(&shell_quote(&format!("{APP_ROOT}:/vam"))));
+        assert!(command.contains(&shell_quote(&format!("{APP_ROOT}:/vam:z"))));
         assert!(command.contains(&shell_quote(runtime_image_reference(&runtime))));
         assert!(command.contains("-a -- '/vam/instances/source' '/vam/backups/target'"));
         assert!(copy_managed_tree_command("/tmp/source", &destination, &runtime).is_err());
@@ -8871,7 +8871,7 @@ mod tests {
         let ownership =
             prepare_numeric_mount_ownership_command("/safe/current", &xray_runtime).unwrap();
         assert!(ownership.contains("chown -R 10001:10001 /work"));
-        assert!(ownership.contains("'/safe/current/xray-state:/work'"));
+        assert!(ownership.contains("'/safe/current/xray-state:/work:z'"));
     }
 
     #[test]
@@ -9035,7 +9035,7 @@ mod tests {
         .unwrap();
         assert!(command.contains("easyrsa import-req"));
         assert!(command.contains("EASYRSA_DN=cn_only"));
-        assert!(command.contains("'/safe/current/vpn:/etc/openvpn'"));
+        assert!(command.contains("'/safe/current/vpn:/etc/openvpn:z'"));
         assert!(command.contains("--entrypoint chown"));
         assert!(command.contains("-R \"$host_owner\" '/etc/openvpn'"));
 
@@ -9107,10 +9107,13 @@ mod tests {
         assert!(identity.contains("awg pubkey"));
         assert!(identity.contains("/work/vpn/awg0.conf.template"));
         assert!(identity.contains("__VAM_AWG_SERVER_PRIVATE_KEY__"));
+        assert!(identity.contains("'/safe/stage:/work:z'"));
 
         let validation = validation_command("/safe/stage", &runtime, true);
         assert!(validation.contains("awg-quick"));
         assert!(validation.contains("/etc/amneziawg/awg0.conf"));
+        assert!(validation.contains("'/safe/stage/vpn:/etc/amneziawg:ro,z'"));
+        assert!(validation.contains("'/safe/stage/dns:/etc/coredns:ro,z'"));
         assert!(validation.contains(COREDNS_IMAGE));
         assert!(validation.contains("docker compose --env-file .env config --quiet"));
     }
@@ -9127,7 +9130,7 @@ mod tests {
         assert!(validation.contains("docker run -d"));
         assert!(validation.contains("--cap-add NET_ADMIN"));
         assert!(validation.contains("--device /dev/net/tun"));
-        assert!(validation.contains("'/safe/stage/vpn:/etc/openvpn'"));
+        assert!(validation.contains("'/safe/stage/vpn:/etc/openvpn:z'"));
         assert!(validation.contains("--config '/etc/openvpn/server.conf'"));
         assert!(validation.contains("docker inspect --format '{{.State.Running}}'"));
         assert!(validation.contains("docker logs \"$openvpn_probe\""));
@@ -9149,7 +9152,7 @@ mod tests {
         assert!(validation.contains("docker run -d"));
         assert!(validation.contains("--cap-add NET_ADMIN"));
         assert!(validation.contains("--sysctl net.ipv4.ip_forward=1"));
-        assert!(validation.contains("'/safe/stage/ikev2:/etc/swanctl:ro'"));
+        assert!(validation.contains("'/safe/stage/ikev2:/etc/swanctl:ro,z'"));
         assert!(validation.contains("docker inspect --format '{{.State.Running}}'"));
         assert!(validation.contains("pidof charon"));
         assert!(validation.contains("swanctl --list-conns"));
@@ -10088,7 +10091,7 @@ mod tests {
             .find(|command| command.contains("reviewed-snapshot"))
             .expect("rollback copy command");
         assert!(restore.contains("docker run --rm --user 0:0 --entrypoint cp"));
-        assert!(restore.contains(&shell_quote(&format!("{APP_ROOT}:/vam"))));
+        assert!(restore.contains(&shell_quote(&format!("{APP_ROOT}:/vam:z"))));
         assert!(restore.contains("-a --"));
         assert!(restore.contains(&format!(
             "'/vam/backups/{}/reviewed-snapshot'",

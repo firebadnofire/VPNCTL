@@ -1,4 +1,4 @@
-# VPN Appliance Manager multi-protocol refactor dissection
+# VPNCTL multi-protocol refactor dissection
 
 This file is the living implementation record for the refactor of the `dnswg`
 repository. It describes the code that existed before the refactor, the design
@@ -18,7 +18,7 @@ is `f92e619` (`docs: record live backend deployment validation`). That commit is
 the latest source of this document, and there are no later implementation commits
 for the dissection to incorporate.
 
-At this revision, VPN Appliance Manager has one shared Rust application service,
+At this revision, VPNCTL has one shared Rust application service,
 a narrow Tauri bridge, a Svelte 5 desktop client, and a developer CLI. The backend
 registry contains functional WireGuard, AmneziaWG 2, OpenVPN, IKEv2, and
 Xray/VLESS implementations. The desktop exposes backend-aware creation, settings,
@@ -56,7 +56,7 @@ in section 12R are evidence from 2026-07-31 and have not been represented as a n
 
 ## 1. Refactor objective and non-negotiable boundaries
 
-VPN Appliance Manager is being expanded from a WireGuard-specific appliance
+VPNCTL is being expanded from a WireGuard-specific appliance
 manager into a multi-protocol self-hosted VPN manager supporting:
 
 - WireGuard;
@@ -66,7 +66,7 @@ manager into a multi-protocol self-hosted VPN manager supporting:
 - Xray/VLESS.
 
 The refactor must preserve the useful security and reliability properties that
-already distinguish VPN Appliance Manager from the adjacent Amnezia client:
+already distinguish VPNCTL from the adjacent Amnezia client:
 
 - the Rust core is the authority for models, validation, secrets, rendering,
   deployment, SSH, backup, rollback, and export;
@@ -2238,7 +2238,7 @@ copy:
 - unrelated host/container TCP and sysctl tuning is applied;
 - initial JSON is composed by unescaped shell interpolation.
 
-VPN Appliance Manager will reuse the useful behavioral model—remote-only
+VPNCTL will reuse the useful behavioral model—remote-only
 REALITY identity, UUID users, structured JSON, explicit restart, public-material
 retrieval—but implement it through deterministic Rust rendering and the
 existing verified-SSH/deployment boundaries.
@@ -5176,7 +5176,7 @@ Final Windows prerequisite and packaging gate:
 - Visual Studio C++ tools, Node 24.18.0, WebView2, NASM 3.02, Rust 1.97.1,
   rustfmt, and Clippy were present;
 - its full workspace verification passed and Tauri produced the NSIS installer
-  at `target/release/bundle/nsis/VPN Appliance Manager_0.1.0_x64-setup.exe`;
+  at `target/release/bundle/nsis/VPNCTL_0.1.0_x64-setup.exe`;
 - no missing prerequisite required approval or installation. The helper's
   existing Corepack step nevertheless printed `Installing pnpm@11.9.0` before
   confirming the required version and current lockfile. This did not change a
@@ -5948,7 +5948,7 @@ Final validation and environment result:
 - `svelte-check` reported zero errors and zero warnings;
 - Vitest reported 4/4 files and 28/28 tests passing;
 - the production Tauri build succeeded and NSIS produced
-  `target/release/bundle/nsis/VPN Appliance Manager_0.1.0_x64-setup.exe`
+  `target/release/bundle/nsis/VPNCTL_0.1.0_x64-setup.exe`
   (6,679,294 bytes);
 - GNU Make is not installed in this Windows environment, so the literal
   `make frontend-check`, `make frontend-test`, `make frontend-build`, `make
@@ -5986,7 +5986,7 @@ has been changed in this planning unit.
 
 The new invariant is:
 
-> VPN Appliance Manager keeps only the information necessary to identify and
+> VPNCTL keeps only the information necessary to identify and
 > securely SSH into an appliance locally; the appliance owns its VPN state and
 > credentials, while the desktop retrieves and caches that state as a disposable
 > management view.

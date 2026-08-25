@@ -15,7 +15,7 @@ describe("desktop application workflows", () => {
     confirm.mockResolvedValue(true);
     invoke.mockImplementation(async (command: string) => {
       switch (command) {
-        case "app_info": return { name: "VPN Appliance Manager", version: "0.1.0", status: "ready", system_username: "tester" };
+        case "app_info": return { name: "VPNCTL", version: "0.1.0", status: "ready", system_username: "tester" };
         case "list_hosts": return [{ id: "host-1", display_name: "Lab host", ssh: { hostname: "192.0.2.1", port: 22, username: "tester", private_key_path: "key" }, created_at: "2026-07-31T12:00:00Z", updated_at: "2026-07-31T12:00:00Z" }];
         case "list_instance_summaries": return [summary("xray")];
         case "backend_options": return backendOptions;

@@ -24,7 +24,7 @@ struct AppState(Arc<ApplicationService>);
 #[tauri::command]
 fn app_info() -> serde_json::Value {
     serde_json::json!({
-        "name": "VPN Appliance Manager",
+        "name": "VPNCTL",
         "version": env!("CARGO_PKG_VERSION"),
         "status": "ready",
         "system_username": system_username()
@@ -641,5 +641,5 @@ pub fn run() {
             client_qr_svg,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running VPN Appliance Manager");
+        .expect("error while running VPNCTL");
 }

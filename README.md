@@ -1,9 +1,9 @@
 <!-- markdownlint-disable MD033 -->
 
-<h1 align="center">VPN Appliance Manager</h1>
+<h1 align="center">VPNCTL</h1>
 
 <p align="center">
-  <img src="https://pubcode.archuser.org/firebadnofire/dnswg/raw/branch/main/assets/app-icon.svg" alt="VPN Appliance Manager app icon" width="112">
+  <img src="https://pubcode.archuser.org/firebadnofire/dnswg/raw/branch/main/assets/app-icon.svg" alt="VPNCTL app icon" width="112">
   <br>
   <strong>Local-first management for self-hosted WireGuard, AmneziaWG, OpenVPN, IKEv2, and Xray appliances.</strong>
 </p>
@@ -17,17 +17,17 @@
 </p>
 
 <p align="center">
-  <img src="https://pubcode.archuser.org/firebadnofire/dnswg/raw/branch/main/assets/instances-screen.png" alt="VPN Appliance Manager instances screen" width="920">
+  <img src="https://pubcode.archuser.org/firebadnofire/dnswg/raw/branch/main/assets/instances-screen.png" alt="VPNCTL instances screen" width="920">
 </p>
 
-VPN Appliance Manager is a Tauri 2 desktop application and developer CLI for
+VPNCTL is a Tauri 2 desktop application and developer CLI for
 managing VPN appliances on Linux Docker hosts over verified SSH. Desired state
 stays in local SQLite, secret values stay in the native OS credential store,
 and each backend renders deterministic Docker Compose configuration through the
 same preview, backup, health, and rollback pipeline.
 
 The repository retains its historical `dnswg` name. The product name is
-**VPN Appliance Manager**.
+**VPNCTL**.
 
 ## Current status
 
@@ -88,7 +88,7 @@ material directly into the secure store.
 
 ## Security model
 
-VPN Appliance Manager is intentionally local-first:
+VPNCTL is intentionally local-first:
 
 - Svelte receives public views, capabilities, plans, health, and redacted
   events. It never receives private keys, PSKs, SSH passphrases, PKCS#12
@@ -287,4 +287,4 @@ Reusable VM acceptance is documented separately.
 
 ## License
 
-VPN Appliance Manager is released under the [MIT License](LICENSE).
+VPNCTL is released under the [MIT License](LICENSE).
