@@ -6556,7 +6556,16 @@ fn compose_activation_command(current: &str, plan: &DeploymentPlan, managed_dns:
     } else {
         "true".into()
     };
-    format!("set -eu; cd {}; {operation}", shell_quote(current))
+    let selinux_operation = operation.replace(
+        "docker compose",
+        "docker compose -f compose.yaml -f compose.selinux.yaml",
+    );
+    format!(
+        "set -eu; cd {current}; if command -v getenforce >/dev/null 2>&1 && test \"$(getenforce 2>/dev/null)\" = Enforcing; then printf '%s\\n' 'services:' '  gateway:' '    security_opt:' '      - label=type:container_runtime_t' > compose.selinux.yaml; trap 'rm -f -- compose.selinux.yaml' EXIT HUP INT TERM; {selinux_operation}; else {operation}; fi",
+        current = shell_quote(current),
+        selinux_operation = selinux_operation,
+        operation = operation,
+    )
 }
 
 fn runtime_image_reference(runtime: &BackendRuntimeSpec) -> &'static str {
@@ -8792,6 +8801,24 @@ mod tests {
         let command = activation_command("/safe/current", "/safe/stage", &files, &plan, &runtime);
         assert!(command.contains("'/safe/stage/dns/zones/db.vpn.internal'"));
         assert!(!command.contains("$(bad)"));
+    }
+
+    #[test]
+    fn compose_activation_uses_selinux_override() {
+        let plan = DeploymentPlan {
+            id: Uuid::nil(),
+            instance_id: Uuid::nil(),
+            operations: vec![DeploymentOperation::ComposeUp],
+            warnings: vec![],
+            desired_state_hash: "hash".into(),
+        };
+        let command = compose_activation_command("/safe/current", &plan, true);
+        assert!(command.contains("getenforce"));
+        assert!(command.contains("label=type:container_runtime_t"));
+        assert!(command.contains(
+            "docker compose -f compose.yaml -f compose.selinux.yaml up -d --remove-orphans"
+        ));
+        assert!(command.contains("rm -f -- compose.selinux.yaml"));
     }
 
     #[test]

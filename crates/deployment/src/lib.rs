@@ -11,8 +11,8 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 use vam_backend::{
-    BackendCapabilities, BackendRuntimeSpec, ContainerCapability, ContainerDevice, ContainerImage,
-    ServerIdentityStrategy,
+    BackendCapabilities, BackendHealthProbe, BackendRuntimeSpec, ContainerCapability,
+    ContainerDevice, ContainerImage, ServerIdentityStrategy,
 };
 use vam_core::{DesiredState, VpnInstance};
 use vam_dns::{DnsError, render_blocklist_hosts, render_corefile, render_zone};
@@ -217,6 +217,15 @@ services:
     render_runtime_inline_sequence(&mut output, "entrypoint", &runtime.entrypoint);
     render_runtime_inline_sequence(&mut output, "command", &runtime.command);
     render_runtime_mapping(&mut output, "sysctls", runtime.sysctls.iter().copied());
+    if let BackendHealthProbe::WireGuardLike { tool, interface } = runtime.health {
+        writeln!(
+            output,
+            "    healthcheck:\n      test: [\"CMD-SHELL\", \"{tool} show {interface} >/dev/null 2>&1\"]\n      interval: 2s\n      timeout: 3s\n      retries: 15\n      start_period: 5s",
+            tool = yaml_escape(tool),
+            interface = yaml_escape(interface),
+        )
+        .expect("writing to a String cannot fail");
+    }
 
     if !host_listeners.is_empty() {
         output.push_str("    ports:\n");
@@ -262,7 +271,8 @@ services:
     restart: unless-stopped
     network_mode: service:gateway
     depends_on:
-      - gateway
+      gateway:
+        condition: service_healthy
     volumes:
       - "./dns/Corefile:/etc/coredns/Corefile:ro,z"
       - "./dns/zones:/etc/coredns/zones:ro,z"
@@ -676,6 +686,8 @@ mod tests {
         assert!(first.contains(WIREGUARD_IMAGE));
         assert!(first.contains(COREDNS_IMAGE));
         assert!(first.contains("network_mode: service:gateway"));
+        assert!(first.contains("condition: service_healthy"));
+        assert!(first.contains("healthcheck:"));
         assert!(first.contains("\"./dns/hosts:/etc/coredns/hosts:ro,z\""));
         assert!(first.contains("\"./vpn:/config/wg_confs:z\""));
         assert!(first.contains("\"LOG_CONFS\": \"false\""));
@@ -697,6 +709,7 @@ mod tests {
         assert!(compose.contains("\"${VAM_LISTENER_0_PORT}:55424/udp\""));
         assert!(compose.contains("\"/dev/net/tun:/dev/net/tun\""));
         assert!(compose.contains("entrypoint: [\"/etc/amneziawg/start-awg.sh\"]"));
+        assert!(compose.contains("healthcheck:"));
         assert!(compose.contains("NET_ADMIN"));
         assert!(compose.contains("  dns:"));
     }
