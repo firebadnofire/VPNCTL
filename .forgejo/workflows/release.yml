@@ -148,6 +148,7 @@ jobs:
             build_command: |
               set -euo pipefail
 
+              export CARGO_PROFILE_RELEASE_STRIP=none
               bash ./build-helpers/mac/build.sh
 
               app_bundle="target/release/bundle/macos/VPNCTL.app"
