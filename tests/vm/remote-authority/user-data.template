@@ -1,0 +1,28 @@
+#cloud-config
+users:
+  - name: testuser
+    groups: [sudo]
+    sudo: ["ALL=(ALL) NOPASSWD:ALL"]
+    shell: /bin/bash
+    ssh_authorized_keys:
+      - __AGENT_PUBLIC_KEY__
+package_update: true
+package_upgrade: false
+packages:
+  - ca-certificates
+  - python3
+  - sudo
+  - qemu-guest-agent
+  - docker.io
+  - docker-compose
+  - wireguard-tools
+  - openssl
+  - kmod
+runcmd:
+  - [modprobe, tun]
+  - [systemctl, enable, --now, qemu-guest-agent]
+  - [systemctl, enable, --now, docker]
+  - [mkdir, -p, /mnt/cidata]
+  - [mount, -o, ro, -L, cidata, /mnt/cidata]
+  - [install, -D, -m, "0755", /mnt/cidata/include/vam-server, /usr/local/libexec/vam-server]
+  - [bash, -c, "python3 /mnt/cidata/include/test.py > /var/log/vpnctl-acceptance.jsonl 2>&1; result=$?; printf '%s' \"$result\" > /var/log/vpnctl-acceptance.exit; exit \"$result\""]

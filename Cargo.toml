@@ -59,6 +59,7 @@ uuid = { version = "1.18.1", features = ["v4", "serde"] }
 url = "2.5.8"
 wireguard-conf = { version = "1.0.1", default-features = false }
 zeroize = { version = "1.8.2", features = ["derive"] }
+x509-parser = { version = "0.18.1", features = ["verify"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

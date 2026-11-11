@@ -3,7 +3,7 @@ import { describe, expect, it } from "vitest";
 import BackendFormHarness from "../../../test/BackendFormHarness.svelte";
 
 describe("backend form isolation", () => {
-  it("renders real fields for all five backends", () => {
+  it("renders real fields for the four supported backends", () => {
     const wireguard = render(BackendFormHarness, { kind: "wireguard" });
     expect(screen.getByRole("checkbox", { name: /userspace fallback/i })).toBeTruthy();
     wireguard.unmount();
@@ -23,11 +23,10 @@ describe("backend form isolation", () => {
     expect(screen.getByText(/password-protected PKCS#12/)).toBeTruthy();
     ikev2.unmount();
 
-    const xray = render(BackendFormHarness, { kind: "xray" });
-    expect(screen.getByLabelText("SNI / camouflage host")).toBeTruthy();
-    expect(screen.queryByText("Certificate file")).toBeNull();
-    expect(document.body.textContent).not.toContain("PRIVATE KEY");
-    xray.unmount();
+    const unsupported = render(BackendFormHarness, { kind: "xray" });
+    expect(screen.getByText("Unsupported backend")).toBeTruthy();
+    expect(screen.queryByLabelText("SNI / camouflage host")).toBeNull();
+    unsupported.unmount();
   });
 
   it("allows OpenVPN certificate lifetimes beyond 825 days", async () => {

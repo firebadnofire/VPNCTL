@@ -217,7 +217,13 @@ impl VpnBackend for OpenVpnBackend {
                 return Err(BackendError::BackendMismatch(self.kind()));
             };
             validate_common_name(&data.common_name)?;
-            validate_device_material(settings, data)?;
+            // Public server configuration is manageable without client-held
+            // private credential references. Export validates those separately.
+            if let Some(serial) = &data.certificate_serial
+                && (serial.is_empty() || !serial.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            {
+                return invalid("certificate_serial", "must be hexadecimal");
+            }
             if !common_names.insert(data.common_name.as_str()) {
                 return invalid("common_name", "active client common names must be unique");
             }
@@ -334,6 +340,7 @@ impl VpnBackend for OpenVpnBackend {
             return Err(BackendError::BackendMismatch(self.kind()));
         };
 
+        validate_device_material(settings, data)?;
         let private_key = required_secret(secrets, &data.private_key_ref)?;
         let certificate = required_secret(secrets, &data.certificate_ref)?;
         let ca_certificate = required_secret(secrets, &data.ca_certificate_ref)?;
@@ -1198,7 +1205,12 @@ mod tests {
             data.common_name = "safe-client".into();
             data.tls_crypt_key_ref = None;
         }
-        assert!(OpenVpnBackend.render_server(&state, &secrets).is_err());
+        assert!(OpenVpnBackend.render_server(&state, &secrets).is_ok());
+        assert!(
+            OpenVpnBackend
+                .render_client(&state, &state.devices[0], &secrets)
+                .is_err()
+        );
 
         if let DeviceBackendData::OpenVpn(data) = &mut state.devices[0].backend_data {
             data.tls_crypt_key_ref = Some(SecretReference(Uuid::from_u128(6)));

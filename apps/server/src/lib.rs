@@ -3,16 +3,18 @@ use std::{
     fs::{File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    time::Duration,
 };
 
 use thiserror::Error;
 use uuid::Uuid;
 use vam_authority::{
     AUTHORITY_PROTOCOL_VERSION, AuthorityError, AuthorityFailure, AuthorityFailureCode,
-    AuthorityOperation, AuthorityRequestEnvelope, AuthorityResponse, AuthorityResponseEnvelope,
-    AuthorityStore,
+    AuthorityRequestEnvelope, AuthorityResponseEnvelope,
 };
+
+mod enrollment;
+mod manifest_rpc;
+mod runtime;
 
 pub const MANAGEMENT_ROOT: &str = "/var/lib/vpn-appliance-manager";
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -158,7 +160,7 @@ impl ServerRuntime {
         Ok(self.paths.caller_exchange_dir(caller))
     }
 
-    pub async fn process_request(
+    pub fn process_request(
         &self,
         caller: CallerIdentity,
         request_id: Uuid,
@@ -169,12 +171,19 @@ impl ServerRuntime {
         let request_bytes = read_bounded(&request_path, self.max_request_bytes)?;
         std::fs::remove_file(&request_path)?;
 
-        let appliance_id = load_or_create_appliance_id(&self.paths)?;
-        let store = AuthorityStore::open(&self.paths.database(), appliance_id).await?;
         let response = match serde_json::from_slice::<AuthorityRequestEnvelope>(&request_bytes) {
             Ok(request) => {
                 if request.request_id == request_id {
-                    dispatch(&store, request).await
+                    failure_response(
+                        request_id,
+                        AuthorityError::Incompatible {
+                            local_protocol: vam_authority::manifest::PROTOCOL_VERSION,
+                            local_schema: vam_authority::manifest::SCHEMA_VERSION,
+                            remote_protocol: request.protocol_version,
+                            remote_schema: 1,
+                        }
+                        .failure(),
+                    )
                 } else {
                     failure_response(
                         request_id,
@@ -245,7 +254,7 @@ pub fn parse_invocation(
         .map_err(|_| ServerError::InvalidInvocation("command is not UTF-8".into()))?;
     match command.as_str() {
         "prepare" if arguments.next().is_none() => Ok(Command::Prepare),
-        "rpc" | "cleanup" => {
+        "rpc" | "manifest-rpc" | "cleanup" => {
             let request_id = arguments
                 .next()
                 .ok_or_else(|| {
@@ -262,6 +271,8 @@ pub fn parse_invocation(
                 .map_err(|_| ServerError::InvalidInvocation("request UUID is invalid".into()))?;
             Ok(if command == "rpc" {
                 Command::Rpc(request_id)
+            } else if command == "manifest-rpc" {
+                Command::ManifestRpc(request_id)
             } else {
                 Command::Cleanup(request_id)
             })
@@ -276,6 +287,7 @@ pub fn parse_invocation(
 pub enum Command {
     Prepare,
     Rpc(Uuid),
+    ManifestRpc(Uuid),
     Cleanup(Uuid),
 }
 
@@ -287,97 +299,6 @@ pub fn ensure_privileged() -> Result<(), ServerError> {
         }
     }
     Ok(())
-}
-
-async fn dispatch(
-    store: &AuthorityStore,
-    request: AuthorityRequestEnvelope,
-) -> AuthorityResponseEnvelope {
-    let request_id = request.request_id;
-    let result = dispatch_result(store, request)
-        .await
-        .map_err(|error| error.failure());
-    AuthorityResponseEnvelope {
-        protocol_version: AUTHORITY_PROTOCOL_VERSION,
-        request_id,
-        result,
-    }
-}
-
-async fn dispatch_result(
-    store: &AuthorityStore,
-    request: AuthorityRequestEnvelope,
-) -> Result<AuthorityResponse, AuthorityError> {
-    request.validate_protocol()?;
-    let info = store.info().await?;
-    match request.appliance_id {
-        Some(expected) if expected != info.appliance_id => {
-            return Err(AuthorityError::InvalidState(format!(
-                "request targets appliance {expected}, not {}",
-                info.appliance_id
-            )));
-        }
-        None if !matches!(request.operation, AuthorityOperation::Info) => {
-            return Err(AuthorityError::InvalidState(
-                "appliance identity is required for this operation".into(),
-            ));
-        }
-        _ => {}
-    }
-    match request.operation {
-        AuthorityOperation::Info => Ok(AuthorityResponse::Info(info)),
-        AuthorityOperation::Snapshot { known_revision } => {
-            if known_revision == Some(info.revision) {
-                Ok(AuthorityResponse::NotModified(info))
-            } else {
-                Ok(AuthorityResponse::Snapshot(Box::new(
-                    store.snapshot().await?,
-                )))
-            }
-        }
-        AuthorityOperation::AcquireLease {
-            expected_revision,
-            owner,
-            scope,
-            ttl_seconds,
-        } => Ok(AuthorityResponse::Lease(
-            store
-                .acquire_lease(
-                    expected_revision,
-                    owner,
-                    &scope,
-                    Duration::from_secs(ttl_seconds),
-                )
-                .await?,
-        )),
-        AuthorityOperation::RenewLease { lease, ttl_seconds } => Ok(AuthorityResponse::Lease(
-            store
-                .renew_lease(&lease, Duration::from_secs(ttl_seconds))
-                .await?,
-        )),
-        AuthorityOperation::AbortLease { lease } => {
-            store.abort_lease(&lease).await?;
-            Ok(AuthorityResponse::LeaseAborted)
-        }
-        AuthorityOperation::Commit { lease, changes } => Ok(AuthorityResponse::Committed(
-            store.commit(&lease, &changes).await?,
-        )),
-        AuthorityOperation::GetSecrets {
-            expected_revision,
-            ids,
-        } => {
-            if ids.len() > 4_096 {
-                return Err(AuthorityError::InvalidState(
-                    "one request may retrieve at most 4096 secrets".into(),
-                ));
-            }
-            Ok(AuthorityResponse::Secrets {
-                values: store
-                    .get_secrets_at_revision(expected_revision, &ids)
-                    .await?,
-            })
-        }
-    }
 }
 
 fn failure_response(request_id: Uuid, failure: AuthorityFailure) -> AuthorityResponseEnvelope {
@@ -392,17 +313,26 @@ fn load_or_create_appliance_id(paths: &ServerPaths) -> Result<Uuid, ServerError>
     let service = effective_identity();
     create_directory(&paths.root, 0o755, service)?;
     create_directory(&paths.control_dir(), 0o700, service)?;
+    let lock_path = paths.control_dir().join("identity.lock");
+    if !lock_path.try_exists()? {
+        match create_private_file(&lock_path, b"") {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    validate_request_file(&lock_path, service)?;
+    let lock = OpenOptions::new().read(true).write(true).open(lock_path)?;
+    lock.lock()?;
     match read_appliance_id(&paths.appliance_id()) {
         Ok(id) => Ok(id),
         Err(ServerError::Filesystem(error)) if error.kind() == std::io::ErrorKind::NotFound => {
             let id = Uuid::new_v4();
-            match create_private_file(&paths.appliance_id(), id.to_string().as_bytes()) {
-                Ok(()) => Ok(id),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                    read_appliance_id(&paths.appliance_id())
-                }
-                Err(error) => Err(error.into()),
-            }
+            let temporary = paths.control_dir().join(format!(".identity-{id}"));
+            create_private_file(&temporary, id.to_string().as_bytes())?;
+            std::fs::rename(temporary, paths.appliance_id())?;
+            File::open(paths.control_dir())?.sync_all()?;
+            Ok(id)
         }
         Err(error) => Err(error),
     }
@@ -568,6 +498,7 @@ fn environment_u32(name: &str) -> Result<u32, ServerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vam_authority::AuthorityOperation;
 
     fn caller() -> CallerIdentity {
         #[cfg(unix)]
@@ -594,7 +525,7 @@ mod tests {
         create_private_file(&runtime.paths().request(caller, request_id), request).unwrap();
     }
 
-    async fn exchange(
+    fn exchange(
         runtime: &ServerRuntime,
         caller: CallerIdentity,
         request: &AuthorityRequestEnvelope,
@@ -605,10 +536,7 @@ mod tests {
             &serde_json::to_vec(request).unwrap(),
             request.request_id,
         );
-        let response_path = runtime
-            .process_request(caller, request.request_id)
-            .await
-            .unwrap();
+        let response_path = runtime.process_request(caller, request.request_id).unwrap();
         let response = serde_json::from_slice(&std::fs::read(&response_path).unwrap()).unwrap();
         runtime
             .cleanup_exchange(caller, request.request_id)
@@ -616,66 +544,32 @@ mod tests {
         response
     }
 
-    #[tokio::test]
-    async fn info_round_trip_creates_stable_authority_and_private_exchange() {
+    #[test]
+    fn legacy_info_is_refused_without_initializing_a_second_authority() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = ServerRuntime::new(directory.path());
-        let caller = caller();
-        let request_id = Uuid::new_v4();
         let request = AuthorityRequestEnvelope {
             protocol_version: AUTHORITY_PROTOCOL_VERSION,
-            request_id,
+            request_id: Uuid::new_v4(),
             appliance_id: None,
             operation: AuthorityOperation::Info,
         };
-        write_request(
-            &runtime,
-            caller,
-            &serde_json::to_vec(&request).unwrap(),
-            request_id,
+        let response = exchange(&runtime, caller(), &request);
+        assert_eq!(
+            response.result.unwrap_err().code,
+            AuthorityFailureCode::Incompatible
         );
-        let response_path = runtime.process_request(caller, request_id).await.unwrap();
-        assert!(!runtime.paths().request(caller, request_id).exists());
-        let response: AuthorityResponseEnvelope =
-            serde_json::from_slice(&std::fs::read(&response_path).unwrap()).unwrap();
-        let AuthorityResponse::Info(first) = response.result.unwrap() else {
-            panic!("expected info response");
-        };
-        runtime.cleanup_exchange(caller, request_id).unwrap();
-        assert!(!response_path.exists());
-
-        let second_id = Uuid::new_v4();
-        let second = AuthorityRequestEnvelope {
-            protocol_version: AUTHORITY_PROTOCOL_VERSION,
-            request_id: second_id,
-            appliance_id: Some(first.appliance_id),
-            operation: AuthorityOperation::Snapshot {
-                known_revision: Some(first.revision),
-            },
-        };
-        write_request(
-            &runtime,
-            caller,
-            &serde_json::to_vec(&second).unwrap(),
-            second_id,
-        );
-        let response_path = runtime.process_request(caller, second_id).await.unwrap();
-        let response: AuthorityResponseEnvelope =
-            serde_json::from_slice(&std::fs::read(response_path).unwrap()).unwrap();
-        assert!(matches!(
-            response.result.unwrap(),
-            AuthorityResponse::NotModified(info) if info.appliance_id == first.appliance_id
-        ));
+        assert!(!runtime.paths.control_dir().exists());
     }
 
-    #[tokio::test]
-    async fn malformed_and_mismatched_requests_fail_closed_without_stdout_payloads() {
+    #[test]
+    fn malformed_and_mismatched_requests_fail_closed_without_stdout_payloads() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = ServerRuntime::new(directory.path());
         let caller = caller();
         let request_id = Uuid::new_v4();
         write_request(&runtime, caller, b"{not-json", request_id);
-        let response_path = runtime.process_request(caller, request_id).await.unwrap();
+        let response_path = runtime.process_request(caller, request_id).unwrap();
         let response: AuthorityResponseEnvelope =
             serde_json::from_slice(&std::fs::read(response_path).unwrap()).unwrap();
         assert_eq!(
@@ -696,7 +590,7 @@ mod tests {
             &serde_json::to_vec(&request).unwrap(),
             file_id,
         );
-        let response_path = runtime.process_request(caller, file_id).await.unwrap();
+        let response_path = runtime.process_request(caller, file_id).unwrap();
         let response: AuthorityResponseEnvelope =
             serde_json::from_slice(&std::fs::read(response_path).unwrap()).unwrap();
         assert_eq!(
@@ -705,28 +599,15 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn lease_commit_and_revision_bound_secret_fetch_dispatch_transactionally() {
+    #[test]
+    fn legacy_mutations_fail_without_creating_authoritative_state() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = ServerRuntime::new(directory.path());
         let caller = caller();
-        let info_request = AuthorityRequestEnvelope {
+        let request = AuthorityRequestEnvelope {
             protocol_version: AUTHORITY_PROTOCOL_VERSION,
             request_id: Uuid::new_v4(),
-            appliance_id: None,
-            operation: AuthorityOperation::Info,
-        };
-        let AuthorityResponse::Info(info) = exchange(&runtime, caller, &info_request)
-            .await
-            .result
-            .unwrap()
-        else {
-            panic!("expected info response");
-        };
-        let lease_request = AuthorityRequestEnvelope {
-            protocol_version: AUTHORITY_PROTOCOL_VERSION,
-            request_id: Uuid::new_v4(),
-            appliance_id: Some(info.appliance_id),
+            appliance_id: Some(Uuid::new_v4()),
             operation: AuthorityOperation::AcquireLease {
                 expected_revision: 0,
                 owner: Uuid::new_v4(),
@@ -734,57 +615,26 @@ mod tests {
                 ttl_seconds: 30,
             },
         };
-        let AuthorityResponse::Lease(lease) = exchange(&runtime, caller, &lease_request)
-            .await
-            .result
-            .unwrap()
-        else {
-            panic!("expected lease response");
-        };
-        let commit_request = AuthorityRequestEnvelope {
-            protocol_version: AUTHORITY_PROTOCOL_VERSION,
-            request_id: Uuid::new_v4(),
-            appliance_id: Some(info.appliance_id),
-            operation: AuthorityOperation::Commit {
-                lease,
-                changes: Box::new(vam_authority::AuthorityChangeSet::default()),
-            },
-        };
-        assert!(matches!(
-            exchange(&runtime, caller, &commit_request)
-                .await
-                .result
-                .unwrap(),
-            AuthorityResponse::Committed(result) if result.revision == 1
-        ));
-        let stale_fetch = AuthorityRequestEnvelope {
-            protocol_version: AUTHORITY_PROTOCOL_VERSION,
-            request_id: Uuid::new_v4(),
-            appliance_id: Some(info.appliance_id),
-            operation: AuthorityOperation::GetSecrets {
-                expected_revision: 0,
-                ids: Vec::new(),
-            },
-        };
         assert_eq!(
-            exchange(&runtime, caller, &stale_fetch)
-                .await
+            exchange(&runtime, caller, &request)
                 .result
                 .unwrap_err()
                 .code,
-            AuthorityFailureCode::RevisionConflict
+            AuthorityFailureCode::Incompatible
         );
+        assert!(!runtime.paths().database().exists());
+        assert!(!runtime.paths().appliance_id().exists());
     }
 
-    #[tokio::test]
-    async fn oversized_request_is_rejected_before_json_parsing() {
+    #[test]
+    fn oversized_request_is_rejected_before_json_parsing() {
         let directory = tempfile::tempdir().unwrap();
         let runtime = ServerRuntime::with_limits(directory.path(), 32, 1024);
         let caller = caller();
         let request_id = Uuid::new_v4();
         write_request(&runtime, caller, &[b'x'; 33], request_id);
         assert!(matches!(
-            runtime.process_request(caller, request_id).await,
+            runtime.process_request(caller, request_id),
             Err(ServerError::RequestTooLarge { max_bytes: 32 } | ServerError::UnsafeRequest)
         ));
     }

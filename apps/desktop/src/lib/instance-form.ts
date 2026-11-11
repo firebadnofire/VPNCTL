@@ -31,13 +31,6 @@ export interface InstanceForm {
   openvpn_certificate_lifetime_days: number;
   ikev2_server_identity: string;
   ikev2_certificate_lifetime_days: number;
-  xray_security: "reality" | "tls";
-  xray_transport: "tcp" | "xhttp" | "mkcp";
-  xray_server_name: string;
-  xray_fingerprint: string;
-  xray_xhttp_path: string;
-  xray_certificate_path: string;
-  xray_private_key_path: string;
 }
 
 export function newInstanceForm(hostId = "", endpointHost = ""): InstanceForm {
@@ -72,12 +65,5 @@ export function newInstanceForm(hostId = "", endpointHost = ""): InstanceForm {
     openvpn_certificate_lifetime_days: 825,
     ikev2_server_identity: endpointHost,
     ikev2_certificate_lifetime_days: 825,
-    xray_security: "reality",
-    xray_transport: "tcp",
-    xray_server_name: "www.cloudflare.com",
-    xray_fingerprint: "chrome",
-    xray_xhttp_path: "/",
-    xray_certificate_path: "",
-    xray_private_key_path: "",
   };
 }

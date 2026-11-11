@@ -50,6 +50,16 @@ pub trait AuthorityExchange: Send + Sync {
     ) -> Result<AuthorityResponseEnvelope, AuthorityClientError>;
 }
 
+#[async_trait]
+pub trait ManifestExchange: Send + Sync {
+    async fn exchange_manifest(
+        &self,
+        session: &AuthoritySshSession<'_>,
+        request: &vam_authority::manifest::Request,
+        cancellation: &CancellationToken,
+    ) -> Result<vam_authority::manifest::Response, AuthorityClientError>;
+}
+
 #[derive(Clone)]
 pub struct AuthorityClient {
     transport: Arc<dyn SshTransport>,
@@ -59,6 +69,79 @@ impl AuthorityClient {
     #[must_use]
     pub fn new(transport: Arc<dyn SshTransport>) -> Self {
         Self { transport }
+    }
+
+    pub async fn exchange_manifest(
+        &self,
+        session: &AuthoritySshSession<'_>,
+        request: &vam_authority::manifest::Request,
+        cancellation: &CancellationToken,
+    ) -> Result<vam_authority::manifest::Response, AuthorityClientError> {
+        request
+            .compatibility
+            .validate()
+            .map_err(|_| AuthorityClientError::ResponseMismatch)?;
+        let bytes = Zeroizing::new(serde_json::to_vec(request)?);
+        if bytes.len() > MAX_AUTHORITY_MESSAGE_BYTES {
+            return Err(AuthorityClientError::RequestTooLarge {
+                max_bytes: MAX_AUTHORITY_MESSAGE_BYTES,
+            });
+        }
+        let uid = self.prepare(session, cancellation).await?;
+        let request_path = exchange_path(uid, "requests", request.request_id);
+        let response_path = exchange_path(uid, "responses", request.request_id);
+        let result = async {
+            self.transport
+                .upload(UploadRequest {
+                    config: session.config,
+                    trusted_key_base64: session.trusted_key_base64,
+                    passphrase: session.passphrase,
+                    remote_path: &request_path,
+                    contents: &bytes,
+                    mode: 0o600,
+                    cancellation,
+                })
+                .await?;
+            let status = self
+                .execute_helper(
+                    session,
+                    &format!("manifest-rpc {}", request.request_id),
+                    cancellation,
+                )
+                .await?;
+            if status != format!("response_ready={}", request.request_id) {
+                return Err(AuthorityClientError::InvalidStatus);
+            }
+            let response_bytes = Zeroizing::new(
+                self.transport
+                    .download(DownloadRequest {
+                        config: session.config,
+                        trusted_key_base64: session.trusted_key_base64,
+                        passphrase: session.passphrase,
+                        remote_path: &response_path,
+                        max_bytes: MAX_AUTHORITY_MESSAGE_BYTES,
+                        cancellation,
+                    })
+                    .await?,
+            );
+            let response: vam_authority::manifest::Response =
+                serde_json::from_slice(&response_bytes)?;
+            if response.request_id != request.request_id
+                || response.compatibility != request.compatibility
+            {
+                return Err(AuthorityClientError::ResponseMismatch);
+            }
+            Ok(response)
+        }
+        .await;
+        self.execute_helper(
+            session,
+            &format!("cleanup {}", request.request_id),
+            &CancellationToken::new(),
+        )
+        .await
+        .map_err(|error| AuthorityClientError::Cleanup(Box::new(error)))?;
+        result
     }
 
     pub async fn exchange(
@@ -195,6 +278,18 @@ impl AuthorityExchange for AuthorityClient {
         cancellation: &CancellationToken,
     ) -> Result<AuthorityResponseEnvelope, AuthorityClientError> {
         Self::exchange(self, session, request, cancellation).await
+    }
+}
+
+#[async_trait]
+impl ManifestExchange for AuthorityClient {
+    async fn exchange_manifest(
+        &self,
+        session: &AuthoritySshSession<'_>,
+        request: &vam_authority::manifest::Request,
+        cancellation: &CancellationToken,
+    ) -> Result<vam_authority::manifest::Response, AuthorityClientError> {
+        Self::exchange_manifest(self, session, request, cancellation).await
     }
 }
 

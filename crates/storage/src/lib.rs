@@ -88,6 +88,51 @@ pub struct Storage {
 }
 
 impl Storage {
+    /// Consistent, non-destructive source backup for an explicitly approved
+    /// legacy migration. The original database and native secrets remain intact.
+    pub async fn backup_legacy_database(
+        &self,
+        backup_id: Uuid,
+    ) -> Result<std::path::PathBuf, StorageError> {
+        let row = sqlx::query("PRAGMA database_list")
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .find(|row| row.get::<String, _>("name") == "main")
+            .ok_or_else(|| {
+                StorageError::InvalidData("legacy database path is unavailable".into())
+            })?;
+        let source: String = row.get("file");
+        if source.is_empty() {
+            return Err(StorageError::InvalidData(
+                "legacy migration backup requires a file-backed database".into(),
+            ));
+        }
+        let parent = Path::new(&source)
+            .parent()
+            .ok_or_else(|| StorageError::InvalidData("legacy database has no parent".into()))?
+            .join("legacy-backups");
+        std::fs::create_dir_all(&parent).map_err(|error| {
+            StorageError::InvalidData(format!("cannot create legacy backup directory: {error}"))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |error| {
+                    StorageError::InvalidData(format!(
+                        "cannot protect legacy backup directory: {error}"
+                    ))
+                },
+            )?;
+        }
+        let destination = parent.join(format!("{backup_id}.sqlite"));
+        sqlx::query("VACUUM INTO ?")
+            .bind(destination.to_string_lossy().as_ref())
+            .execute(&self.pool)
+            .await?;
+        Ok(destination)
+    }
     pub async fn open(path: &Path) -> Result<Self, StorageError> {
         let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))?
             .create_if_missing(true)

@@ -64,6 +64,17 @@ use vam_ssh::{CommandResult, RusshTransport, SshError, SshTransport, UploadReque
 use vam_storage::{ActivityRecord, BackupRecord, Storage, StorageError};
 
 mod authority_sync;
+mod migration;
+mod remote;
+mod remote_certificates;
+
+pub use migration::LegacyMigrationPreview;
+pub use remote::RemoteRestorePreview;
+pub use remote::validate_remote_configuration;
+pub use remote::{
+    LegacyCandidate, PeerAvailability, RemoteDraft, RemoteInventory, RemoteSaveInput,
+    ServerIdentity,
+};
 
 pub use authority_sync::{AuthoritySyncError, AuthoritySynchronizer, SynchronizationResult};
 use zeroize::Zeroizing;
@@ -1060,6 +1071,8 @@ pub struct ApplicationService {
     pub storage: Storage,
     pub secrets: Arc<dyn SecretStore>,
     transport: Arc<dyn SshTransport>,
+    manifest_exchange: Arc<dyn vam_authority_client::ManifestExchange>,
+    runtime_projection: Option<Arc<DesiredState>>,
     backends: Arc<BackendRegistry>,
     instance_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
     cancellations: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
@@ -1087,11 +1100,92 @@ impl ApplicationService {
         Self {
             storage,
             secrets,
+            manifest_exchange: Arc::new(vam_authority_client::AuthorityClient::new(
+                transport.clone(),
+            )),
             transport,
+            runtime_projection: None,
             backends: Arc::new(BackendRegistry::new(backends)),
             instance_locks: Arc::default(),
             cancellations: Arc::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_manifest_exchange(
+        mut self,
+        exchange: Arc<dyn vam_authority_client::ManifestExchange>,
+    ) -> Self {
+        self.manifest_exchange = exchange;
+        self
+    }
+
+    /// Helper-only immutable projection of a locked authoritative revision.
+    /// The supplied storage is an ephemeral execution index, not desired state.
+    #[must_use]
+    pub fn with_runtime_projection(mut self, state: DesiredState) -> Self {
+        self.runtime_projection = Some(Arc::new(state));
+        self
+    }
+
+    /// Only the on-demand helper supplies an immutable runtime projection.
+    pub async fn issue_projected_certificate(
+        &self,
+        device: &mut Device,
+    ) -> Result<String, AppError> {
+        if self.runtime_projection.is_none() {
+            return Err(validation_error(
+                "Certificate issuance requires helper runtime execution.",
+            ));
+        }
+        let state = self.desired_state(device.instance_id).await?;
+        self.storage
+            .set_setting(&certificate_authority_setting(state.instance.id), &true)
+            .await
+            .map_err(storage_error)?;
+        let outcome = self.issue_certificate_device(&state, device).await?;
+        outcome.backup_path.ok_or_else(|| {
+            validation_error("Certificate operation did not retain its safety backup.")
+        })
+    }
+
+    pub async fn revoke_projected_certificate(&self, device: &Device) -> Result<String, AppError> {
+        if self.runtime_projection.is_none() {
+            return Err(validation_error(
+                "Certificate revocation requires helper runtime execution.",
+            ));
+        }
+        let state = self.desired_state(device.instance_id).await?;
+        self.execute_device_credential_action(&state, device, CredentialAction::Revoke)
+            .await?
+            .backup_path
+            .ok_or_else(|| {
+                validation_error("Certificate revocation did not retain its safety backup.")
+            })
+    }
+
+    pub async fn compensate_projected_certificate(
+        &self,
+        instance_id: Uuid,
+        backup: String,
+    ) -> Result<(), AppError> {
+        if self.runtime_projection.is_none()
+            || !backup.starts_with(&format!("{APP_ROOT}/backups/{instance_id}/"))
+            || !backup.rsplit('/').next().is_some_and(valid_backup_name)
+        {
+            return Err(validation_error(
+                "Invalid helper credential recovery backup.",
+            ));
+        }
+        let state = self.desired_state(instance_id).await?;
+        self.restore_credential_outcome(
+            &state,
+            &CredentialExecutionOutcome {
+                backup_path: Some(backup),
+                ..CredentialExecutionOutcome::default()
+            },
+        )
+        .await
     }
 
     pub async fn create_host(&self, input: CreateHostInput) -> Result<DockerHost, AppError> {
@@ -1147,11 +1241,29 @@ impl ApplicationService {
     }
 
     pub async fn list_hosts(&self) -> Result<Vec<DockerHost>, AppError> {
-        self.storage.list_hosts().await.map_err(storage_error)
+        let mut hosts = Vec::new();
+        for host in self.storage.list_hosts().await.map_err(storage_error)? {
+            if !self
+                .storage
+                .get_setting::<bool>(&format!("archived_host_profile:{}", host.id))
+                .await
+                .map_err(storage_error)?
+                .unwrap_or(false)
+            {
+                hosts.push(host);
+            }
+        }
+        Ok(hosts)
     }
 
     pub async fn delete_host(&self, id: Uuid) -> Result<(), AppError> {
-        self.storage.delete_host(id).await.map_err(storage_error)
+        self.storage.get_host(id).await.map_err(storage_error)?;
+        // Archive local recovery references without ever issuing a remote
+        // deletion or breaking legacy database foreign keys.
+        self.storage
+            .set_setting(&format!("archived_host_profile:{id}"), &true)
+            .await
+            .map_err(storage_error)
     }
 
     pub async fn probe_host_key(&self, host_id: Uuid) -> Result<HostKeyProbe, AppError> {
@@ -1937,7 +2049,6 @@ fi
             VpnBackendKind::AmneziaWg,
             VpnBackendKind::OpenVpn,
             VpnBackendKind::Ikev2,
-            VpnBackendKind::Xray,
         ]
         .into_iter()
         .filter_map(|kind| {
@@ -1967,6 +2078,14 @@ fi
     }
 
     pub async fn desired_state(&self, instance_id: Uuid) -> Result<DesiredState, AppError> {
+        if let Some(state) = &self.runtime_projection {
+            if state.instance.id != instance_id {
+                return Err(validation_error(
+                    "Runtime projection targets another instance.",
+                ));
+            }
+            return Ok(state.as_ref().clone());
+        }
         self.storage
             .desired_state(instance_id)
             .await
@@ -3062,6 +3181,15 @@ fi
         Ok(plan)
     }
 
+    pub async fn deployment_evidence_hash(&self, instance_id: Uuid) -> Result<String, AppError> {
+        let state = self.desired_state(instance_id).await?;
+        let manifest = self.remote_manifest(&state.instance).await?;
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&manifest).map_err(serialization_error)?)
+        ))
+    }
+
     pub async fn plan_instance_view(
         &self,
         instance_id: Uuid,
@@ -3952,12 +4080,13 @@ fi
             .get_instance(instance_id)
             .await
             .map_err(storage_error)?;
-        let was_deployed = self
-            .storage
-            .last_successful_deployment(instance_id)
-            .await
-            .map_err(storage_error)?
-            .is_some();
+        let was_deployed = self.runtime_projection.is_some()
+            || self
+                .storage
+                .last_successful_deployment(instance_id)
+                .await
+                .map_err(storage_error)?
+                .is_some();
         if !was_deployed {
             self.storage
                 .soft_delete_instance(instance_id, Utc::now())
@@ -4345,9 +4474,11 @@ fi
         secrets: &HashMap<SecretReference, Zeroizing<String>>,
     ) -> Result<Vec<RenderedFile>, AppError> {
         let mut render_state = state.clone();
-        render_state.dns_blocklist_domains = self
-            .selected_dns_blocklist_domains(render_state.instance.id)
-            .await?;
+        if self.runtime_projection.is_none() {
+            render_state.dns_blocklist_domains = self
+                .selected_dns_blocklist_domains(render_state.instance.id)
+                .await?;
+        }
         let backend = self
             .backends
             .get(render_state.instance.backend)
@@ -4492,6 +4623,17 @@ fi
         ),
         AppError,
     > {
+        if self
+            .storage
+            .get_setting::<bool>(&format!("archived_host_profile:{host_id}"))
+            .await
+            .map_err(storage_error)?
+            .unwrap_or(false)
+        {
+            return Err(validation_error(
+                "This local server profile was removed. Add a saved connection before managing the server.",
+            ));
+        }
         let host = self
             .storage
             .get_host(host_id)
@@ -6183,10 +6325,14 @@ install -m 0644 /dev/null "$marker""#,
             }
             let script = format!(
                 r#"set -eu
-sas="$(swanctl --list-sas --ike {connection_name} --raw)"
-if test -n "$sas"; then
-  swanctl --terminate --ike {connection_name} --timeout 10
-fi"#,
+if output="$(swanctl --terminate --ike {connection_name} --timeout 10 2>&1)"; then
+  exit 0
+fi
+if test "$output" = 'terminate failed: no matching SAs to terminate found'; then
+  exit 0
+fi
+printf '%s\n' "$output" >&2
+exit 1"#,
                 connection_name = shell_quote(connection_name),
             );
             Some(format!(
@@ -8041,8 +8187,19 @@ fn validate_dns_hostlist(
 }
 
 async fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), AppError> {
+    match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(validation_error(
+                "Refusing to write private material through a symbolic link.",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error(error)),
+    }
     #[cfg(unix)]
     {
+        use std::os::unix::fs::PermissionsExt as _;
         use tokio::{fs::OpenOptions, io::AsyncWriteExt};
         let mut file = OpenOptions::new()
             .create(true)
@@ -8050,6 +8207,9 @@ async fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), AppError
             .write(true)
             .mode(0o600)
             .open(path)
+            .await
+            .map_err(io_error)?;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
             .await
             .map_err(io_error)?;
         file.write_all(contents).await.map_err(io_error)?;
@@ -8986,6 +9146,18 @@ mod tests {
         assert!(command.contains("IKEv2 authority is partial"));
         assert!(command.contains("--entrypoint chown"));
         assert!(command.contains("-R \"$host_owner\" '/etc/swanctl'"));
+        let terminate = credential_operation_command(
+            "/safe/current",
+            &runtime,
+            VpnBackendKind::Ikev2,
+            &CredentialOperation::TerminateIkev2Connection {
+                connection_name: "client-laptop-1234".into(),
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert!(terminate.contains("no matching SAs to terminate found"));
+        assert!(terminate.contains("exit 1"));
         assert!(!command.contains("--type rsa"));
     }
 
@@ -9405,7 +9577,6 @@ mod tests {
             VpnBackendKind::AmneziaWg,
             VpnBackendKind::OpenVpn,
             VpnBackendKind::Ikev2,
-            VpnBackendKind::Xray,
         ];
         let options = service.backend_options();
         assert_eq!(options.len(), backends.len());
@@ -9419,7 +9590,6 @@ mod tests {
                 (VpnBackendKind::AmneziaWg, "AWG"),
                 (VpnBackendKind::OpenVpn, "OVPN"),
                 (VpnBackendKind::Ikev2, "IKE"),
-                (VpnBackendKind::Xray, "XRAY"),
             ]
         );
         assert!(
@@ -9458,12 +9628,6 @@ mod tests {
         assert_eq!(
             options[3].presentation.export_formats,
             vec![ClientExportFormat::ProtectedPkcs12]
-        );
-        assert_eq!(options[4].presentation.routing, RoutingCapability::Proxy);
-        assert_eq!(options[4].presentation.dns, DnsCapability::Unsupported);
-        assert_eq!(
-            options[4].presentation.statistics,
-            StatisticsCapability::Unavailable
         );
         for (index, backend) in backends.into_iter().enumerate() {
             let host = service

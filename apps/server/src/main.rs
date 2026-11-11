@@ -29,7 +29,11 @@ async fn run() -> Result<String, vam_server::ServerError> {
             Ok(format!("exchange_uid={}", caller.uid))
         }
         Command::Rpc(request_id) => {
-            runtime.process_request(caller, request_id).await?;
+            runtime.process_request(caller, request_id)?;
+            Ok(format!("response_ready={request_id}"))
+        }
+        Command::ManifestRpc(request_id) => {
+            runtime.process_manifest_request(caller, request_id).await?;
             Ok(format!("response_ready={request_id}"))
         }
         Command::Cleanup(request_id) => {

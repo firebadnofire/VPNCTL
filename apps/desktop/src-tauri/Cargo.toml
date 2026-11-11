@@ -24,6 +24,7 @@ tauri-plugin-dialog.workspace = true
 tokio.workspace = true
 uuid.workspace = true
 vam-application = { path = "../../../crates/application" }
+vam-authority = { path = "../../../crates/authority" }
 vam-core = { path = "../../../crates/core" }
 vam-protocol = { path = "../../../crates/protocol" }
 vam-secrets = { path = "../../../crates/secrets" }

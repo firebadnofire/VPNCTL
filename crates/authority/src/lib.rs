@@ -14,6 +14,8 @@ use vam_core::{DesiredState, Device, DnsRecord, User, VpnInstance};
 use vam_protocol::{DeploymentPlan, DeploymentProgress, DeploymentStatus, DeploymentSummary};
 use zeroize::Zeroize;
 
+pub mod manifest;
+
 pub const AUTHORITY_PROTOCOL_VERSION: u32 = 1;
 pub const AUTHORITY_SCHEMA_VERSION: u32 = 1;
 pub const MAX_SECRET_BYTES: usize = 16 * 1024 * 1024;

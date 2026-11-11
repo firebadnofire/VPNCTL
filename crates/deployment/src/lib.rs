@@ -217,12 +217,23 @@ services:
     render_runtime_inline_sequence(&mut output, "entrypoint", &runtime.entrypoint);
     render_runtime_inline_sequence(&mut output, "command", &runtime.command);
     render_runtime_mapping(&mut output, "sysctls", runtime.sysctls.iter().copied());
-    if let BackendHealthProbe::WireGuardLike { tool, interface } = runtime.health {
+    let health_command = match runtime.health {
+        BackendHealthProbe::WireGuardLike { tool, interface } => {
+            Some(format!("{tool} show {interface} >/dev/null 2>&1"))
+        }
+        BackendHealthProbe::OpenVpn => {
+            Some("pidof openvpn >/dev/null && test -s /run/openvpn/status.log".to_owned())
+        }
+        BackendHealthProbe::Ikev2 => {
+            Some("pidof charon >/dev/null && swanctl --list-conns >/dev/null".to_owned())
+        }
+        BackendHealthProbe::Xray { .. } => None,
+    };
+    if let Some(command) = health_command {
         writeln!(
             output,
-            "    healthcheck:\n      test: [\"CMD-SHELL\", \"{tool} show {interface} >/dev/null 2>&1\"]\n      interval: 2s\n      timeout: 3s\n      retries: 15\n      start_period: 5s",
-            tool = yaml_escape(tool),
-            interface = yaml_escape(interface),
+            "    healthcheck:\n      test: [\"CMD-SHELL\", \"{}\"]\n      interval: 2s\n      timeout: 3s\n      retries: 15\n      start_period: 5s",
+            yaml_escape(&command),
         )
         .expect("writing to a String cannot fail");
     }
@@ -724,6 +735,8 @@ mod tests {
         assert!(compose.contains("\"${VAM_LISTENER_0_PORT}:1194/udp\""));
         assert!(compose.contains("\"/dev/net/tun:/dev/net/tun\""));
         assert!(compose.contains("NET_ADMIN"));
+        assert!(compose.contains("pidof openvpn >/dev/null"));
+        assert!(compose.contains("condition: service_healthy"));
     }
 
     #[test]
@@ -735,6 +748,7 @@ mod tests {
         assert!(compose.contains("\"${VAM_LISTENER_1_PORT}:4500/udp\""));
         assert!(compose.contains("NET_ADMIN"));
         assert!(!compose.contains("/dev/net/tun"));
+        assert!(compose.contains("swanctl --list-conns >/dev/null"));
     }
 
     #[test]

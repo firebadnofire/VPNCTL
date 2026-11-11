@@ -227,7 +227,6 @@ impl VpnBackend for Ikev2Backend {
                 return Err(BackendError::BackendMismatch(self.kind()));
             };
             validate_client_identity(&data.identity)?;
-            validate_device_material(data)?;
             if let Some(serial) = &data.certificate_serial {
                 validate_certificate_serial(serial)?;
             }
@@ -247,6 +246,7 @@ impl VpnBackend for Ikev2Backend {
         device: &Device,
     ) -> Result<Vec<SecretReference>, BackendError> {
         let data = ikev2_device(device, self.kind())?;
+        validate_device_material(data)?;
         Ok(vec![
             required_reference(data.private_key_ref.as_ref(), self.kind())?.clone(),
             required_reference(data.certificate_ref.as_ref(), self.kind())?.clone(),
@@ -1243,7 +1243,12 @@ mod tests {
             data.identity = "safe-client".into();
             data.private_key_ref = None;
         }
-        assert!(Ikev2Backend.render_server(&state, &secrets).is_err());
+        assert!(Ikev2Backend.render_server(&state, &secrets).is_ok());
+        assert!(
+            Ikev2Backend
+                .render_client(&state, &state.devices[0], &secrets)
+                .is_err()
+        );
 
         if let DeviceBackendData::Ikev2(data) = &mut state.devices[0].backend_data {
             data.private_key_ref = Some(SecretReference(Uuid::from_u128(3)));

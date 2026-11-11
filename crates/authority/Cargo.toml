@@ -15,6 +15,7 @@ sqlx.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 vam-core = { path = "../core" }
+vam-dns = { path = "../dns" }
 vam-protocol = { path = "../protocol" }
 zeroize.workspace = true
 

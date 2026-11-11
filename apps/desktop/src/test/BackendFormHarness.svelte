@@ -8,4 +8,4 @@
   let BackendForm = $derived(backendForms[kind]);
 </script>
 
-<BackendForm bind:form />
+{#if BackendForm}<BackendForm bind:form />{:else}<p>Unsupported backend</p>{/if}

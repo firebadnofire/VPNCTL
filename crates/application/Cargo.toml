@@ -34,6 +34,10 @@ vam-secrets = { path = "../secrets" }
 vam-ssh = { path = "../ssh" }
 vam-storage = { path = "../storage" }
 zeroize.workspace = true
+x509-parser.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
