@@ -127,7 +127,7 @@ describe("remote-authoritative desktop workflows", () => {
     await waitFor(() => expect(screen.queryByText(/Checking local export material/)).toBeNull());
     await fireEvent.click(screen.getByRole("tab", { name: "Settings" }));
     await fireEvent.input(screen.getByLabelText("Instance name"), { target: { value: "My draft" } });
-    await screen.findByText(/Unsaved local edits/);
+    await screen.findByText(/Unsaved changes ·/);
     await fireEvent.click(screen.getByRole("button", { name: "Save to Server" }));
     await screen.findByText("Remote revision conflict");
     expect((screen.getByLabelText("Instance name") as HTMLInputElement).value).toBe("My draft");
@@ -154,12 +154,12 @@ describe("remote-authoritative desktop workflows", () => {
     render(App);
     await screen.findByText("Remote WG");
     await fireEvent.click(screen.getByRole("button", { name: /Remote WG.*WireGuard/ }));
-    await screen.findByText(/Unsaved local edits · based on revision 3/);
+    await screen.findByText(/Unsaved changes · Save to Server/);
     await fireEvent.click(screen.getByRole("tab", { name: "Deployment" }));
     expect((screen.getByRole("button", { name: "Preview / Deploy" }) as HTMLButtonElement).disabled).toBe(true);
     await fireEvent.click(screen.getByRole("button", { name: "Reload from Server" }));
     await screen.findByRole("heading", { name: "Current server configuration" });
-    expect(screen.queryByText(/Unsaved local edits · based on revision 3/)).toBeNull();
+    expect(screen.queryByText(/Unsaved changes · Save to Server/)).toBeNull();
     expect(invoke.mock.calls.some(([command]) => command === "save_remote_draft")).toBe(false);
   });
   it("discards an unchanged old server copy while preserving genuine draft conflicts", async () => {
@@ -176,9 +176,9 @@ describe("remote-authoritative desktop workflows", () => {
     render(App); await screen.findByText("Updated server instance");
     await fireEvent.click(screen.getByRole("button", { name: /Devices/ }));
     await waitFor(() => expect(invoke).toHaveBeenCalledWith("discard_remote_draft", { hostId: host.id, instanceId: old.configuration.instance.id }));
-    await screen.findByLabelText("Peer name");
-    expect(screen.queryByText(/Unsaved local edits/)).toBeNull();
-    expect(screen.queryByText(/This draft is based on an older revision/)).toBeNull();
+    await screen.findByLabelText("Device name");
+    expect(screen.queryByText(/Unsaved changes ·/)).toBeNull();
+    expect(screen.queryByText(/The server configuration has changed since/)).toBeNull();
   });
   it("does not restore the previous revision as a draft after creating a peer", async () => {
     const remote = manifest();
@@ -199,20 +199,17 @@ describe("remote-authoritative desktop workflows", () => {
     await fireEvent.click(screen.getByRole("button", { name: /Remote WG.*WireGuard/ }));
     await waitFor(() => expect(screen.queryByText(/Checking local export material/)).toBeNull());
     await fireEvent.click(screen.getByRole("tab", { name: "Peers / Devices" }));
-    await fireEvent.input(screen.getByLabelText("Peer name"), { target: { value: "Phone" } });
-    await fireEvent.click(screen.getByRole("button", { name: "Create Peer on Server" }));
-    await screen.findByText(/saved revision 5/);
+    await fireEvent.input(screen.getByLabelText("Device name"), { target: { value: "Phone" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Add Device" }));
+    await screen.findByText("Device saved on the server");
     await screen.findByDisplayValue("Phone");
-    await screen.findByText("Client added and activated.");
-    expect(invoke).toHaveBeenCalledWith("preview_remote_deployment", expect.objectContaining({ expectedRevision: 5 }));
-    expect(invoke).toHaveBeenCalledWith("apply_remote_deployment", expect.objectContaining({ expectedRevision: 5, expectedStateHash: "client-plan" }));
-    const commands = invoke.mock.calls.map(([command]) => command);
-    expect(commands.indexOf("discard_remote_draft")).toBeLessThan(commands.indexOf("apply_remote_deployment"));
-    expect(screen.queryByText(/Pending deployment ·/)).toBeNull();
-    expect(screen.queryByText(/Unsaved local edits/)).toBeNull();
+    await screen.findByText("Device added to the saved configuration. Deploy when you are ready to enable access.");
+    expect(invoke.mock.calls.some(([command]) => command === "preview_remote_deployment" || command === "apply_remote_deployment")).toBe(false);
+    expect(invoke.mock.calls.some(([command]) => command === "discard_remote_draft")).toBe(true);
+    expect(screen.queryByText(/Unsaved changes ·/)).toBeNull();
     expect(invoke.mock.calls.some(([command]) => command === "save_remote_draft")).toBe(false);
   });
-  it("drains an in-flight draft write before adding and activating a client", async () => {
+  it("drains an in-flight draft write before saving a device", async () => {
     current = inventory([manifest()]);
     let local: RemoteDraft | null = null;
     let finishWrite!: () => void;
@@ -235,67 +232,59 @@ describe("remote-authoritative desktop workflows", () => {
     await waitFor(() => expect(invoke.mock.calls.some(([command]) => command === "save_remote_draft")).toBe(true));
     await fireEvent.input(screen.getByLabelText("Instance name"), { target: { value: "Remote WG" } });
     await fireEvent.click(screen.getByRole("tab", { name: "Peers / Devices" }));
-    await fireEvent.input(screen.getByLabelText("Peer name"), { target: { value: "Phone" } });
-    await fireEvent.click(screen.getByRole("button", { name: "Create Peer on Server" }));
+    await fireEvent.input(screen.getByLabelText("Device name"), { target: { value: "Phone" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Add Device" }));
     expect(invoke.mock.calls.some(([command]) => command === "add_remote_peer")).toBe(false);
     finishWrite();
-    await screen.findByText("Client added and activated.");
+    await screen.findByText("Device added to the saved configuration. Deploy when you are ready to enable access.");
     expect(local).toBeNull();
-    expect(screen.queryByText(/Unsaved local edits/)).toBeNull();
+    expect(screen.queryByText(/Unsaved changes ·/)).toBeNull();
   });
-  it("retains a saved client on activation failure and retries without creating it again", async () => {
+  it("keeps device creation separate from a failed explicit deployment", async () => {
     current = inventory([manifest()]);
     const saved = { ...manifest(), revision: 5 };
+    saved.configuration.peers = [{ id: "new-peer", display_name: "Phone", enabled: true, user_id: null, ipv4_address: null, ipv6_address: null, dns_name: null, created_at: saved.saved_at, identity: { backend: "wireguard", public_key: "public" } }];
     const base = invoke.getMockImplementation()!;
-    let attempts = 0;
     invoke.mockImplementation((command: string, args: unknown) => {
       if (command === "add_remote_peer") { current = inventory([saved]); return saved; }
       if (command === "preview_remote_deployment") return { desired_state_hash: "plan", warnings: [], operations: [] };
-      if (command === "apply_remote_deployment") {
-        if (++attempts === 1) return Promise.reject({ code: "deployment_failed", message: "Activation failed" });
-        return { status: "succeeded" };
-      }
+      if (command === "apply_remote_deployment") return Promise.reject({ code: "deployment_failed", message: "Deployment failed safely" });
       return base(command, args);
     });
     render(App); await screen.findByText("Remote WG");
     await fireEvent.click(screen.getByRole("button", { name: /Devices/ }));
-    await screen.findByLabelText("Peer name");
-    await fireEvent.input(screen.getByLabelText("Peer name"), { target: { value: "Phone" } });
-    await fireEvent.click(screen.getByRole("button", { name: "Create Peer on Server" }));
-    await screen.findByText("Activation failed");
-    await screen.findByText(/Client saved, but activation did not complete/);
-    await fireEvent.click(screen.getByRole("button", { name: "Retry client activation" }));
-    await screen.findByText("Client added and activated.");
+    await screen.findByLabelText("Device name");
+    await fireEvent.input(screen.getByLabelText("Device name"), { target: { value: "Phone" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Add Device" }));
+    await screen.findByText("Device saved on the server");
+    await waitFor(() => expect(invoke.mock.calls.filter(([command]) => command === "remote_peer_availability")).toHaveLength(2));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Review deployment" }) as HTMLButtonElement).disabled).toBe(false));
+    expect(invoke.mock.calls.some(([command]) => command === "apply_remote_deployment")).toBe(false);
+    await fireEvent.click(screen.getByRole("button", { name: "Review deployment" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Preview / Deploy" }));
+    await fireEvent.click(await screen.findByRole("button", { name: "Apply saved revision 5" }));
+    await screen.findByText("Deployment failed safely");
     expect(invoke.mock.calls.filter(([command]) => command === "add_remote_peer")).toHaveLength(1);
+    expect(screen.getByRole("heading", { name: "Remote WG" })).toBeTruthy();
   });
-  it("does not activate a newer concurrent revision while retrying client activation", async () => {
+  it("does not deploy when concurrent device creation is rejected", async () => {
     current = inventory([manifest()]);
-    const saved = { ...manifest(), revision: 5 };
     const base = invoke.getMockImplementation()!;
-    invoke.mockImplementation((command: string, args: unknown) => {
-      if (command === "add_remote_peer") { current = inventory([saved]); return saved; }
-      if (command === "preview_remote_deployment") return { desired_state_hash: "plan", warnings: [], operations: [] };
-      if (command === "apply_remote_deployment") {
-        current = inventory([{ ...saved, revision: 6 }]);
-        return Promise.reject({ code: "revision_conflict", message: "Another client saved a new revision" });
-      }
-      return base(command, args);
-    });
+    invoke.mockImplementation((command: string, args: unknown) => command === "add_remote_peer" ? Promise.reject({ code: "revision_conflict", message: "Another client saved a new revision" }) : base(command, args));
     render(App); await screen.findByText("Remote WG");
     await fireEvent.click(screen.getByRole("button", { name: /Devices/ }));
-    await screen.findByLabelText("Peer name");
-    await fireEvent.input(screen.getByLabelText("Peer name"), { target: { value: "Phone" } });
-    await fireEvent.click(screen.getByRole("button", { name: "Create Peer on Server" }));
+    await screen.findByLabelText("Device name");
+    await fireEvent.input(screen.getByLabelText("Device name"), { target: { value: "Phone" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Add Device" }));
     await screen.findByText("Another client saved a new revision");
-    await screen.findByText(/Client saved, but activation did not complete/);
-    await fireEvent.click(screen.getByRole("button", { name: "Retry client activation" }));
-    await screen.findByText(/Server configuration changed after adding this client/);
-    expect(invoke.mock.calls.filter(([command]) => command === "apply_remote_deployment")).toHaveLength(1);
+    expect((screen.getByRole("button", { name: "Add Device" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(invoke.mock.calls.some(([command]) => command === "apply_remote_deployment")).toBe(false);
   });
   it("shows private QR export and clears it on navigation", async () => {
     const remote = manifest();
     remote.configuration.peers = [{ id: "peer-1", user_id: null, display_name: "Phone", ipv4_address: "10.64.0.2", ipv6_address: null, dns_name: null, enabled: true, created_at: remote.saved_at, identity: { backend: "wireguard", public_key: "public" } }];
     current = inventory([remote]);
+    current.discovery.deployments[remote.configuration.instance.id] = { deployed_revision: remote.revision, pending_operation: null };
     const base = invoke.getMockImplementation()!;
     invoke.mockImplementation((command: string, args: unknown) => {
       if (command === "remote_peer_availability") return [{ peer_id: "peer-1", complete_export_available: true }];
@@ -304,16 +293,19 @@ describe("remote-authoritative desktop workflows", () => {
     });
     render(App); await screen.findByText("Remote WG");
     await fireEvent.click(screen.getByRole("button", { name: /Devices/ }));
-    await screen.findByLabelText("Peer name");
-    await waitFor(() => expect((screen.getByRole("button", { name: "Show QR code" }) as HTMLButtonElement).disabled).toBe(false));
+    await screen.findByLabelText("Device name");
+    await waitFor(() => expect((screen.getByRole("button", { name: "Get Configuration" }) as HTMLButtonElement).disabled).toBe(false));
+    await fireEvent.click(screen.getByRole("button", { name: "Get Configuration" }));
     await fireEvent.click(screen.getByRole("button", { name: "Show QR code" }));
     expect(await screen.findByAltText("Private VPN client configuration QR code")).toBeTruthy();
     expect(screen.getByText(/contains private VPN credentials/)).toBeTruthy();
-    await fireEvent.click(screen.getByRole("button", { name: "Close QR code" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Close Get Configuration" }));
     expect(screen.queryByAltText("Private VPN client configuration QR code")).toBeNull();
-    await waitFor(() => expect((screen.getByRole("button", { name: "Show QR code" }) as HTMLButtonElement).disabled).toBe(false));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Get Configuration" }) as HTMLButtonElement).disabled).toBe(false));
+    await fireEvent.click(screen.getByRole("button", { name: "Get Configuration" }));
     await fireEvent.click(screen.getByRole("button", { name: "Show QR code" }));
     await screen.findByAltText("Private VPN client configuration QR code");
+    await fireEvent.click(screen.getByRole("button", { name: "Close Get Configuration" }));
     await fireEvent.click(screen.getByRole("button", { name: /Hosts/ }));
     expect(screen.queryByAltText("Private VPN client configuration QR code")).toBeNull();
   });
@@ -347,8 +339,8 @@ describe("remote-authoritative desktop workflows", () => {
     render(App);
     await screen.findByText("Remote WG");
     await fireEvent.click(screen.getByRole("button", { name: /Remote WG.*WireGuard/ }));
-    await screen.findByText(/Pending deployment · saved desired state differs/);
-    expect(screen.getByText(/saved revision 4 · deployed revision 3/)).toBeTruthy();
+    await screen.findByText(/Changes ready to deploy ·/);
+    expect(screen.getByText("Configuration details")).toBeTruthy();
   });
   it("disables complete export when this client lacks the peer private key", async () => {
     const remote = manifest();
@@ -362,8 +354,8 @@ describe("remote-authoritative desktop workflows", () => {
     await screen.findByText("Remote WG");
     await fireEvent.click(screen.getByRole("button", { name: /Remote WG.*WireGuard/ }));
     await fireEvent.click(screen.getByRole("tab", { name: "Peers / Devices" }));
-    await screen.findByText("Private material unavailable on this client");
-    expect((screen.getByRole("button", { name: "Export configuration" }) as HTMLButtonElement).disabled).toBe(true);
+    await screen.findByText(/Deploy this instance once to establish its server identity/);
+    expect((screen.getByRole("button", { name: "Get Configuration" }) as HTMLButtonElement).disabled).toBe(true);
     expect(invoke.mock.calls.some(([command]) => command === "export_remote_peer")).toBe(false);
   });
   it("requires a deployed certificate authority before enrolling a certificate peer", async () => {
@@ -374,8 +366,8 @@ describe("remote-authoritative desktop workflows", () => {
     await screen.findByText("Remote OpenVPN");
     await fireEvent.click(screen.getByRole("button", { name: /Remote OpenVPN.*OpenVPN/ }));
     await fireEvent.click(screen.getByRole("tab", { name: "Peers / Devices" }));
-    expect(screen.getByText("Deploy this instance once to establish its certificate authority before enrolling peers.")).toBeTruthy();
-    expect((screen.getByRole("button", { name: "Create Peer on Server" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText("Deploy this instance once to establish its certificate authority before enrolling devices.")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Add Device" }) as HTMLButtonElement).disabled).toBe(true);
   });
   it("shows remote deployment receipts from a fresh client without secret fields", async () => {
     current = inventory([manifest()]);
@@ -492,7 +484,7 @@ describe("remote-authoritative desktop workflows", () => {
     await waitFor(() => expect(screen.queryByText(/Checking local export material/)).toBeNull());
     await fireEvent.click(screen.getByRole("tab", { name: "Settings" }));
     await fireEvent.input(screen.getByLabelText("Instance name"), { target: { value: "Retained edit" } });
-    await screen.findByText(/Unsaved local edits/);
+    await screen.findByText(/Unsaved changes ·/);
     await fireEvent.click(screen.getByRole("button", { name: "Danger Zone" }));
     await waitFor(() => expect(releaseDraft).toBeTypeOf("function"));
     expect(screen.queryByRole("heading", { name: "Danger Zone", level: 1 })).toBeNull();
@@ -698,4 +690,93 @@ describe("remote-authoritative desktop workflows", () => {
     expect(screen.getAllByRole("option").map((option) => option.textContent)).toEqual(["WireGuard", "AmneziaWG", "OpenVPN", "IKEv2/IPsec"]);
     expect(document.body.textContent).not.toMatch(/xray|vless/i);
   });
+  it("reviews a stale draft against original and latest server values without writing", async () => {
+    const original = manifest(), latest = structuredClone(original), local = structuredClone(original.configuration);
+    latest.revision = 5; latest.configuration.instance.display_name = "Server edit";
+    local.instance.display_name = "My local edit"; current = inventory([latest]);
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "load_remote_draft") return { host_id: host.id, base_revision: 4, configuration: local };
+      if (command === "remote_history") return [original];
+      if (command === "read_remote") return latest;
+      return base(command, args);
+    });
+    render(App); await screen.findByText("Server edit");
+    await fireEvent.click(screen.getByRole("button", { name: /Server edit.*WireGuard/ }));
+    await screen.findByText(/The server configuration has changed since/);
+    expect((screen.getByRole("button", { name: "Save to Server" }) as HTMLButtonElement).disabled).toBe(true);
+    await waitFor(() => expect((screen.getByRole("button", { name: "Review differences" }) as HTMLButtonElement).disabled).toBe(false));
+    await fireEvent.click(screen.getByRole("button", { name: "Review differences" }));
+    const dialog = await screen.findByRole("dialog", { name: "Review configuration changes" });
+    expect(dialog.textContent).toContain("My local edit"); expect(dialog.textContent).toContain("Server edit"); expect(dialog.textContent).toContain("Remote WG");
+    expect(invoke.mock.calls.some(([command]) => command === "save_remote_configuration" || command === "apply_remote_deployment")).toBe(false);
+  });
+
+  async function enterExport() {
+    const remote = manifest();
+    remote.configuration.peers = [{ id: "export-peer", user_id: null, display_name: "Laptop", ipv4_address: "10.64.0.2", ipv6_address: null, dns_name: null, enabled: true, created_at: remote.saved_at, identity: { backend: "wireguard", public_key: "public" } }];
+    current = inventory([remote]); current.discovery.deployments[remote.configuration.instance.id] = { deployed_revision: remote.revision, pending_operation: null };
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "remote_peer_availability" ? [{ peer_id: "export-peer", complete_export_available: true }] : base(command, args));
+    render(App); await screen.findByText("Remote WG");
+    await fireEvent.click(screen.getByRole("button", { name: /Devices/ }));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Get Configuration" }) as HTMLButtonElement).disabled).toBe(false));
+    await fireEvent.click(screen.getByRole("button", { name: "Get Configuration" }));
+    return remote;
+  }
+  it("copies through the scoped native command and records only a public summary", async () => {
+    const remote = await enterExport(), base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "copy_remote_peer_configuration" ? null : base(command, args));
+    expect(invoke.mock.calls.some(([command]) => command === "remote_peer_qr_svg")).toBe(false);
+    await fireEvent.click(screen.getByRole("button", { name: "Copy configuration text" }));
+    await screen.findByText("Configuration copied. Keep your clipboard private.");
+    expect(invoke).toHaveBeenCalledWith("copy_remote_peer_configuration", { hostId: host.id, instanceId: remote.configuration.instance.id, peerId: "export-peer" });
+    expect(screen.getByText(/system clipboard history/)).toBeTruthy();
+  });
+  it("keeps oversized QR failures visible and offers file export", async () => {
+    await enterExport(); const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "remote_peer_qr_svg" ? Promise.reject({ code: "qr_generation_failed", message: "Configuration too large. Download the file instead." }) : base(command, args));
+    await fireEvent.click(screen.getByRole("button", { name: "Show QR code" }));
+    await waitFor(() => expect(screen.getAllByText("Configuration too large. Download the file instead.").length).toBeGreaterThan(0));
+    expect((screen.getByRole("button", { name: "Download configuration file" }) as HTMLButtonElement).disabled).toBe(false);
+    expect(screen.queryByAltText("Private VPN client configuration QR code")).toBeNull();
+  });
+  it("does not redisplay a QR response after its dialog was closed", async () => {
+    await enterExport(); const base = invoke.getMockImplementation()!;
+    let finish!: (value: string) => void;
+    invoke.mockImplementation((command: string, args: unknown) => command === "remote_peer_qr_svg" ? new Promise<string>(resolve => finish = resolve) : base(command, args));
+    await fireEvent.click(screen.getByRole("button", { name: "Show QR code" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Close Get Configuration" }));
+    finish('<svg xmlns="http://www.w3.org/2000/svg"></svg>');
+    await waitFor(() => expect(screen.queryByText(/Preparing private configuration QR code/)).toBeNull());
+    await fireEvent.click(screen.getByRole("button", { name: "Get Configuration" }));
+    expect(screen.queryByAltText("Private VPN client configuration QR code")).toBeNull();
+  });
+
+  it("shows clipboard failure without claiming a successful copy", async () => {
+    await enterExport(); const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "copy_remote_peer_configuration" ? Promise.reject({ code: "clipboard_unavailable", message: "Clipboard unavailable. Download the file instead." }) : base(command, args));
+    await fireEvent.click(screen.getByRole("button", { name: "Copy configuration text" }));
+    await waitFor(() => expect(screen.getAllByText("Clipboard unavailable. Download the file instead.").length).toBeGreaterThan(0));
+    expect(screen.queryByText("Configuration copied. Keep your clipboard private.")).toBeNull();
+  });
+  it("keeps an operational error visible when an unrelated background task succeeds", async () => {
+    current = inventory([manifest()]); const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "save_remote_configuration" ? Promise.reject({ code: "revision_conflict", message: "Server changed while editing" }) : base(command, args));
+    render(App); await screen.findByText("Remote WG");
+    await fireEvent.click(screen.getByRole("button", { name: /Remote WG.*WireGuard/ }));
+    await fireEvent.click(screen.getByRole("tab", { name: "Settings" }));
+    await fireEvent.input(screen.getByLabelText("Instance name"), { target: { value: "Local draft" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Save to Server" }));
+    await screen.findByText("Server changed while editing");
+    await fireEvent.click(screen.getByRole("tab", { name: "Deployment" }));
+    await fireEvent.click(screen.getByRole("button", { name: "View configuration history" }));
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("remote_history", expect.anything()));
+    expect(screen.getByText("Server changed while editing")).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Dismiss error" }));
+    expect(screen.queryByText("Server changed while editing")).toBeNull();
+    expect(screen.getByText(/The server configuration has changed since/)).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Save to Server" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
 });

@@ -28,3 +28,21 @@ CoreDNS forwards public queries over DNS-over-TLS with certificate-name verifica
 ## Operational limits
 
 The helper is currently installed or upgraded through host administration rather than an automated VPNCTL bootstrap. A future manifest schema needs an explicit validated converter and recovery backup; this release supports schema 1 only. Pending runtime operations can block new changes and require request-ID reconciliation or operator recovery; do not clear the marker blindly. See [deployment and recovery](docs/deployment.md) and [remote format](docs/remote-format.md).
+
+## Desktop configuration retrieval
+
+Configuration text copying is an explicit, selected-device native command. Rust
+renders the same complete credential-bearing artifact used by file export and
+writes it directly to the OS clipboard; the frontend receives only success or a
+safe error. Generic frontend clipboard permissions are not enabled. IKEv2 binary
+PKCS#12 bundles cannot be copied as text. Clipboard contents may remain in OS
+history, sync to other devices through OS features, or be read by other local
+applications; VPNCTL does not promise clipboard erasure.
+
+WireGuard and AmneziaWG QR images are generated locally in Rust only after an
+explicit request. The image is held in frontend memory while its dialog is open
+and cleared on close, navigation, or configuration changes. Late responses cannot
+reopen it. No QR generation service, temporary QR file, or configuration-bearing
+navigation URL is used. Clearing UI references is not a guarantee of immediate
+memory erasure by the webview. Session activity stores curated public operation
+summaries, never exported configurations, credential material, or raw errors.

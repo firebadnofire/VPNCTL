@@ -156,6 +156,7 @@ async fn apply_host_provisioning_view(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
@@ -178,6 +179,7 @@ pub fn run() {
             remote::remote_peer_availability,
             remote::export_remote_peer,
             remote::remote_peer_qr_svg,
+            remote::copy_remote_peer_configuration,
             remote::revoke_remote_peer,
             remote::remove_remote_configuration,
             remote::restore_archived_instance,

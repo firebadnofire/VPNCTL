@@ -79,3 +79,34 @@ make verify
 - [Deployment and recovery](docs/deployment.md)
 - [Security and credential ownership](SECURITY.md)
 - [VM testing](docs/testing-vm.md)
+
+## Desktop usability
+
+Temporary feedback appears as dismissible notifications (success: 5 seconds,
+information: 7 seconds, noncritical warnings: 10 seconds). Hover or focus pauses
+its timer. **Activity** retains the latest 100 public summaries for this session;
+restarting the app clears them. Persistent connection, configuration-conflict,
+and interrupted-operation conditions stay visible separately. **Logs** continues
+to read the server's deployment history.
+
+**Devices** represents VPN client identities, not automatically detected physical
+hardware. **Add Device** saves an identity on the server without deploying it.
+Choose **Review deployment**, preview the saved configuration, and explicitly
+apply it when ready. The first deployment establishes the server identity;
+certificate-based instances also require their initial deployment before enrollment.
+
+**Get Configuration** offers locally generated QR codes for WireGuard and
+AmneziaWG, text copy for those protocols and OpenVPN, and private file download
+for all supported protocols. IKEv2 uses its existing binary PKCS#12 import
+workflow. Exports require matching private credentials on this installation and
+always reread the authoritative server configuration. A fresh installation can
+manage devices without possessing their export keys. QR and text import are not
+advertised for incompatible formats.
+
+Configuration status is independent from service health: matching saved and
+deployed revisions does not prove the VPN is running. **Check VPN health** records
+an explicit health observation; reconnection invalidates previous observations.
+Unknown deployment state is shown as unknown rather than pending deployment.
+**Review differences** compares the original draft, local edits, and the latest
+server values. Resolution is explicit discard-and-reload; reapply desired edits
+manually. Saving and deploying retain all server-side concurrency checks.

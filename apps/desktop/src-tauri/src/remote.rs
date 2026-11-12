@@ -353,3 +353,23 @@ pub async fn remote_peer_qr_svg(
         .remote_peer_qr_svg(host_id, instance_id, peer_id)
         .await
 }
+
+/// Copy through the native bridge without returning credentials to JavaScript.
+#[tauri::command]
+pub async fn copy_remote_peer_configuration(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    host_id: Uuid,
+    instance_id: Uuid,
+    peer_id: Uuid,
+) -> Result<(), AppError> {
+    use tauri_plugin_clipboard_manager::ClipboardExt;
+    let text = state
+        .0
+        .remote_peer_configuration_text(host_id, instance_id, peer_id)
+        .await?;
+    app.clipboard().write_text(text.as_str()).map_err(|_| AppError::new(
+        "clipboard_unavailable",
+        "Could not copy the configuration to the system clipboard. Download the configuration file instead.",
+    ))
+}

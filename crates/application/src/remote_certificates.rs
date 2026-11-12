@@ -141,14 +141,13 @@ impl ApplicationService {
         })
     }
 
-    pub(super) async fn export_remote_certificate(
+    pub(super) async fn remote_certificate_artifact(
         &self,
         host_id: Uuid,
         manifest: &Manifest,
         peer_id: Uuid,
         binding: DeviceBackendData,
-        destination: &std::path::Path,
-    ) -> Result<(), AppError> {
+    ) -> Result<vam_protocol::ClientArtifact, AppError> {
         let peer = manifest
             .configuration
             .peers
@@ -231,7 +230,7 @@ impl ApplicationService {
         let artifact = backend
             .render_client(&state, &device, &secrets)
             .map_err(backend_error)?;
-        super::write_private_file(destination, artifact.contents.as_bytes()).await
+        Ok(artifact)
     }
 
     pub async fn revoke_remote_peer(

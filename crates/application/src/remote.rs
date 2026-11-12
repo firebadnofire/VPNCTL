@@ -493,22 +493,58 @@ impl ApplicationService {
         peer_id: Uuid,
         destination: &std::path::Path,
     ) -> Result<(), AppError> {
+        let artifact = self
+            .remote_peer_export_artifact(host_id, instance_id, peer_id)
+            .await?;
+        super::write_private_file(destination, artifact.contents.as_bytes()).await
+    }
+
+    /// Explicit export only. Never serialize this secret-bearing artifact into UI state or logs.
+    pub async fn remote_peer_export_artifact(
+        &self,
+        host_id: Uuid,
+        instance_id: Uuid,
+        peer_id: Uuid,
+    ) -> Result<vam_protocol::ClientArtifact, AppError> {
         use vam_core::DeviceBackendData;
         let manifest = self.read_remote(host_id, instance_id).await?;
         let binding = self.storage.get_setting::<DeviceBackendData>(&peer_binding_key(manifest.appliance_id, instance_id, peer_id)).await.map_err(storage_error)?
-            .ok_or_else(|| AppError::new("missing_local_private_key", "This client does not possess the peer private key and cannot export a complete configuration."))?;
+            .ok_or_else(|| AppError::new("missing_local_private_key", "This client does not possess the device private key and cannot export a complete configuration."))?;
         if matches!(
             binding,
             DeviceBackendData::OpenVpn(_) | DeviceBackendData::Ikev2(_)
         ) {
-            return self
-                .export_remote_certificate(host_id, &manifest, peer_id, binding, destination)
-                .await;
+            self.remote_certificate_artifact(host_id, &manifest, peer_id, binding)
+                .await
+        } else {
+            self.remote_peer_configuration(host_id, &manifest, peer_id, binding)
+                .await
         }
+    }
+
+    /// Explicit text export for the native clipboard; binary credential bundles are not text.
+    pub async fn remote_peer_configuration_text(
+        &self,
+        host_id: Uuid,
+        instance_id: Uuid,
+        peer_id: Uuid,
+    ) -> Result<zeroize::Zeroizing<String>, AppError> {
         let artifact = self
-            .remote_peer_configuration(host_id, &manifest, peer_id, binding)
+            .remote_peer_export_artifact(host_id, instance_id, peer_id)
             .await?;
-        super::write_private_file(destination, artifact.contents.as_bytes()).await
+        if artifact.contents.is_binary() {
+            return Err(AppError::new(
+                "text_export_not_supported",
+                "This device uses a binary credential bundle. Download the configuration file instead.",
+            ));
+        }
+        Ok(zeroize::Zeroizing::new(
+            artifact
+                .contents
+                .as_text()
+                .ok_or_else(|| validation_error("Configuration text is unavailable."))?
+                .to_owned(),
+        ))
     }
 
     /// Render only for the verified appliance and the locally held matching key.
@@ -1765,6 +1801,18 @@ mod tests {
             let contents = std::fs::read_to_string(&destination).unwrap();
             assert!(contents.contains("PrivateKey = "));
             assert!(contents.contains("PresharedKey = "));
+            let text = a
+                .remote_peer_configuration_text(host_a.id, id, peer)
+                .await
+                .unwrap();
+            assert_eq!(text.as_str(), contents);
+            assert_eq!(
+                b.remote_peer_configuration_text(host_b.id, id, peer)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "missing_local_private_key"
+            );
             assert_eq!(
                 b.remote_peer_qr_svg(host_b.id, id, peer)
                     .await

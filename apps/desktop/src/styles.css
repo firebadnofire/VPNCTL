@@ -557,3 +557,49 @@ input:focus, select:focus { border-color: #2f80ed; box-shadow: 0 0 0 3px #2f80ed
 .empty-workspace p { color: var(--workspace-muted); font-size: 12px; line-height: 1.6; max-width: 320px; margin: 0 0 7px; }
 .empty-symbol { display: grid; place-items: center; width: 49px; height: 49px; border-radius: 13px; background: #edf4fc; color: #6592c5; font-size: 25px; margin-bottom: 4px; }
 @media (max-width: 850px) { .instance-head { flex-direction: column; } .instance-head .header-actions { justify-content: flex-start; } .server-tabs, .instance-tabs { overflow-x: auto; } .app-main .setup-form, .overview-facts { grid-template-columns: 1fr !important; } }
+
+/* Shared feedback and accessible contextual help. */
+.toast-region { position: fixed; right: 22px; bottom: 22px; z-index: 40; display: grid; gap: 10px; width: min(410px, calc(100vw - 32px)); pointer-events: none; }
+.toast { pointer-events: auto; display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px; background: white; border: 1px solid #b8d4e9; border-left: 4px solid #2478cd; border-radius: 10px; box-shadow: 0 5px 22px #102a4326; }
+.toast[data-kind="success"] { border-left-color: #21805a; }
+.toast[data-kind="warning"] { border-left-color: #a36200; }
+.toast button { background: transparent; border: 0; font-size: 22px; min-width: 36px; min-height: 36px; }
+.tooltip-wrap { display: inline-block; position: relative; vertical-align: middle; }
+.help-trigger { border: 1px solid #627d98; color: #334e68; background: white; border-radius: 50%; width: 28px; height: 28px; padding: 0; margin-inline: 4px; cursor: help; }
+.tooltip-content { position: absolute; z-index: 45; top: 100%; right: 0; width: min(260px, 65vw); padding: 12px; border-radius: 8px; background: #17344d; color: white; font-size: 13px; font-weight: 400; line-height: 1.5; white-space: normal; box-shadow: 0 4px 15px #102a4333; }
+.tooltip-content[hidden] { display: none; }
+dialog.modal { border: 1px solid #bcccdc; color: #243b53; margin: auto; }
+dialog.modal::backdrop { background: #102a4378; }
+.activity-list { padding: 0; list-style: none; }
+.activity-list li { padding: 12px 0; border-bottom: 1px solid #e4edf5; }
+.activity-list time { display: block; font-size: 12px; color: #52697d; margin-top: 5px; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: 0s !important; transition-duration: 0s !important; } }
+.configuration-qr { display: block; width: min(384px, 100%); height: auto; margin: 20px auto; background: white; }
+.export-actions, .host-tools > div { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.export-actions p { flex-basis: 100%; }
+.configuration-details { margin: 12px 0; }
+.configuration-details dl { display: grid; grid-template-columns: 1fr auto; gap: 8px; }
+.configuration-details dd { margin: 0; }
+.action-help, .compact-summary { color: #486581; font-size: 13px; line-height: 1.6; }
+.field-error { display: block; font-size: 12px; font-weight: 500; color: #a32626; margin-top: 4px; }
+[aria-invalid="true"] { border-color: #a32626 !important; }
+.status-line { font-weight: 650; color: #254e70; }
+.enrollment-result { display: block; }
+.enrollment-result button { margin: 5px 8px 5px 0; }
+.metric-link { text-align: left; cursor: pointer; color: inherit; font: inherit; }
+.metric-link:hover { border-color: #2f80ed; background: #f6faff; }
+.metric-grid[aria-label="Server summary"] .metric-card { min-height: 120px; }
+.instance-state[data-state="configuration"] { color: #254e70; background: #e8f1fa; }
+.host-tools summary, .configuration-details summary { cursor: pointer; padding: 9px 0; }
+.attention-panel { margin: 18px 0; }
+.attention-panel p { line-height: 1.7; }
+.table-wrap { max-width: 100%; overflow-x: auto; }
+.table-wrap td, .table-wrap th { overflow-wrap: anywhere; }
+.table-wrap td input:not([type="checkbox"]) { min-width: 120px; max-width: 100%; }
+.instance-card.selected { border-color: #2f80ed; box-shadow: inset 4px 0 #2f80ed; background: #edf5ff; }
+.instance-detail-column, .instance-workspace, .app-main, .workspace { min-width: 0; }
+.header-actions { flex-wrap: wrap; align-items: center; }
+.eyebrow { text-transform: none; letter-spacing: .03em; }
+button, summary { touch-action: manipulation; }
+@media (max-width: 850px) { .toast-region { right: 12px; bottom: 12px; } .instance-content { padding-inline: 12px; } .topbar { flex-wrap: wrap; gap: 8px; } .metric-grid[aria-label="Server summary"] .metric-card { min-height: 100px; } }
+.app-main .eyebrow, .sidebar nav h2 { text-transform: none; letter-spacing: .03em; }
