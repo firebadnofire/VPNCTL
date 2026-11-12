@@ -340,3 +340,16 @@ pub async fn discard_remote_draft(
 ) -> Result<(), AppError> {
     state.0.discard_remote_draft(host_id, instance_id).await
 }
+
+#[tauri::command]
+pub async fn remote_peer_qr_svg(
+    state: State<'_, AppState>,
+    host_id: Uuid,
+    instance_id: Uuid,
+    peer_id: Uuid,
+) -> Result<String, AppError> {
+    state
+        .0
+        .remote_peer_qr_svg(host_id, instance_id, peer_id)
+        .await
+}

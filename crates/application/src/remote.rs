@@ -19,6 +19,9 @@ pub struct ServerIdentity {
     pub appliance_id: Uuid,
     pub machine_fingerprint: String,
     pub ssh_public_key: String,
+    /// Negotiated helper features; never used as an appliance trust anchor.
+    #[serde(default)]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -490,7 +493,7 @@ impl ApplicationService {
         peer_id: Uuid,
         destination: &std::path::Path,
     ) -> Result<(), AppError> {
-        use vam_core::{DeviceBackendData, SecretReference};
+        use vam_core::DeviceBackendData;
         let manifest = self.read_remote(host_id, instance_id).await?;
         let binding = self.storage.get_setting::<DeviceBackendData>(&peer_binding_key(manifest.appliance_id, instance_id, peer_id)).await.map_err(storage_error)?
             .ok_or_else(|| AppError::new("missing_local_private_key", "This client does not possess the peer private key and cannot export a complete configuration."))?;
@@ -502,12 +505,33 @@ impl ApplicationService {
                 .export_remote_certificate(host_id, &manifest, peer_id, binding, destination)
                 .await;
         }
+        let artifact = self
+            .remote_peer_configuration(host_id, &manifest, peer_id, binding)
+            .await?;
+        super::write_private_file(destination, artifact.contents.as_bytes()).await
+    }
+
+    /// Render only for the verified appliance and the locally held matching key.
+    async fn remote_peer_configuration(
+        &self,
+        host_id: Uuid,
+        manifest: &Manifest,
+        peer_id: Uuid,
+        binding: vam_core::DeviceBackendData,
+    ) -> Result<vam_protocol::ClientArtifact, AppError> {
+        use vam_core::{DeviceBackendData, SecretReference};
+        let instance_id = manifest.configuration.instance.id;
         let mut state = manifest.configuration.runtime_state();
         let device = state
             .devices
             .iter_mut()
             .find(|device| device.id == peer_id)
             .ok_or_else(|| validation_error("Peer no longer exists."))?;
+        if !device.enabled {
+            return Err(validation_error(
+                "Disabled peers cannot be exported as active configurations.",
+            ));
+        }
         let (private_ref, psk_ref, identity_matches) = match (&device.backend_data, &binding) {
             (DeviceBackendData::WireGuard(remote), DeviceBackendData::WireGuard(local)) => (
                 &local.private_key_ref,
@@ -583,7 +607,48 @@ impl ApplicationService {
         let artifact = backend
             .render_client(&state, &device, &secrets)
             .map_err(super::backend_error)?;
-        super::write_private_file(destination, artifact.contents.as_bytes()).await
+        Ok(artifact)
+    }
+
+    pub async fn remote_peer_qr_svg(
+        &self,
+        host_id: Uuid,
+        instance_id: Uuid,
+        peer_id: Uuid,
+    ) -> Result<String, AppError> {
+        let manifest = self.read_remote(host_id, instance_id).await?;
+        if !matches!(
+            manifest.configuration.instance.backend,
+            VpnBackendKind::WireGuard | VpnBackendKind::AmneziaWg
+        ) {
+            return Err(AppError::new(
+                "qr_not_supported",
+                "Use file export for this backend's client credentials.",
+            ));
+        }
+        let binding = self
+            .storage
+            .get_setting(&peer_binding_key(
+                manifest.appliance_id,
+                instance_id,
+                peer_id,
+            ))
+            .await
+            .map_err(storage_error)?
+            .ok_or_else(|| {
+                AppError::new(
+                    "missing_local_private_key",
+                    "This client does not possess the peer private key.",
+                )
+            })?;
+        let artifact = self
+            .remote_peer_configuration(host_id, &manifest, peer_id, binding)
+            .await?;
+        let code = qrcode::QrCode::new(artifact.contents.as_bytes()).map_err(|_| AppError::new("qr_generation_failed", "The configuration is too large for a QR code. Export it as a private file instead."))?;
+        Ok(code
+            .render::<qrcode::render::svg::Color>()
+            .min_dimensions(384, 384)
+            .build())
     }
     /// SSH trust is checked before any use of the appliance UUID. The latter
     /// is an ownership identifier, never an authentication credential.
@@ -612,6 +677,7 @@ impl ApplicationService {
         let Reply::Info {
             appliance_id,
             machine_fingerprint,
+            capabilities,
             ..
         } = response.result.map_err(remote_failure)?
         else {
@@ -623,6 +689,7 @@ impl ApplicationService {
             appliance_id,
             machine_fingerprint,
             ssh_public_key: trusted.public_key_base64,
+            capabilities,
         };
         if let Some(previous) = self
             .storage
@@ -1075,6 +1142,9 @@ impl ApplicationService {
         confirmed: bool,
     ) -> Result<Manifest, AppError> {
         let identity = self.remote_identity(input.host_id).await?;
+        if !supports_archives(&identity) {
+            return Err(archive_upgrade_required());
+        }
         manifest_reply(
             self.remote_operation(
                 input.host_id,
@@ -1091,7 +1161,8 @@ impl ApplicationService {
                     confirmed,
                 },
             )
-            .await?,
+            .await
+            .map_err(archive_operation_error)?,
         )
     }
 
@@ -1103,6 +1174,9 @@ impl ApplicationService {
         request_id: Uuid,
         confirmed: bool,
     ) -> Result<Manifest, AppError> {
+        if !supports_archives(&self.remote_identity(host_id).await?) {
+            return Err(archive_upgrade_required());
+        }
         manifest_reply(
             self.remote_operation(
                 host_id,
@@ -1113,7 +1187,8 @@ impl ApplicationService {
                     confirmed,
                 },
             )
-            .await?,
+            .await
+            .map_err(archive_operation_error)?,
         )
     }
 
@@ -1176,6 +1251,34 @@ fn remote_failure(failure: vam_authority::AuthorityFailure) -> AppError {
     }
 }
 
+fn archive_upgrade_required() -> AppError {
+    let mut error = AppError::new(
+        "helper_upgrade_required",
+        "The server helper does not support restorable archives. The archive or restore operation has not run.",
+    );
+    error.remediation = Some("Update the VPNCTL helper at /usr/local/libexec/vam-server on this server, then Refresh / Reconnect. The desktop app and server helper must both support archived-instance recovery.".into());
+    error
+}
+
+fn supports_archives(identity: &ServerIdentity) -> bool {
+    identity
+        .capabilities
+        .iter()
+        .any(|feature| feature == vam_authority::manifest::INSTANCE_ARCHIVE_CAPABILITY)
+}
+
+fn archive_operation_error(error: AppError) -> AppError {
+    // A helper downgrade between negotiation and execution still fails closed.
+    // Never retry using the older removal operation: it lacks restore metadata.
+    if error.code == "remote_authority" && error.message.contains("invalid manifest request") {
+        let mut failure = archive_upgrade_required();
+        failure.technical_detail = Some(error.message);
+        failure
+    } else {
+        error
+    }
+}
+
 fn remote_transport_error(error: &vam_authority_client::AuthorityClientError) -> AppError {
     AppError { code: "remote_exchange_failed".into(), message: error.to_string(), scope: None,
         remote_state_changed: true, rollback_succeeded: None,
@@ -1201,6 +1304,7 @@ mod tests {
         appliance_id: Uuid,
         offline: AtomicBool,
         calls: AtomicUsize,
+        supports_archives: AtomicBool,
     }
 
     #[async_trait]
@@ -1221,6 +1325,11 @@ mod tests {
                     appliance_id: self.appliance_id,
                     machine_fingerprint: session.config.hostname.clone(),
                     software_version: "test".into(),
+                    capabilities: if self.supports_archives.load(Ordering::SeqCst) {
+                        vec![vam_authority::manifest::INSTANCE_ARCHIVE_CAPABILITY.into()]
+                    } else {
+                        vec![]
+                    },
                 }),
                 Operation::Discover => self.store.discover().map(Reply::Discovery),
                 Operation::Read { instance_id } => self
@@ -1354,6 +1463,7 @@ mod tests {
             appliance_id,
             offline: AtomicBool::new(false),
             calls: AtomicUsize::new(0),
+            supports_archives: AtomicBool::new(true),
         })
     }
 
@@ -1422,6 +1532,90 @@ mod tests {
         assert!(b.legacy_candidates().await.unwrap().is_empty());
         b.delete_host(host_b.id).await.unwrap();
         assert_eq!(helper.store.discover().unwrap().instances.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn outdated_helper_blocks_archival_until_support_is_negotiated() {
+        let directory = tempfile::tempdir().unwrap();
+        let helper = helper(directory.path());
+        helper.supports_archives.store(false, Ordering::SeqCst);
+        let (service, host) = client(helper.clone(), "server", true).await;
+        let created = service
+            .create_remote_instance(CreateInstanceInput {
+                host_id: host.id,
+                display_name: "Still active".into(),
+                endpoint_host: "vpn.example.test".into(),
+                backend: VpnBackendKind::WireGuard,
+                backend_settings: None,
+                endpoint_port: None,
+                ipv4_subnet: "10.88.0.0/24".into(),
+                dns_zone: "vpn.internal".into(),
+                routing_mode: None,
+                xray_tls_import: None,
+            })
+            .await
+            .unwrap();
+        let input = RemoteSaveInput {
+            host_id: host.id,
+            expected_revision: created.revision,
+            request_id: Uuid::new_v4(),
+            configuration: created.configuration.clone(),
+        };
+        let error = service
+            .remove_remote_configuration(input.clone(), true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "helper_upgrade_required");
+        assert!(!error.remote_state_changed);
+        assert!(
+            error
+                .remediation
+                .unwrap()
+                .contains("/usr/local/libexec/vam-server")
+        );
+        assert_eq!(
+            helper.store.discover().unwrap().instances,
+            vec![created.clone()]
+        );
+        assert!(
+            service
+                .restore_archived_instance(
+                    host.id,
+                    created.configuration.instance.id,
+                    2,
+                    Uuid::new_v4(),
+                    true
+                )
+                .await
+                .is_err()
+        );
+        helper.supports_archives.store(true, Ordering::SeqCst);
+        assert!(
+            service
+                .remove_remote_configuration(input, true)
+                .await
+                .unwrap()
+                .removed
+        );
+        assert!(helper.store.discover().unwrap().instances.is_empty());
+    }
+
+    #[test]
+    fn legacy_info_and_cache_do_not_imply_archive_support() {
+        let response: Reply = serde_json::from_value(serde_json::json!({"response":"info", "value": {
+            "appliance_id": Uuid::new_v4(), "machine_fingerprint":"machine", "software_version":"0.1.0"
+        }})).unwrap();
+        assert!(matches!(response, Reply::Info { capabilities, .. } if capabilities.is_empty()));
+        let identity: ServerIdentity = serde_json::from_value(serde_json::json!({
+            "appliance_id": Uuid::new_v4(), "machine_fingerprint":"machine", "ssh_public_key":"approved"
+        })).unwrap();
+        assert!(!supports_archives(&identity));
+        let mapped = archive_operation_error(AppError::new(
+            "remote_authority",
+            "authority state is invalid: invalid manifest request",
+        ));
+        assert_eq!(mapped.code, "helper_upgrade_required");
+        assert!(!mapped.remote_state_changed);
     }
 
     #[tokio::test]
@@ -1512,127 +1706,145 @@ mod tests {
 
     #[tokio::test]
     async fn peers_remain_visible_without_local_private_keys_and_only_original_client_exports() {
-        let dir = tempfile::tempdir().unwrap();
-        let helper = helper(&dir.path().join("remote"));
-        let (a, host_a) = client(helper.clone(), "server", true).await;
-        let (b, host_b) = client(helper.clone(), "server", true).await;
-        let created = a
-            .create_remote_instance(CreateInstanceInput {
-                host_id: host_a.id,
-                display_name: "primary".into(),
-                endpoint_host: "vpn.example.com".into(),
-                backend: VpnBackendKind::WireGuard,
-                backend_settings: None,
-                endpoint_port: None,
-                ipv4_subnet: "10.88.0.0/24".into(),
-                dns_zone: "vpn.internal".into(),
-                routing_mode: None,
-                xray_tls_import: None,
-            })
-            .await
-            .unwrap();
-        let id = created.configuration.instance.id;
-        let saved = a
-            .add_remote_peer(
-                host_a.id,
-                1,
-                super::super::CreateDeviceInput {
-                    instance_id: id,
-                    user_id: None,
-                    display_name: "phone".into(),
-                    preshared_key: true,
-                    create_dns_record: true,
-                    dns_name: Some("phone".into()),
-                },
+        for backend in [VpnBackendKind::WireGuard, VpnBackendKind::AmneziaWg] {
+            let dir = tempfile::tempdir().unwrap();
+            let helper = helper(&dir.path().join("remote"));
+            let (a, host_a) = client(helper.clone(), "server", true).await;
+            let (b, host_b) = client(helper.clone(), "server", true).await;
+            let created = a
+                .create_remote_instance(CreateInstanceInput {
+                    host_id: host_a.id,
+                    display_name: "primary".into(),
+                    endpoint_host: "vpn.example.com".into(),
+                    backend,
+                    backend_settings: None,
+                    endpoint_port: None,
+                    ipv4_subnet: "10.88.0.0/24".into(),
+                    dns_zone: "vpn.internal".into(),
+                    routing_mode: None,
+                    xray_tls_import: None,
+                })
+                .await
+                .unwrap();
+            let id = created.configuration.instance.id;
+            let saved = a
+                .add_remote_peer(
+                    host_a.id,
+                    1,
+                    super::super::CreateDeviceInput {
+                        instance_id: id,
+                        user_id: None,
+                        display_name: "phone".into(),
+                        preshared_key: true,
+                        create_dns_record: true,
+                        dns_name: Some("phone".into()),
+                    },
+                )
+                .await
+                .unwrap();
+            let peer = saved.configuration.peers[0].id;
+            assert_eq!(
+                b.read_remote(host_b.id, id)
+                    .await
+                    .unwrap()
+                    .configuration
+                    .peers
+                    .len(),
+                1
+            );
+            let destination = dir.path().join("phone.conf");
+            let error = b
+                .export_remote_peer(host_b.id, id, peer, &destination)
+                .await
+                .unwrap_err();
+            assert_eq!(error.code, "missing_local_private_key");
+            assert!(!destination.exists());
+            a.export_remote_peer(host_a.id, id, peer, &destination)
+                .await
+                .unwrap();
+            let contents = std::fs::read_to_string(&destination).unwrap();
+            assert!(contents.contains("PrivateKey = "));
+            assert!(contents.contains("PresharedKey = "));
+            assert_eq!(
+                b.remote_peer_qr_svg(host_b.id, id, peer)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "missing_local_private_key"
+            );
+            let qr = a.remote_peer_qr_svg(host_a.id, id, peer).await.unwrap();
+            assert!(qr.contains("<svg"));
+            assert!(qr.contains("<path"));
+            let expected_qr = qrcode::QrCode::new(contents.as_bytes())
+                .unwrap()
+                .render::<qrcode::render::svg::Color>()
+                .min_dimensions(384, 384)
+                .build();
+            assert_eq!(qr, expected_qr);
+            assert_eq!(
+                saved.configuration.dns_records[0].managed_by_device_id,
+                Some(peer)
+            );
+            a.discover_remote(host_a.id).await.unwrap();
+            a.delete_host(host_a.id).await.unwrap();
+            assert_eq!(std::fs::read_to_string(&destination).unwrap(), contents);
+            let reconnected = DockerHost {
+                id: Uuid::new_v4(),
+                ..host_a
+            };
+            a.storage.save_host(&reconnected).await.unwrap();
+            approve(&a, &reconnected).await;
+            assert_eq!(
+                a.discover_remote(reconnected.id)
+                    .await
+                    .unwrap()
+                    .discovery
+                    .instances
+                    .len(),
+                1
+            );
+            assert!(
+                a.remote_peer_availability(reconnected.id, id)
+                    .await
+                    .unwrap()[0]
+                    .complete_export_available
+            );
+            a.export_remote_peer(
+                reconnected.id,
+                id,
+                peer,
+                &dir.path().join("reconnected.conf"),
             )
             .await
             .unwrap();
-        let peer = saved.configuration.peers[0].id;
-        assert_eq!(
-            b.read_remote(host_b.id, id)
-                .await
-                .unwrap()
-                .configuration
-                .peers
-                .len(),
-            1
-        );
-        let destination = dir.path().join("phone.conf");
-        let error = b
-            .export_remote_peer(host_b.id, id, peer, &destination)
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, "missing_local_private_key");
-        assert!(!destination.exists());
-        a.export_remote_peer(host_a.id, id, peer, &destination)
-            .await
-            .unwrap();
-        let contents = std::fs::read_to_string(&destination).unwrap();
-        assert!(contents.contains("PrivateKey = "));
-        assert!(contents.contains("PresharedKey = "));
-        assert_eq!(
-            saved.configuration.dns_records[0].managed_by_device_id,
-            Some(peer)
-        );
-        a.discover_remote(host_a.id).await.unwrap();
-        a.delete_host(host_a.id).await.unwrap();
-        assert_eq!(std::fs::read_to_string(&destination).unwrap(), contents);
-        let reconnected = DockerHost {
-            id: Uuid::new_v4(),
-            ..host_a
-        };
-        a.storage.save_host(&reconnected).await.unwrap();
-        approve(&a, &reconnected).await;
-        assert_eq!(
-            a.discover_remote(reconnected.id)
-                .await
-                .unwrap()
-                .discovery
-                .instances
-                .len(),
-            1
-        );
-        assert!(
-            a.remote_peer_availability(reconnected.id, id)
-                .await
-                .unwrap()[0]
-                .complete_export_available
-        );
-        a.export_remote_peer(
-            reconnected.id,
-            id,
-            peer,
-            &dir.path().join("reconnected.conf"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            std::fs::read_to_string(dir.path().join("reconnected.conf")).unwrap(),
-            contents
-        );
-        helper
-            .store
-            .remove(
-                &SaveRequest {
-                    compatibility: Compatibility::default(),
-                    appliance_id: helper.appliance_id,
-                    request_id: Uuid::new_v4(),
-                    expected_revision: saved.revision,
-                    configuration: saved.configuration,
-                    secrets: BTreeMap::new(),
-                },
-                true,
-            )
-            .unwrap();
-        assert!(
-            a.discover_remote(reconnected.id)
-                .await
-                .unwrap()
-                .discovery
-                .instances
-                .is_empty()
-        );
-        assert!(helper.store.discover().unwrap().instances.is_empty());
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("reconnected.conf")).unwrap(),
+                contents
+            );
+            helper
+                .store
+                .remove(
+                    &SaveRequest {
+                        compatibility: Compatibility::default(),
+                        appliance_id: helper.appliance_id,
+                        request_id: Uuid::new_v4(),
+                        expected_revision: saved.revision,
+                        configuration: saved.configuration,
+                        secrets: BTreeMap::new(),
+                    },
+                    true,
+                )
+                .unwrap();
+            assert!(
+                a.discover_remote(reconnected.id)
+                    .await
+                    .unwrap()
+                    .discovery
+                    .instances
+                    .is_empty()
+            );
+            assert!(helper.store.discover().unwrap().instances.is_empty());
+        }
     }
 
     #[tokio::test]

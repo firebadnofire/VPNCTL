@@ -14,7 +14,7 @@ export interface Manifest {
   request_digest: string; saved_at: string; removed: boolean; configuration: Configuration;
 }
 export interface RemoteInventory {
-  host_id: string; identity: { appliance_id: string; machine_fingerprint: string; ssh_public_key: string };
+  host_id: string; identity: { appliance_id: string; machine_fingerprint: string; ssh_public_key: string; capabilities?: string[] };
   synchronized_at: string; cached: boolean;
   discovery: { instances: Manifest[]; archived_instances?: Manifest[]; errors: Record<string, string>; deployments: Record<string, { deployed_revision: number | null; pending_operation: string | null }> };
 }

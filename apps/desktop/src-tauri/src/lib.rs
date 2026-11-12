@@ -177,6 +177,7 @@ pub fn run() {
             remote::add_remote_peer,
             remote::remote_peer_availability,
             remote::export_remote_peer,
+            remote::remote_peer_qr_svg,
             remote::revoke_remote_peer,
             remote::remove_remote_configuration,
             remote::restore_archived_instance,

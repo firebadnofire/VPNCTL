@@ -35,6 +35,16 @@ Deployment backup and rollback act on runtime trees, not control generations. A 
 
 Desktop/CLI and helper exchange protocol version 2 and manifest schema version 1. The helper negotiates compatibility before opening or creating authoritative storage. A mismatched client receives `incompatible` and must not write. The schema number is checked when reading every committed generation.
 
+Helper Info also advertises optional capabilities. Restorable instance archive and restore require `instance_archives_v1`; protocol version 2 alone does not imply support. Missing capabilities default to empty for older helpers. Clients refuse these operations until the helper is updated and freshly verified; they never fall back to legacy removal.
+
 There is no in-place schema upgrader in this version. To move to a future schema: stop mutation traffic, create and verify a complete control/recovery backup, install a helper and clients that explicitly support both source and destination schemas, validate a conversion of every retained generation and secret reference, and atomically publish upgraded generations only after validation. Keep the original backup until discovery, history, deployment observation and recovery have been verified. A version without a reviewed converter must refuse the write and leave control state untouched.
 
 A pre-existing remote SQLite authority database is not automatically imported. Preserve its database, WAL and SHM together, plus any protected secret files, and use the old recovery tooling in an isolated copy to export its public state. Validate identity and content before committing a schema-1 manifest through the helper. Do not delete the old database until independent discovery and recovery backup checks pass. Legacy local SQLite migration is a separate, explicit operation from the desktop or CLI.
+
+## Desktop client enrollment and export
+
+Adding a client saves its credentials and public configuration, clears the previous local draft, then automatically previews and applies that exact saved revision through the existing revision/hash checks. Internal revisions remain mandatory concurrency evidence; no manual revision or save step is required for enrollment. If activation fails, the saved client and local keys survive. Inspect interrupted operations and retry client activation rather than creating the client again. Existing unrelated local edits must be saved or discarded first. Deployment cannot use an unsaved or obsolete draft revision.
+
+Retained drafts that exactly match a known committed server generation are obsolete copies and may be discarded; differing edits remain available for explicit reconciliation. Draft writes are drained before enrollment and local cleanup.
+
+WireGuard and AmneziaWG client configurations can be displayed as QR codes. QR rendering shares the file-export renderer, requires the verified appliance and matching locally held private key, and never uploads the client private key. QR codes contain sensitive credentials; they are kept in the current view only and cleared on navigation, editing, or refresh. Certificate backends retain private file export. Oversized configurations report a QR error and must be exported as files.

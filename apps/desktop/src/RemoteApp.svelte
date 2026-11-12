@@ -52,6 +52,9 @@
   let dnsType = "A";
   let hostForm = { display_name: "", hostname: "", username: "", port: 22, private_key_path: "", passphrase: "" };
   let defaultUsername = "";
+  let draftWrite: Promise<boolean> = Promise.resolve(true);
+  let qrImage = "";
+  let clientActivationPending: { instanceId: string; revision: number } | null = null;
   let draftTimer: ReturnType<typeof setTimeout> | undefined;
   let dangerInstanceId = "";
   let dangerPeerId = "";
@@ -59,12 +62,13 @@
   let pendingArchiveRestore: { hostId: string; instanceId: string; expectedRevision: number; requestId: string } | null = null;
   let pendingInstanceArchive: { hostId: string; instanceId: string; input: { host_id: string; expected_revision: number; request_id: string; configuration: Configuration } } | null = null;
   onDestroy(() => clearTimeout(draftTimer));
-  function scheduleDraft() { clearTimeout(draftTimer); draftTimer = setTimeout(() => { void retainDraft(); }, 300); }
+  function scheduleDraft() { qrImage = ""; clearTimeout(draftTimer); draftTimer = setTimeout(() => { void retainDraft(); }, 300); }
   $: host = hosts.find((item) => item.id === selectedHostId);
   $: eligibleLocalLegacyInstances = candidates.filter((candidate) => candidate.supported);
   $: showMigrationUI = eligibleLocalLegacyInstances.length > 0;
   $: dirty = Boolean(selected && draft && JSON.stringify(draft) !== JSON.stringify(selected.configuration));
   $: online = connection === "connected" && !inventory?.cached;
+  $: supportsInstanceArchives = Boolean(inventory?.identity.capabilities?.includes("instance_archives_v1"));
   $: observation = selected ? inventory?.discovery.deployments?.[selected.configuration.instance.id] : undefined;
   $: peerCount = inventory?.discovery.instances.reduce((count, item) => count + item.configuration.peers.length, 0) ?? 0;
   $: enabledPeerCount = inventory?.discovery.instances.reduce((count, item) => count + item.configuration.peers.filter((peer) => peer.enabled).length, 0) ?? 0;
@@ -97,12 +101,14 @@
   });
   async function selectServer(id: string, section = "Overview") {
     if (dirty && !(await retainDraft())) return;
+    qrImage = ""; clientActivationPending = null;
     selectedHostId = id; selected = null; draft = null; inventory = null; inspection = null; probe = null;
     dangerInstanceId = ""; dangerPeerId = "";
     plan = null; health = null; backups = []; restorePreview = null; page = "server"; serverTab = section; await refreshServer();
   }
   async function navigateSection(section: string) {
     if (dirty && !(await retainDraft())) return;
+    qrImage = "";
     page = "server"; serverTab = section; selected = null; draft = null;
     if (["Devices", "DNS", "Backups", "Logs"].includes(section) && inventory?.discovery.instances.length) {
       await selectSectionInstance(inventory.discovery.instances[0].configuration.instance.id);
@@ -120,6 +126,7 @@
   async function refreshServer() {
     if (!selectedHostId) return;
     const id = selectedHostId;
+    qrImage = "";
     connection = "loading";
     const fresh = await task("Synchronizing server", () => call<RemoteInventory>("discover_remote", { hostId: id }));
     if (selectedHostId !== id) return;
@@ -149,18 +156,38 @@
   }
   async function retainDraft() {
     clearTimeout(draftTimer);
-    if (!draft || !selected) return true;
-    await task("Keeping local draft", () => call<void>("save_remote_draft", { draft: { host_id: selectedHostId, base_revision: baseRevision, configuration: draft } }));
-    return !error;
+    if (!draft || !selected || !dirty) return draftWrite;
+    const retained = { host_id: selectedHostId, base_revision: baseRevision, configuration: copy(draft) };
+    draftWrite = draftWrite.then(async () => {
+      try { await call<void>("save_remote_draft", { draft: retained }); return true; }
+      catch (cause) { error = cause as AppError; return false; }
+    });
+    return draftWrite;
   }
   async function openInstance(manifest: Manifest) {
     if (dirty && !(await retainDraft())) return;
     if (serverTab === "Overview" || serverTab === "Hosts") serverTab = "Instances";
+    qrImage = "";
     selected = manifest; draft = copy(manifest.configuration); baseRevision = manifest.revision;
     plan = null; health = null; backups = []; restorePreview = null;
     tab = serverTab === "Devices" ? "Peers / Devices" : serverTab === "DNS" ? "DNS and Routing" : ["Backups", "Logs"].includes(serverTab) ? "Deployment" : "Overview";
     availability = []; history = []; runtimeHistory = [];
-    const local = await task("Loading local draft", () => call<RemoteDraft | null>("load_remote_draft", { hostId: selectedHostId, instanceId: manifest.configuration.instance.id }));
+    let local = await task("Loading local draft", () => call<RemoteDraft | null>("load_remote_draft", { hostId: selectedHostId, instanceId: manifest.configuration.instance.id }));
+    if (local && online) {
+      let obsoleteCopy = JSON.stringify(local.configuration) === JSON.stringify(manifest.configuration);
+      if (!obsoleteCopy && local.base_revision !== manifest.revision) {
+        const previous = await task("Checking retained draft", () => call<Manifest[]>("remote_history", { hostId: selectedHostId, instanceId: manifest.configuration.instance.id }));
+        if (!previous) { draft = local.configuration; baseRevision = local.base_revision; return; }
+        obsoleteCopy = previous.some((item) => item.revision === local!.base_revision && JSON.stringify(item.configuration) === JSON.stringify(local!.configuration));
+      }
+      if (obsoleteCopy) {
+        clearTimeout(draftTimer);
+        if (!await draftWrite) return;
+        const discarded = await task("Clearing unchanged retained draft", async () => { await call<void>("discard_remote_draft", { hostId: selectedHostId, instanceId: manifest.configuration.instance.id }); return true; });
+        if (!discarded) return;
+        local = null;
+      }
+    }
     if (local) { draft = local.configuration; baseRevision = local.base_revision; notice = "Unsaved local edits restored. Saving requires revision validation."; }
     settingsForm = editFormFromInstance(draft!.instance);
     if (online) {
@@ -174,6 +201,8 @@
     if (dirty && !await confirm("Discard this local draft and reload the server configuration?", { title: "Reload configuration", kind: "warning" })) return;
     const fresh = await task("Reading server configuration", () => call<Manifest>("read_remote", { hostId: selectedHostId, instanceId: selected!.configuration.instance.id }));
     if (fresh) {
+      await draftWrite;
+      draftWrite = Promise.resolve(true);
       await task("Discarding local draft", () => call<void>("discard_remote_draft", { hostId: selectedHostId, instanceId: fresh.configuration.instance.id }));
       if (!error) {
         selected = null; draft = null; notice = "";
@@ -209,10 +238,49 @@
     scheduleDraft();
   }
   async function addPeer() {
-    if (!selected || dirty) return;
-    const saved = await task("Saving new peer to server", () => call<Manifest>("add_remote_peer", { hostId: selectedHostId, expectedRevision: baseRevision,
-      input: { instance_id: selected!.configuration.instance.id, display_name: peerName, user_id: null, dns_name: peerDns || null, preshared_key: true, create_dns_record: Boolean(peerDns) } }));
-    if (saved) { peerName = ""; peerDns = ""; selected = null; draft = null; await refreshServer(); await openInstance(saved); tab = "Peers / Devices"; }
+    if (!selected || dirty || busy || !online) return;
+    clearTimeout(draftTimer);
+    const hostId = selectedHostId;
+    const instanceId = selected.configuration.instance.id;
+    const saved = await task("Adding client", async () => {
+      if (!await draftWrite) throw { code: "draft_write_failed", message: "A previous draft could not be saved. Reload from Server before adding a client." };
+      return await call<Manifest>("add_remote_peer", { hostId, expectedRevision: selected!.revision,
+        input: { instance_id: instanceId, display_name: peerName, user_id: null, dns_name: peerDns || null, preshared_key: true, create_dns_record: Boolean(peerDns) } });
+    });
+    if (!saved) return;
+    peerName = ""; peerDns = "";
+    selected = saved; draft = copy(saved.configuration); baseRevision = saved.revision; plan = null;
+    clientActivationPending = { instanceId, revision: saved.revision };
+    const cleared = await task("Clearing previous client draft", async () => {
+      await call<void>("discard_remote_draft", { hostId, instanceId }); return true;
+    });
+    if (!cleared) { notice = "Client saved. Previous local draft could not be cleared; reload before continuing."; return; }
+    await activateClients();
+  }
+  async function activateClients() {
+    if (!selected || !online || dirty || busy) return;
+    const hostId = selectedHostId, instanceId = selected.configuration.instance.id, revision = selected.revision;
+    const activated = await task("Activating clients", async () => {
+      if (clientActivationPending?.instanceId === instanceId && clientActivationPending.revision !== revision) throw { code: "revision_conflict", message: "Server configuration changed after adding this client. Review the latest saved configuration in Deployment before applying it." };
+      const preview = await call<RemotePlan>("preview_remote_deployment", { hostId, instanceId, expectedRevision: revision });
+      const result = await call<{ status: string }>("apply_remote_deployment", { hostId, instanceId, expectedRevision: revision, expectedStateHash: preview.desired_state_hash, requestId: crypto.randomUUID() });
+      if (result.status !== "succeeded") throw { code: "client_activation_failed", message: "Client activation did not succeed. Inspect deployment health before retrying." };
+      return true;
+    });
+    // Discovery must not clear an activation failure or resurrect the prior draft.
+    const activationError = error;
+    selected = null; draft = null;
+    await refreshServer();
+    const current = inventory?.discovery.instances.find((item) => item.configuration.instance.id === instanceId);
+    if (current) { await openInstance(current); tab = "Peers / Devices"; }
+    if (!activated) { error = activationError; notice = "Client saved, but activation did not complete. Check operation outcome if required, then retry activation. Do not add the client again."; }
+    else { clientActivationPending = null; notice = "Client added and activated."; }
+  }
+  async function showPeerQr(peerId: string) {
+    if (!selected || !online || dirty || busy) return;
+    qrImage = "";
+    const svg = await task("Preparing private client QR code", () => call<string>("remote_peer_qr_svg", { hostId: selectedHostId, instanceId: selected!.configuration.instance.id, peerId }));
+    if (svg) qrImage = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(svg);
   }
   async function exportPeer(peerId: string) {
     if (!selected) return;
@@ -237,6 +305,7 @@
       if (!await confirm(message, { title: resetPreferences ? "Factory Reset · local data only" : "Local drop", kind: "warning" })) return false;
       clearTimeout(draftTimer);
       pendingCleanup = target;
+      await draftWrite;
       await call("cleanup_local", { ...target, confirmed: true });
       pendingCleanup = null;
       hosts = hosts.filter((item) => !target.hostIds.includes(item.id));
@@ -258,7 +327,7 @@
     }
   }
   async function archiveDangerInstance() {
-    if (busy || !online || !dangerInstance || pendingCleanup) return;
+    if (busy || !online || !supportsInstanceArchives || !dangerInstance || pendingCleanup) return;
     const hostId = selectedHostId;
     const instanceId = dangerInstance.configuration.instance.id;
     if (pendingInstanceArchive && (pendingInstanceArchive.hostId !== hostId || pendingInstanceArchive.instanceId !== instanceId)) return;
@@ -271,6 +340,10 @@
       pendingInstanceArchive = null;
       return true;
     });
+    if (error?.code === "helper_upgrade_required" && inventory) {
+      pendingInstanceArchive = null;
+      inventory = { ...inventory, identity: { ...inventory.identity, capabilities: [] } };
+    }
     if (completed) { notice = "Instance archived on server. History and recovery data are retained."; await refreshServer(); }
   }
   async function revokeDangerPeer() {
@@ -294,13 +367,13 @@
     dnsName = ""; dnsValue = ""; void retainDraft();
   }
   async function previewDeployment() {
-    if (!selected) return;
-    const result = await task("Previewing saved revision", () => call<RemotePlan>("preview_remote_deployment", { hostId: selectedHostId, instanceId: selected!.configuration.instance.id, expectedRevision: baseRevision }));
+    if (!selected || dirty || busy || !online) return;
+    const result = await task("Previewing saved revision", () => call<RemotePlan>("preview_remote_deployment", { hostId: selectedHostId, instanceId: selected!.configuration.instance.id, expectedRevision: selected!.revision }));
     if (result) plan = result;
   }
   async function deploy() {
-    if (!selected || !plan || !await confirm("Deploy saved revision " + baseRevision + " on " + host?.display_name + "?", { title: "Apply deployment", kind: "warning" })) return;
-    await task("Deploying saved revision", () => call("apply_remote_deployment", { hostId: selectedHostId, instanceId: selected!.configuration.instance.id, expectedRevision: baseRevision, expectedStateHash: plan!.desired_state_hash, requestId: crypto.randomUUID() }));
+    if (!selected || dirty || busy || !plan || !await confirm("Deploy saved revision " + selected.revision + " on " + host?.display_name + "?", { title: "Apply deployment", kind: "warning" })) return;
+    await task("Deploying saved revision", () => call("apply_remote_deployment", { hostId: selectedHostId, instanceId: selected!.configuration.instance.id, expectedRevision: selected!.revision, expectedStateHash: plan!.desired_state_hash, requestId: crypto.randomUUID() }));
     plan = null; if (!error) { notice = "Deployment completed and health verified."; await refreshServer(); }
   }
   async function loadHistory() {
@@ -335,7 +408,7 @@
     if (result) restorePreview = result;
   }
   async function restoreArchivedInstance(archived: Manifest) {
-    if (!online || busy || dirty || pendingCleanup) return;
+    if (!online || !supportsInstanceArchives || busy || dirty || pendingCleanup) return;
     const instanceId = archived.configuration.instance.id;
     if (pendingArchiveRestore && (pendingArchiveRestore.hostId !== selectedHostId || pendingArchiveRestore.instanceId !== instanceId)) return;
     const pendingId = inventory?.discovery.deployments[instanceId]?.pending_operation;
@@ -348,6 +421,10 @@
       pendingArchiveRestore = request;
       return await call<Manifest>("restore_archived_instance", { ...request, confirmed: true });
     });
+    if (error?.code === "helper_upgrade_required" && inventory) {
+      pendingArchiveRestore = null;
+      inventory = { ...inventory, identity: { ...inventory.identity, capabilities: [] } };
+    }
     if (restored) {
       pendingArchiveRestore = null;
       selected = null; draft = null;
@@ -447,7 +524,8 @@
             <p>{host.display_name} · {online ? "Live connection" : "Remote actions require a live connection."}</p>
             <button class="secondary" disabled={Boolean(busy) || Boolean(pendingCleanup)} onclick={refreshServer}>Refresh / Reconnect</button>
             {#if inventory?.discovery.instances.length}<label>Managed instance<select value={dangerInstance?.configuration.instance.id ?? ""} disabled={Boolean(busy) || Boolean(pendingCleanup)} onchange={(event) => { dangerInstanceId = event.currentTarget.value; dangerPeerId = ""; }}>{#each inventory.discovery.instances as item}<option value={item.configuration.instance.id}>{item.configuration.instance.display_name}</option>{/each}</select></label>{:else}<p>{online ? "No managed instances available." : "Connect to load the server inventory."}</p>{/if}
-            <div class="danger-row"><div><h3>Archive instance on server</h3><p>Stop the selected VPN instance and disconnect its users. Saved history and server recovery data are retained. This does not permanently erase the instance.</p></div><button class="danger-action" disabled={!online || !dangerInstance || Boolean(busy) || Boolean(pendingCleanup) || (Boolean(pendingInstanceArchive) && (pendingInstanceArchive?.hostId !== selectedHostId || pendingInstanceArchive?.instanceId !== dangerInstance?.configuration.instance.id))} onclick={archiveDangerInstance}>Archive instance on server</button></div>
+            {#if online && !supportsInstanceArchives}<div class="alert" role="status">Server helper update required. Archiving is unavailable until the VPNCTL helper on this server is updated. Then Refresh / Reconnect. The instance remains active unless archival succeeds.</div>{/if}
+            <div class="danger-row"><div><h3>Archive instance on server</h3><p>Stop the selected VPN instance and disconnect its users. Saved history and server recovery data are retained. This does not permanently erase the instance.</p></div><button class="danger-action" disabled={!online || !supportsInstanceArchives || !dangerInstance || Boolean(busy) || Boolean(pendingCleanup) || (Boolean(pendingInstanceArchive) && (pendingInstanceArchive?.hostId !== selectedHostId || pendingInstanceArchive?.instanceId !== dangerInstance?.configuration.instance.id))} onclick={archiveDangerInstance}>Archive instance on server</button></div>
             {#if dangerPeers.length}<label>Device certificate<select value={dangerPeer?.id ?? ""} disabled={Boolean(busy) || Boolean(pendingCleanup)} onchange={(event) => dangerPeerId = event.currentTarget.value}>{#each dangerPeers as peer}<option value={peer.id}>{peer.display_name}</option>{/each}</select></label><div class="danger-row"><div><h3>Revoke device certificate</h3><p>Revocation cannot be reversed. Deploy the instance afterward to apply it. Local client keys are preserved.</p></div><button class="danger-action" disabled={!online || !dangerPeer || Boolean(busy) || Boolean(pendingCleanup)} onclick={revokeDangerPeer}>Revoke device certificate</button></div>{/if}
           {/if}
         </section>
@@ -484,7 +562,7 @@
       {#if ["Devices", "DNS", "Backups", "Logs"].includes(serverTab) && inventory?.discovery.instances.length}<section class="card section-selector"><label for="section-instance">Instance</label><select id="section-instance" value={selected?.configuration.instance.id ?? ""} onchange={(event) => selectSectionInstance(event.currentTarget.value)}>{#each inventory.discovery.instances as item}<option value={item.configuration.instance.id}>{item.configuration.instance.display_name}</option>{/each}</select><span>{host.display_name} · {inventory.cached ? "cached" : connection}</span></section>{/if}
       {#if serverTab === "Backups"}
         <section class="card archived-backups"><header><div><h2>Archived instances</h2><p>Restore saved configuration and retained runtime identities. Restored instances stay stopped until you start or deploy them.</p></div><button class="secondary" disabled={Boolean(busy)} onclick={refreshServer}>Refresh archives</button></header>
-          {#if archivedInstances.length}<div class="table-wrap"><table><thead><tr><th>Instance</th><th>Archived</th><th>Saved state</th><th>Action</th></tr></thead><tbody>{#each archivedInstances as archived}<tr><td>{archived.configuration.instance.display_name}<small>{nameOf(archived.configuration.instance.backend)}</small></td><td>{new Date(archived.saved_at).toLocaleString()}</td><td>Archived revision {archived.revision}</td><td><button class="secondary" disabled={!online || dirty || Boolean(busy) || Boolean(pendingCleanup) || (Boolean(pendingArchiveRestore) && pendingArchiveRestore?.instanceId !== archived.configuration.instance.id)} onclick={() => restoreArchivedInstance(archived)}>{pendingArchiveRestore?.instanceId === archived.configuration.instance.id ? "Retry archived instance restore" : "Restore archived instance"}</button></td></tr>{/each}</tbody></table></div>{:else}<div class="inventory-empty"><h3>{inventory ? "No archived instances" : "Archive inventory unavailable"}</h3><p>{inventory ? "Instances archived on this server will appear here." : "Connect to the server to read its archived instances."}</p></div>{/if}
+          {#if archivedInstances.length}<div class="table-wrap"><table><thead><tr><th>Instance</th><th>Archived</th><th>Saved state</th><th>Action</th></tr></thead><tbody>{#each archivedInstances as archived}<tr><td>{archived.configuration.instance.display_name}<small>{nameOf(archived.configuration.instance.backend)}</small></td><td>{new Date(archived.saved_at).toLocaleString()}</td><td>Archived revision {archived.revision}</td><td><button class="secondary" disabled={!online || !supportsInstanceArchives || dirty || Boolean(busy) || Boolean(pendingCleanup) || (Boolean(pendingArchiveRestore) && pendingArchiveRestore?.instanceId !== archived.configuration.instance.id)} onclick={() => restoreArchivedInstance(archived)}>{pendingArchiveRestore?.instanceId === archived.configuration.instance.id ? "Retry archived instance restore" : "Restore archived instance"}</button></td></tr>{/each}</tbody></table></div>{:else}<div class="inventory-empty"><h3>{online && !supportsInstanceArchives ? "Server helper update required" : inventory ? "No archived instances" : "Archive inventory unavailable"}</h3><p>{online && !supportsInstanceArchives ? "Update the VPNCTL helper on this server, then Refresh / Reconnect to list and restore archived instances." : inventory ? "Instances archived on this server will appear here." : "Connect to the server to read its archived instances."}</p></div>{/if}
         </section>
       {/if}
       {#if selected && draft}
@@ -498,14 +576,16 @@
           {#if baseRevision !== selected.revision}<div class="alert">This draft is based on an older revision. Reload or reconcile your edits before saving.</div>{/if}
           {#if observation?.deployed_revision !== selected.revision}<div class="notice status-pending" role="status">Pending deployment · saved desired state differs from the deployed revision.</div>{/if}
           {#if observation?.pending_operation}<div class="alert" role="alert">An interrupted runtime operation requires reconciliation before another mutation. <button class="secondary" disabled={!online || Boolean(busy)} onclick={reconcileRuntime}>Check operation outcome</button></div>{/if}
-          {#if serverTab === "Instances"}<div class="tabs instance-tabs" role="tablist" aria-label="Instance sections">{#each tabs as item}<button role="tab" aria-label={item} aria-selected={tab === item} class:active={tab === item} onclick={() => tab = item}>{item === "Peers / Devices" ? "Devices" : item === "DNS and Routing" ? "DNS" : item === "Deployment" ? "Deploy" : item}</button>{/each}</div>{/if}
-          <div class="instance-content">
+          {#if serverTab === "Instances"}<div class="tabs instance-tabs" role="tablist" aria-label="Instance sections">{#each tabs as item}<button role="tab" disabled={Boolean(busy)} aria-label={item} aria-selected={tab === item} class:active={tab === item} onclick={() => { qrImage = ""; tab = item; }}>{item === "Peers / Devices" ? "Devices" : item === "DNS and Routing" ? "DNS" : item === "Deployment" ? "Deploy" : item}</button>{/each}</div>{/if}
+          <fieldset class="instance-content" disabled={Boolean(busy)} aria-label="Instance controls">
           {#if tab === "Overview"}<h3>Remote configuration</h3><dl class="overview-facts"><div><dt>Owning server</dt><dd>{host.display_name}</dd></div><div><dt>Endpoint</dt><dd>{draft.instance.endpoint.host}:{draft.instance.endpoint.port}</dd></div><div><dt>Peers / devices</dt><dd>{draft.peers.length}</dd></div><div><dt>Network</dt><dd>{draft.instance.network.ipv4_subnet}</dd></div><div><dt>Last saved</dt><dd>{new Date(selected.saved_at).toLocaleString()}</dd></div></dl>
           {:else if tab === "Peers / Devices"}
             <div class="table-wrap">
-            <table><thead><tr><th>Name</th><th>Address</th><th>State</th><th>Local export</th><th>Action</th></tr></thead><tbody>{#each draft.peers as peer}<tr><td><input aria-label={"Peer name " + peer.display_name} bind:value={peer.display_name} /></td><td>{peer.ipv4_address}</td><td>{#if draft.instance.backend === "openvpn" || draft.instance.backend === "ikev2"}{peer.enabled ? "Active" : "Revoked"}{:else}<input aria-label={"Enable " + peer.display_name} type="checkbox" bind:checked={peer.enabled} />{/if}</td><td><button class="secondary" disabled={!online || dirty || !availability.find((item) => item.peer_id === peer.id)?.complete_export_available} onclick={() => exportPeer(peer.id)}>Export configuration</button>{#if !availability.find((item) => item.peer_id === peer.id)?.complete_export_available}<p>Private material unavailable on this client</p>{/if}</td><td>{#if (draft.instance.backend === "openvpn" || draft.instance.backend === "ikev2") && peer.enabled}<button class="secondary" disabled={Boolean(busy)} onclick={() => openDangerZone(draft!.instance.id, peer.id)}>Revoke in Danger Zone</button>{/if}</td></tr>{/each}</tbody></table>
+            <table><thead><tr><th>Name</th><th>Address</th><th>State</th><th>Local export</th><th>Action</th></tr></thead><tbody>{#each draft.peers as peer}<tr><td><input aria-label={"Peer name " + peer.display_name} bind:value={peer.display_name} /></td><td>{peer.ipv4_address}</td><td>{#if draft.instance.backend === "openvpn" || draft.instance.backend === "ikev2"}{peer.enabled ? "Active" : "Revoked"}{:else}<input aria-label={"Enable " + peer.display_name} type="checkbox" bind:checked={peer.enabled} />{/if}</td><td><button class="secondary" disabled={!online || dirty || !availability.find((item) => item.peer_id === peer.id)?.complete_export_available} onclick={() => exportPeer(peer.id)}>Export configuration</button>{#if ["wireguard", "amnezia_wg"].includes(draft.instance.backend)}<button class="secondary" disabled={!online || dirty || Boolean(busy) || !availability.find((item) => item.peer_id === peer.id)?.complete_export_available} onclick={() => showPeerQr(peer.id)}>Show QR code</button>{/if}{#if !availability.find((item) => item.peer_id === peer.id)?.complete_export_available}<p>Private material unavailable on this client</p>{/if}</td><td>{#if (draft.instance.backend === "openvpn" || draft.instance.backend === "ikev2") && peer.enabled}<button class="secondary" disabled={Boolean(busy)} onclick={() => openDangerZone(draft!.instance.id, peer.id)}>Revoke in Danger Zone</button>{/if}</td></tr>{/each}</tbody></table>
             </div>
-            <form class="remote-form" onsubmit={(event) => { event.preventDefault(); void addPeer(); }}><h3>Add peer / device</h3><label>Peer name<input required bind:value={peerName} /></label><label>DNS name (optional)<input bind:value={peerDns} /></label><p>Save or discard existing edits before creating a peer.</p>{#if !certificateAuthorityReady}<p>Deploy this instance once to establish its certificate authority before enrolling peers.</p>{/if}<button class="primary" disabled={!online || dirty || !certificateAuthorityReady || Boolean(busy)}>Create Peer on Server</button></form>
+            {#if qrImage}<section aria-label="Client configuration QR code"><h3>Scan client configuration</h3><p>This QR code contains private VPN credentials. Keep it private.</p><img src={qrImage} alt="Private VPN client configuration QR code" width="384" height="384" /><button class="secondary" onclick={() => qrImage = ""}>Close QR code</button></section>{/if}
+            {#if clientActivationPending?.instanceId === draft.instance.id}<button class="secondary" disabled={!online || dirty || Boolean(busy) || Boolean(observation?.pending_operation)} onclick={activateClients}>Retry client activation</button>{/if}
+            <form class="remote-form" onsubmit={(event) => { event.preventDefault(); void addPeer(); }}><h3>Add peer / device</h3><label>Peer name<input required bind:value={peerName} /></label><label>DNS name (optional)<input bind:value={peerDns} /></label><p>Adding a client saves and activates it automatically.</p>{#if dirty}<p>Save or discard existing edits before creating a peer.</p>{/if}{#if !certificateAuthorityReady}<p>Deploy this instance once to establish its certificate authority before enrolling peers.</p>{/if}<button class="primary" disabled={!online || dirty || !certificateAuthorityReady || Boolean(busy)}>Create Peer on Server</button></form>
           {:else if tab === "DNS and Routing"}
             <label>Routing<select bind:value={draft.instance.routing_mode}><option value="split_tunnel">Split tunnel</option><option value="full_tunnel">Full tunnel</option></select></label>
             <div class="table-wrap">
@@ -525,7 +605,7 @@
             {:else}
             <div class="header-actions"><button class="primary" disabled={!online || dirty || Boolean(busy)} onclick={previewDeployment}>Preview / Deploy</button><button class="secondary" disabled={!online || Boolean(busy)} onclick={async () => { const result = await task("Checking deployment health", () => call<InstanceHealth>("inspect_remote_health", { hostId: selectedHostId, instanceId: selected!.configuration.instance.id })); if (result) health = result; }}>Check health</button><button class="secondary" disabled={!online || Boolean(busy)} onclick={async () => { await task("Creating runtime backup", () => call("backup_remote_deployment", { hostId: selectedHostId, instanceId: selected!.configuration.instance.id, expectedRevision: baseRevision })); if (!error) notice = "Runtime backup created on server."; }}>Create runtime backup</button><button class="secondary" disabled={!online || Boolean(busy)} onclick={loadHistory}>View configuration history</button><button class="secondary" disabled={!online || Boolean(busy)} onclick={loadRuntimeHistory}>View deployment history</button><button class="secondary" disabled={!online || Boolean(busy)} onclick={loadBackups}>View runtime backups</button></div>
             {#if dirty}<p>Save local edits to the server before previewing deployment.</p>{/if}
-            {#if plan}<h3>Deployment preview for saved revision {baseRevision}</h3>{#each plan.warnings as warning}<p class="danger">{warning}</p>{/each}<ul>{#each plan.operations as operation}<li>{operation.operation.replaceAll("_", " ")} {operation.path ?? operation.service ?? ""}</li>{/each}</ul><button class="primary" disabled={Boolean(busy)} onclick={deploy}>Apply saved revision {baseRevision}</button>{/if}
+            {#if plan}<h3>Deployment preview for saved revision {selected.revision}</h3>{#each plan.warnings as warning}<p class="danger">{warning}</p>{/each}<ul>{#each plan.operations as operation}<li>{operation.operation.replaceAll("_", " ")} {operation.path ?? operation.service ?? ""}</li>{/each}</ul><button class="primary" disabled={!online || dirty || Boolean(busy)} onclick={deploy}>Apply saved revision {selected.revision}</button>{/if}
             {#if health}<h3>Deployment health</h3><dl><dt>Gateway</dt><dd>{health.gateway_running ? "Running" : "Stopped / unavailable"}</dd><dt>Backend</dt><dd>{health.backend_ready ? "Ready" : "Needs attention"}</dd><dt>Listeners</dt><dd>{health.listeners_ready ? "Ready" : "Needs attention"}</dd><dt>Deployed peer state</dt><dd>{health.client_state_matches ? "Matches" : "Needs attention"}</dd>{#if health.dns_required}<dt>Private DNS</dt><dd>{health.private_dns_resolves ? "Resolving" : "Needs attention"}</dd><dt>Public DNS</dt><dd>{health.public_dns_resolves ? "Resolving securely" : "Needs attention"}</dd>{/if}</dl>{#if health.details.length}<details><summary>Health details</summary><ul>{#each health.details as detail}<li>{detail}</li>{/each}</ul></details>{/if}{/if}
             {#each backups as backup}<div class="history-row"><span>{backup.name} · {new Date(backup.created_at).toLocaleString()}</span><button class="secondary" disabled={!online || dirty || Boolean(busy)} onclick={() => previewRestore(backup.name)}>Preview deployment restore</button></div>{/each}
             {#if restorePreview}<section class="alert"><div><h3>Restore deployed revision {restorePreview.deployed_revision ?? "unknown"}</h3><p>{restorePreview.identity_impact}</p><p>Saved desired revision {restorePreview.desired_revision} will remain unchanged.</p><button class="primary" disabled={!online || dirty || Boolean(busy)} onclick={restoreDeployment}>Restore Deployment</button></div></section>{/if}
@@ -533,7 +613,7 @@
             {#each runtimeHistory as event}<div class="history-row"><span>{event.operation.replaceAll("_", " ")} · desired revision {event.desired_revision} · {event.succeeded ? "Succeeded" : "Failed"}{event.requires_recovery ? " · Recovery required" : ""}{event.deployed_revision == null ? "" : " · deployed revision " + event.deployed_revision}</span></div>{/each}
             {/if}
           {/if}
-          </div>
+          </fieldset>
         </section>
         </div></div>
       {:else if serverTab === "Backups"}

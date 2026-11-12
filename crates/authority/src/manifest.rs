@@ -26,6 +26,7 @@ use zeroize::Zeroizing;
 use crate::{AuthorityError, SecretValue};
 
 pub const PROTOCOL_VERSION: u32 = 2;
+pub const INSTANCE_ARCHIVE_CAPABILITY: &str = "instance_archives_v1";
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -473,6 +474,8 @@ pub enum Reply {
         appliance_id: Uuid,
         machine_fingerprint: String,
         software_version: String,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     Discovery(Discovery),
     Manifest(Box<Manifest>),

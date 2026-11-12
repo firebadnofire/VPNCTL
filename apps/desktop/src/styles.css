@@ -528,7 +528,7 @@ input:focus, select:focus { border-color: #2f80ed; box-shadow: 0 0 0 3px #2f80ed
 .instance-workspace > .notice, .instance-workspace > .alert { margin: 12px 23px; }
 .instance-workspace > .notice.status-pending { background: #fff5df; border-color: #f2dcb0; color: #8f6217; }
 .instance-workspace > .notice.status-unsaved { background: #e9f2ff; border-color: #c9dcfa; color: #2464a9; }
-.instance-content { padding: 23px; min-width: 0; }
+.instance-content { border: 0; margin: 0; padding: 23px; min-width: 0; }
 .instance-content > h3 { font-size: 17px; letter-spacing: -.03em; margin: 0 0 17px; }
 .overview-facts { display: grid !important; grid-template-columns: repeat(2, minmax(0, 1fr)) !important; gap: 0 18px; margin: 0; }
 .overview-facts > div { display: grid; gap: 7px; min-width: 0; padding: 16px 0; border-bottom: 1px solid #e8eef4; }

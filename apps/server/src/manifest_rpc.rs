@@ -68,6 +68,7 @@ impl ServerRuntime {
                 appliance_id,
                 machine_fingerprint,
                 software_version: env!("CARGO_PKG_VERSION").into(),
+                capabilities: vec![vam_authority::manifest::INSTANCE_ARCHIVE_CAPABILITY.into()],
             });
         }
         let store = ManifestStore::open(&self.paths.control_dir(), appliance_id)?;
