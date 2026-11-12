@@ -133,6 +133,16 @@ pub enum ServerCommand {
         #[arg(long)]
         confirm: bool,
     },
+    /// Restore an archived instance and its runtime files, without starting it.
+    RestoreArchived {
+        instance_id: Uuid,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        request_id: Uuid,
+        #[arg(long)]
+        confirm: bool,
+    },
     Reconcile {
         instance_id: Uuid,
         mutation_id: Uuid,
@@ -357,6 +367,22 @@ pub async fn run(
         } => print_json(
             &service
                 .restore_remote_desired(host_id, instance_id, revision, expected_revision, confirm)
+                .await?,
+        )?,
+        ServerCommand::RestoreArchived {
+            instance_id,
+            expected_revision,
+            request_id,
+            confirm,
+        } => print_json(
+            &service
+                .restore_archived_instance(
+                    host_id,
+                    instance_id,
+                    expected_revision,
+                    request_id,
+                    confirm,
+                )
                 .await?,
         )?,
         ServerCommand::Reconcile {

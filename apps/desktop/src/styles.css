@@ -336,6 +336,11 @@ input:focus, select:focus { border-color: #2f80ed; box-shadow: 0 0 0 3px #2f80ed
 .sidebar nav button.danger-nav { color: #ffb7bc; }
 .sidebar nav button.danger-nav.active { background: #563745; box-shadow: inset 3px 0 #ff818e; }
 .danger-zone { display: grid; gap: 20px; }
+.archived-backups { margin-bottom: 24px; }
+.archived-backups header { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding: 24px; }
+.archived-backups h2 { margin: 0 0 8px; }
+.archived-backups header p { margin: 0; max-width: 70ch; line-height: 1.6; }
+.archived-backups td small { display: block; margin-top: 5px; }
 .danger-zone .card { padding: 25px; }
 .danger-zone .danger-preservation { border-color: #efc7cc; background: #fff9fa; }
 .danger-zone h2, .danger-zone h3 { margin: 0 0 10px; }

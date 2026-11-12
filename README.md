@@ -37,6 +37,9 @@ removal, local Factory Reset, instance archiving, and certificate revocation.
 4. Keep unsaved edits as a local draft. **Save to Server** advances desired revision only.
 5. **Preview / Deploy** binds the saved revision and observed deployed state. Deployment stages, validates, backs up, activates, and checks health through the helper.
 6. Restore a deployment from a remote backup without rewinding saved desired history. **Restore Desired Configuration** creates a new desired revision and requires a separate deployment.
+7. Archived instances remain in **Backups → Archived instances**. Restore brings
+   back their saved configuration and runtime identities without starting them;
+   choose Start or Preview / Deploy afterward. Archive snapshots are retained.
 
 Remote runtime trees are under `/opt/vpn-appliance-manager/instances/<uuid>`. The control directory is outside activation and rollback. Disaster recovery bundles include the control store, active runtime trees, and retained deployment backups. Certificate and server-key restoration is checked against newer saved configuration before it runs.
 

@@ -16,7 +16,7 @@ export interface Manifest {
 export interface RemoteInventory {
   host_id: string; identity: { appliance_id: string; machine_fingerprint: string; ssh_public_key: string };
   synchronized_at: string; cached: boolean;
-  discovery: { instances: Manifest[]; errors: Record<string, string>; deployments: Record<string, { deployed_revision: number | null; pending_operation: string | null }> };
+  discovery: { instances: Manifest[]; archived_instances?: Manifest[]; errors: Record<string, string>; deployments: Record<string, { deployed_revision: number | null; pending_operation: string | null }> };
 }
 export interface RemoteDraft { host_id: string; base_revision: number; configuration: Configuration }
 export interface PeerAvailability { peer_id: string; complete_export_available: boolean; reason: string | null }

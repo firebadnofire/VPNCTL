@@ -400,14 +400,17 @@ describe("remote-authoritative desktop workflows", () => {
     expect(invoke.mock.calls.some(([command]) => command === "cleanup_local")).toBe(false);
     expect(screen.getByLabelText("Danger Zone host")).toBeTruthy();
   });
-  it("archives only the chosen instance using a freshly read revision", async () => {
+  it("archives the chosen instance and restores it from Backups with its snapshot retained", async () => {
     const original = manifest();
     const fresh = { ...original, revision: 9 };
     current = inventory([original]);
     const base = invoke.getMockImplementation()!;
     invoke.mockImplementation((command: string, args: unknown) => {
       if (command === "read_remote") return fresh;
-      if (command === "remove_remote_configuration") { current = inventory(); return { ...fresh, removed: true }; }
+      if (command === "remove_remote_configuration") { current = inventory(); const archived = { ...fresh, revision: 10, removed: true }; current.discovery.archived_instances = [archived]; return archived; }
+      if (command === "restore_archived_instance") { const restored = { ...fresh, revision: 11 }; current = inventory([restored]); current.discovery.deployments[original.configuration.instance.id] = { deployed_revision: 9, pending_operation: null }; return restored; }
+      if (command === "set_remote_running") return { gateway_running: true, backend_ready: true, details: [] };
+      if (command === "list_remote_backups") return [{ name: "archive-retained-snapshot", created_at: original.saved_at }];
       return base(command, args);
     });
     render(App);
@@ -418,6 +421,58 @@ describe("remote-authoritative desktop workflows", () => {
     expect(invoke).toHaveBeenCalledWith("remove_remote_configuration", { input: { host_id: host.id, expected_revision: 9, request_id: expect.any(String), configuration: fresh.configuration }, confirmed: true });
     expect(confirm).toHaveBeenCalledWith(expect.stringContaining("Connected VPN users will lose service"), expect.anything());
     await screen.findByText("No managed instances available.");
+    await fireEvent.click(screen.getByRole("button", { name: "Backups" }));
+    await screen.findByRole("heading", { name: "Archived instances" });
+    await fireEvent.click(screen.getByRole("button", { name: "Restore archived instance" }));
+    await screen.findByText("Archived instance restored. It remains stopped until you start or deploy it. The recovery snapshot is retained.");
+    await screen.findByText("archive-retained-snapshot");
+    expect(invoke).toHaveBeenCalledWith("restore_archived_instance", { hostId: host.id, instanceId: original.configuration.instance.id, expectedRevision: 10, requestId: expect.any(String), confirmed: true });
+    expect(invoke.mock.calls.some(([command]) => ["apply_remote_deployment", "set_remote_running"].includes(command))).toBe(false);
+    await fireEvent.click(screen.getByRole("button", { name: "Start instance" }));
+    await screen.findByText("Instance started using its restored deployed state. Preview / Deploy to apply newer saved configuration.");
+    expect(invoke).toHaveBeenCalledWith("set_remote_running", { hostId: host.id, instanceId: original.configuration.instance.id, expectedRevision: 11, running: true });
+  });
+  it("retains failed archive restores and retries the server's pending operation ID", async () => {
+    const archived = { ...manifest(), removed: true, revision: 5 };
+    current = inventory(); current.discovery.archived_instances = [archived];
+    current.discovery.deployments[archived.configuration.instance.id] = { deployed_revision: 4, pending_operation: "persisted-restore-request" };
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "restore_archived_instance" ? Promise.reject({ code: "archive_restore_failed", message: "Runtime archive unavailable" }) : base(command, args));
+    render(App);
+    await screen.findByText("No VPN instances configured on this server.");
+    await fireEvent.click(screen.getByRole("button", { name: "Backups" }));
+    await screen.findByRole("button", { name: "Restore archived instance" });
+    await fireEvent.click(screen.getByRole("button", { name: "Restore archived instance" }));
+    await screen.findByText("Runtime archive unavailable");
+    expect(screen.getByText("Archived revision 5")).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Retry archived instance restore" }));
+    await waitFor(() => expect(invoke.mock.calls.filter(([command]) => command === "restore_archived_instance")).toHaveLength(2));
+    const calls = invoke.mock.calls.filter(([command]) => command === "restore_archived_instance");
+    expect(calls[0][1]).toEqual(expect.objectContaining({ requestId: "persisted-restore-request" }));
+    expect(calls[1][1]).toEqual(calls[0][1]);
+  });
+  it("keeps archived backups visible offline and prevents restoration", async () => {
+    current = { ...inventory(), cached: true }; current.discovery.archived_instances = [{ ...manifest(), removed: true }];
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "discover_remote") return Promise.reject({ code: "offline", message: "Server unreachable" });
+      return command === "cached_remote_inventory" ? current : base(command, args);
+    });
+    render(App);
+    await screen.findByText(/Offline · showing cached information/);
+    await fireEvent.click(screen.getByRole("button", { name: "Backups" }));
+    await screen.findByText("Archived revision 4");
+    expect((screen.getByRole("button", { name: "Restore archived instance" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+  it("does not restore an archived instance after cancelling confirmation", async () => {
+    current = inventory(); current.discovery.archived_instances = [{ ...manifest(), removed: true }];
+    confirm.mockResolvedValue(false);
+    render(App);
+    await screen.findByText("No VPN instances configured on this server.");
+    await fireEvent.click(screen.getByRole("button", { name: "Backups" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Restore archived instance" }));
+    await waitFor(() => expect(confirm).toHaveBeenCalledOnce());
+    expect(invoke.mock.calls.some(([command]) => command === "restore_archived_instance")).toBe(false);
   });
   it("does not archive an instance when its confirmation is cancelled", async () => {
     current = inventory([manifest()]);
@@ -430,6 +485,28 @@ describe("remote-authoritative desktop workflows", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Archive instance on server" }));
     await waitFor(() => expect(confirm).toHaveBeenCalledOnce());
     expect(invoke.mock.calls.some(([command]) => command === "remove_remote_configuration")).toBe(false);
+  });
+  it("retries a lost archival response with the same revision and request ID", async () => {
+    current = inventory([manifest()]);
+    const base = invoke.getMockImplementation()!;
+    let calls = 0;
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "read_remote") return manifest();
+      if (command === "remove_remote_configuration") {
+        calls += 1;
+        if (calls === 1) return Promise.reject({ code: "remote_exchange_failed", message: "Archive response lost" });
+        current = inventory(); return { ...manifest(), removed: true };
+      }
+      return base(command, args);
+    });
+    render(App);
+    await screen.findByText("Remote WG"); await enterDangerZone();
+    await fireEvent.click(screen.getByRole("button", { name: "Archive instance on server" }));
+    await screen.findByText("Archive response lost");
+    await fireEvent.click(screen.getByRole("button", { name: "Archive instance on server" }));
+    await screen.findByText("Instance archived on server. History and recovery data are retained.");
+    const attempts = invoke.mock.calls.filter(([command]) => command === "remove_remote_configuration");
+    expect(attempts[1][1]).toEqual(attempts[0][1]);
   });
   it("revokes a selected certificate in Danger Zone without removing its local keys", async () => {
     const vpn = manifest();

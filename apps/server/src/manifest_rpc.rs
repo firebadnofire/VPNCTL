@@ -98,6 +98,10 @@ impl ServerRuntime {
             Operation::Remove {
                 request: save,
                 confirmed,
+            }
+            | Operation::ArchiveInstance {
+                request: save,
+                confirmed,
             } => {
                 if save.request_id != request.request_id || save.appliance_id != appliance_id {
                     return Err(AuthorityError::InvalidState(
@@ -106,6 +110,18 @@ impl ServerRuntime {
                 }
                 crate::runtime::remove_instance(&store, &save, confirmed).await
             }
+            Operation::RestoreArchivedInstance {
+                instance_id,
+                expected_revision,
+                confirmed,
+            } => crate::archive::restore(
+                &store,
+                std::path::Path::new("/opt/vpn-appliance-manager"),
+                instance_id,
+                expected_revision,
+                request.request_id,
+                confirmed,
+            ),
             Operation::History { instance_id } => Ok(Reply::History(store.history(instance_id)?)),
             Operation::RuntimeHistory { instance_id } => {
                 crate::runtime::history(&store, instance_id)

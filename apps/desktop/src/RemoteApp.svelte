@@ -56,6 +56,8 @@
   let dangerInstanceId = "";
   let dangerPeerId = "";
   let pendingCleanup: { operationId: string; hostIds: string[]; resetPreferences: boolean } | null = null;
+  let pendingArchiveRestore: { hostId: string; instanceId: string; expectedRevision: number; requestId: string } | null = null;
+  let pendingInstanceArchive: { hostId: string; instanceId: string; input: { host_id: string; expected_revision: number; request_id: string; configuration: Configuration } } | null = null;
   onDestroy(() => clearTimeout(draftTimer));
   function scheduleDraft() { clearTimeout(draftTimer); draftTimer = setTimeout(() => { void retainDraft(); }, 300); }
   $: host = hosts.find((item) => item.id === selectedHostId);
@@ -75,6 +77,7 @@
   $: dangerInstance = inventory?.discovery.instances.find((item) => item.configuration.instance.id === dangerInstanceId) ?? inventory?.discovery.instances[0] ?? null;
   $: dangerPeers = dangerInstance && ["openvpn", "ikev2"].includes(dangerInstance.configuration.instance.backend) ? dangerInstance.configuration.peers.filter((peer) => peer.enabled) : [];
   $: dangerPeer = dangerPeers.find((peer) => peer.id === dangerPeerId) ?? dangerPeers[0] ?? null;
+  $: archivedInstances = inventory?.discovery.archived_instances ?? [];
   const copy = <T,>(value: T): T => JSON.parse(JSON.stringify(value));
   const nameOf = (kind: VpnBackendKind) => backends.find((backend) => backend.kind === kind)?.name ?? "Unsupported backend";
 
@@ -123,6 +126,7 @@
     if (fresh) {
       const hadEdits = dirty;
       inventory = fresh; connection = "connected";
+      if (pendingInstanceArchive && fresh.discovery.archived_instances?.some((item) => item.request_id === pendingInstanceArchive?.input.request_id)) pendingInstanceArchive = null;
       if (selected) {
         const current = fresh.discovery.instances.find((item) => item.configuration.instance.id === selected?.configuration.instance.id);
         if (current) {
@@ -257,10 +261,14 @@
     if (busy || !online || !dangerInstance || pendingCleanup) return;
     const hostId = selectedHostId;
     const instanceId = dangerInstance.configuration.instance.id;
+    if (pendingInstanceArchive && (pendingInstanceArchive.hostId !== hostId || pendingInstanceArchive.instanceId !== instanceId)) return;
     const completed = await task("Archiving instance", async () => {
-      const fresh = await call<Manifest>("read_remote", { hostId, instanceId });
-      if (!await confirm(`Stop and archive ${fresh.configuration.instance.display_name} on ${host?.display_name}? Connected VPN users will lose service. Saved history, server recovery data, and local client keys are retained. Local drafts are not applied.`, { title: "Archive instance on server", kind: "warning" })) return false;
-      await call("remove_remote_configuration", { input: { host_id: hostId, expected_revision: fresh.revision, request_id: crypto.randomUUID(), configuration: fresh.configuration }, confirmed: true });
+      const fresh = pendingInstanceArchive ? null : await call<Manifest>("read_remote", { hostId, instanceId });
+      const input = pendingInstanceArchive?.input ?? { host_id: hostId, expected_revision: fresh!.revision, request_id: crypto.randomUUID(), configuration: fresh!.configuration };
+      if (!await confirm(`Stop and archive ${input.configuration.instance.display_name} on ${host?.display_name}? Connected VPN users will lose service. Saved history, server recovery data, and local client keys are retained. Local drafts are not applied. Restore the instance from Backups.`, { title: "Archive instance on server", kind: "warning" })) return false;
+      pendingInstanceArchive = { hostId, instanceId, input };
+      await call("remove_remote_configuration", { input, confirmed: true });
+      pendingInstanceArchive = null;
       return true;
     });
     if (completed) { notice = "Instance archived on server. History and recovery data are retained."; await refreshServer(); }
@@ -325,6 +333,39 @@
     if (!selected) return;
     const result = await task("Reviewing deployment restore", () => call<RemoteRestorePreview>("preview_remote_restore", { hostId: selectedHostId, instanceId: selected!.configuration.instance.id, expectedRevision: baseRevision, backupName }));
     if (result) restorePreview = result;
+  }
+  async function restoreArchivedInstance(archived: Manifest) {
+    if (!online || busy || dirty || pendingCleanup) return;
+    const instanceId = archived.configuration.instance.id;
+    if (pendingArchiveRestore && (pendingArchiveRestore.hostId !== selectedHostId || pendingArchiveRestore.instanceId !== instanceId)) return;
+    const pendingId = inventory?.discovery.deployments[instanceId]?.pending_operation;
+    const request = pendingArchiveRestore ?? {
+      hostId: selectedHostId, instanceId, expectedRevision: archived.revision,
+      requestId: pendingId && pendingId !== archived.request_id ? pendingId : crypto.randomUUID(),
+    };
+    const restored = await task("Restoring archived instance", async () => {
+      if (!await confirm(`Restore ${archived.configuration.instance.display_name} on ${host?.display_name}? Its saved configuration and archived runtime identities will be restored. The instance stays stopped until you explicitly start or deploy it. Its recovery snapshot and local client keys are retained.`, { title: "Restore archived instance", kind: "warning" })) return null;
+      pendingArchiveRestore = request;
+      return await call<Manifest>("restore_archived_instance", { ...request, confirmed: true });
+    });
+    if (restored) {
+      pendingArchiveRestore = null;
+      selected = null; draft = null;
+      notice = "Archived instance restored. It remains stopped until you start or deploy it. The recovery snapshot is retained.";
+      await refreshServer();
+      const current = inventory?.discovery.instances.find((item) => item.configuration.instance.id === instanceId);
+      if (online && current) { await openInstance(current); await loadBackups(); }
+    }
+  }
+  async function startRestoredInstance() {
+    if (!selected || !online || dirty || busy || observation?.deployed_revision == null) return;
+    const instanceId = selected.configuration.instance.id;
+    const revision = selected.revision;
+    const result = await task("Starting instance", async () => {
+      if (!await confirm(`Start ${selected!.configuration.instance.display_name} on ${host?.display_name} using its restored deployed state? VPN users may reconnect. Preview / Deploy is still required to apply any newer saved configuration.`, { title: "Start instance", kind: "warning" })) return null;
+      return await call<InstanceHealth>("set_remote_running", { hostId: selectedHostId, instanceId, expectedRevision: revision, running: true });
+    });
+    if (result) { health = result; notice = "Instance started using its restored deployed state. Preview / Deploy to apply newer saved configuration."; }
   }
   async function restoreDeployment() {
     if (!selected || !restorePreview || !await confirm("Restore this deployment and its persistent identity state? Saved desired configuration will be preserved.", { title: "Restore deployment", kind: "warning" })) return;
@@ -406,7 +447,7 @@
             <p>{host.display_name} · {online ? "Live connection" : "Remote actions require a live connection."}</p>
             <button class="secondary" disabled={Boolean(busy) || Boolean(pendingCleanup)} onclick={refreshServer}>Refresh / Reconnect</button>
             {#if inventory?.discovery.instances.length}<label>Managed instance<select value={dangerInstance?.configuration.instance.id ?? ""} disabled={Boolean(busy) || Boolean(pendingCleanup)} onchange={(event) => { dangerInstanceId = event.currentTarget.value; dangerPeerId = ""; }}>{#each inventory.discovery.instances as item}<option value={item.configuration.instance.id}>{item.configuration.instance.display_name}</option>{/each}</select></label>{:else}<p>{online ? "No managed instances available." : "Connect to load the server inventory."}</p>{/if}
-            <div class="danger-row"><div><h3>Archive instance on server</h3><p>Stop the selected VPN instance and disconnect its users. Saved history and server recovery data are retained. This does not permanently erase the instance.</p></div><button class="danger-action" disabled={!online || !dangerInstance || Boolean(busy) || Boolean(pendingCleanup)} onclick={archiveDangerInstance}>Archive instance on server</button></div>
+            <div class="danger-row"><div><h3>Archive instance on server</h3><p>Stop the selected VPN instance and disconnect its users. Saved history and server recovery data are retained. This does not permanently erase the instance.</p></div><button class="danger-action" disabled={!online || !dangerInstance || Boolean(busy) || Boolean(pendingCleanup) || (Boolean(pendingInstanceArchive) && (pendingInstanceArchive?.hostId !== selectedHostId || pendingInstanceArchive?.instanceId !== dangerInstance?.configuration.instance.id))} onclick={archiveDangerInstance}>Archive instance on server</button></div>
             {#if dangerPeers.length}<label>Device certificate<select value={dangerPeer?.id ?? ""} disabled={Boolean(busy) || Boolean(pendingCleanup)} onchange={(event) => dangerPeerId = event.currentTarget.value}>{#each dangerPeers as peer}<option value={peer.id}>{peer.display_name}</option>{/each}</select></label><div class="danger-row"><div><h3>Revoke device certificate</h3><p>Revocation cannot be reversed. Deploy the instance afterward to apply it. Local client keys are preserved.</p></div><button class="danger-action" disabled={!online || !dangerPeer || Boolean(busy) || Boolean(pendingCleanup)} onclick={revokeDangerPeer}>Revoke device certificate</button></div>{/if}
           {/if}
         </section>
@@ -441,6 +482,11 @@
       {#if inventory?.cached}<div class="alert" role="status">Offline · showing cached information from {new Date(inventory.synchronized_at).toLocaleString()}. Saving and deployment require a live connection.</div>{/if}
       {#if inventory && Object.keys(inventory.discovery.errors).length}<div class="alert" role="alert">Some remote instance metadata could not be read. The server is not empty.<ul>{#each Object.values(inventory.discovery.errors) as problem}<li>{problem}</li>{/each}</ul></div>{/if}
       {#if ["Devices", "DNS", "Backups", "Logs"].includes(serverTab) && inventory?.discovery.instances.length}<section class="card section-selector"><label for="section-instance">Instance</label><select id="section-instance" value={selected?.configuration.instance.id ?? ""} onchange={(event) => selectSectionInstance(event.currentTarget.value)}>{#each inventory.discovery.instances as item}<option value={item.configuration.instance.id}>{item.configuration.instance.display_name}</option>{/each}</select><span>{host.display_name} · {inventory.cached ? "cached" : connection}</span></section>{/if}
+      {#if serverTab === "Backups"}
+        <section class="card archived-backups"><header><div><h2>Archived instances</h2><p>Restore saved configuration and retained runtime identities. Restored instances stay stopped until you start or deploy them.</p></div><button class="secondary" disabled={Boolean(busy)} onclick={refreshServer}>Refresh archives</button></header>
+          {#if archivedInstances.length}<div class="table-wrap"><table><thead><tr><th>Instance</th><th>Archived</th><th>Saved state</th><th>Action</th></tr></thead><tbody>{#each archivedInstances as archived}<tr><td>{archived.configuration.instance.display_name}<small>{nameOf(archived.configuration.instance.backend)}</small></td><td>{new Date(archived.saved_at).toLocaleString()}</td><td>Archived revision {archived.revision}</td><td><button class="secondary" disabled={!online || dirty || Boolean(busy) || Boolean(pendingCleanup) || (Boolean(pendingArchiveRestore) && pendingArchiveRestore?.instanceId !== archived.configuration.instance.id)} onclick={() => restoreArchivedInstance(archived)}>{pendingArchiveRestore?.instanceId === archived.configuration.instance.id ? "Retry archived instance restore" : "Restore archived instance"}</button></td></tr>{/each}</tbody></table></div>{:else}<div class="inventory-empty"><h3>{inventory ? "No archived instances" : "Archive inventory unavailable"}</h3><p>{inventory ? "Instances archived on this server will appear here." : "Connect to the server to read its archived instances."}</p></div>{/if}
+        </section>
+      {/if}
       {#if selected && draft}
         {#if serverTab === "Devices"}<div class="metric-grid section-metrics" aria-label="Device summary"><div class="metric-card"><span class="metric-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="2"/><path d="M11 18h2"/></svg></span><strong>{draft.peers.length}</strong><span class="metric-label">Assigned identities</span><small>On {draft.instance.display_name}</small></div><div class="metric-card"><span class="metric-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></svg></span><strong>{draft.peers.filter((peer) => peer.enabled).length}</strong><span class="metric-label">Enabled</span><small>Saved access state</small></div><div class="metric-card"><span class="metric-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="4" y="10" width="16" height="11" rx="2"/><path d="M7 10V7a5 5 0 0 1 10 0v3"/></svg></span><strong>{draft.peers.filter((peer) => !peer.enabled).length}</strong><span class="metric-label">Disabled</span><small>Saved access state</small></div><div class="metric-card"><span class="metric-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="8" cy="15" r="5"/><path d="m12 11 9-9 2 2-2 2 1 2-3 3-2-2-3 3"/></svg></span><strong>{availability.filter((item) => item.complete_export_available).length}</strong><span class="metric-label">Exportable here</span><small>Complete local credentials</small></div></div>{/if}
         {#if serverTab === "DNS"}<div class="metric-grid section-metrics three" aria-label="DNS summary"><div class="metric-card"><span class="metric-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg></span><strong>{draft.dns_records.length}</strong><span class="metric-label">Private DNS records</span><small>Saved configuration</small></div><div class="metric-card"><span class="metric-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m12 22 0 0C6 19 4 16 4 10V5l8-3 8 3v5c0 6-2 9-8 12Z"/><path d="m9 12 2 2 4-4"/></svg></span><strong>{draft.dns_blocklist_domains.length}</strong><span class="metric-label">Blocklist domains</span><small>Saved configuration</small></div><div class="metric-card"><span class="metric-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span><strong class="metric-date">{draft.instance.dns.zone}</strong><span class="metric-label">Private DNS zone</span><small>On {draft.instance.display_name}</small></div></div>{/if}
@@ -473,7 +519,7 @@
             {#if serverTab === "Logs"}
               <div class="table-wrap"><table><thead><tr><th>Operation</th><th>Desired revision</th><th>Result</th><th>Deployed revision</th><th>Recovery</th></tr></thead><tbody>{#each runtimeHistory as event}<tr><td>{event.operation.replaceAll("_", " ")}</td><td>{event.desired_revision}</td><td><span class="instance-state" data-state={event.succeeded ? "healthy" : "needs_deployment"}>{event.succeeded ? "Succeeded" : "Failed"}</span></td><td>{event.deployed_revision ?? "Unknown"}</td><td>{event.requires_recovery ? "Required" : "None"}</td></tr>{/each}</tbody></table>{#if !runtimeHistory.length}<div class="inventory-empty"><h3>No deployment history</h3><p>Remote operations for this instance will appear here.</p></div>{/if}</div>
             {:else if serverTab === "Backups"}
-              <div class="section-toolbar"><h3>Runtime snapshots</h3><button class="primary" disabled={!online || dirty || Boolean(busy)} onclick={async () => { await task("Creating runtime backup", () => call("backup_remote_deployment", { hostId: selectedHostId, instanceId: selected!.configuration.instance.id, expectedRevision: baseRevision })); if (!error) { notice = "Runtime backup created on server."; await loadBackups(); } }}>Create snapshot</button></div>
+              <div class="section-toolbar"><h3>Runtime snapshots</h3><button class="secondary" disabled={!online || dirty || observation?.deployed_revision == null || Boolean(busy)} onclick={startRestoredInstance}>Start instance</button><button class="primary" disabled={!online || dirty || Boolean(busy)} onclick={async () => { await task("Creating runtime backup", () => call("backup_remote_deployment", { hostId: selectedHostId, instanceId: selected!.configuration.instance.id, expectedRevision: baseRevision })); if (!error) { notice = "Runtime backup created on server."; await loadBackups(); } }}>Create snapshot</button></div>
               <div class="table-wrap"><table><thead><tr><th>Snapshot</th><th>Created</th><th>Action</th></tr></thead><tbody>{#each backups as backup}<tr><td>{backup.name}</td><td>{new Date(backup.created_at).toLocaleString()}</td><td><button class="secondary" disabled={!online || dirty || Boolean(busy)} onclick={() => previewRestore(backup.name)}>Preview restore</button></td></tr>{/each}</tbody></table>{#if !backups.length}<div class="inventory-empty"><h3>No runtime snapshots</h3><p>Create a snapshot of the selected instance to populate this page.</p></div>{/if}</div>
               {#if restorePreview}<section class="alert"><div><h3>Restore deployed revision {restorePreview.deployed_revision ?? "unknown"}</h3><p>{restorePreview.identity_impact}</p><p>Saved desired revision {restorePreview.desired_revision} will remain unchanged.</p><button class="primary" disabled={!online || dirty || Boolean(busy)} onclick={restoreDeployment}>Restore Deployment</button></div></section>{/if}
             {:else}
@@ -490,6 +536,8 @@
           </div>
         </section>
         </div></div>
+      {:else if serverTab === "Backups"}
+        <section class="card inventory-empty"><h2>Runtime snapshots</h2><p>Choose an active instance or restore an archived instance above to access its runtime snapshots.</p></section>
       {:else}
         {#if serverTab === "Hosts"}<div class="prototype-split"><section class="card host-list-panel"><header><h2>Managed hosts</h2><span>{hosts.length} configured</span></header>{#each hosts as server}<button class:selected={server.id === selectedHostId} onclick={async () => { await selectServer(server.id); serverTab = "Hosts"; }}><span class="instance-symbol" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="8" rx="2"/><rect x="3" y="13" width="18" height="8" rx="2"/><path d="M11 7h6M11 17h6"/></svg></span><span><strong>{server.display_name}</strong><small>{server.ssh.username}@{server.ssh.hostname}:{server.ssh.port}</small></span><span class="instance-chevron" aria-hidden="true">›</span></button>{/each}</section><section class="card host-detail-panel"><div class="detail-hero"><div><p class="eyebrow">Host details</p><h2>{host.display_name}</h2><p>{host.ssh.username}@{host.ssh.hostname}:{host.ssh.port}</p></div><span class="instance-state" data-state={online ? "healthy" : "needs_deployment"}>{connection}</span></div><div class="host-actions"><button class="secondary" disabled={Boolean(busy)} onclick={refreshServer}>Refresh / Reconnect</button><button class="secondary" onclick={probeServer}>Verify SSH host identity</button><button class="secondary" onclick={inspectServer}>Inspect host readiness</button></div><div class="fact-grid"><div><span>Appliance identity</span><strong>{inventory?.identity.appliance_id ?? "Not synchronized"}</strong></div><div><span>Managed instances</span><strong>{inventory?.discovery.instances.length ?? "Unknown"}</strong></div><div><span>Last synchronized</span><strong>{inventory ? new Date(inventory.synchronized_at).toLocaleString() : "Never"}</strong></div><div><span>Connection</span><strong>{connection}</strong></div></div>{#if probe}<div class="host-verification"><h3>{probe.state === "changed" ? "Changed SSH host key" : "SSH host key"}</h3><p>{probe.key.sha256_fingerprint}</p><p>Verify this fingerprint through an independent trusted channel.</p><label>Exact verified fingerprint<input bind:value={fingerprint} /></label>{#if probe.state === "changed"}<label><input type="checkbox" bind:checked={replaceChanged} /> Explicitly replace the previously approved key</label>{/if}<button class="primary" disabled={fingerprint !== probe.key.sha256_fingerprint || (probe.state === "changed" && !replaceChanged)} onclick={approveIdentity}>Approve SSH identity</button></div>{/if}{#if inspection}<div class="inspection-panel"><p>{inspection.inspection.operating_system} · {inspection.inspection.architecture}</p><p>Docker: {inspection.inspection.docker_version ?? "Unavailable"} · Compose: {inspection.inspection.compose_version ?? "Unavailable"}</p><HostReadinessMatrix view={inspection} /></div>{/if}</section></div>
         {:else}

@@ -1079,7 +1079,7 @@ impl ApplicationService {
             self.remote_operation(
                 input.host_id,
                 input.request_id,
-                Operation::Remove {
+                Operation::ArchiveInstance {
                     request: Box::new(SaveRequest {
                         compatibility: Compatibility::default(),
                         appliance_id: identity.appliance_id,
@@ -1088,6 +1088,28 @@ impl ApplicationService {
                         configuration: input.configuration,
                         secrets: BTreeMap::new(),
                     }),
+                    confirmed,
+                },
+            )
+            .await?,
+        )
+    }
+
+    pub async fn restore_archived_instance(
+        &self,
+        host_id: Uuid,
+        instance_id: Uuid,
+        expected_revision: u64,
+        request_id: Uuid,
+        confirmed: bool,
+    ) -> Result<Manifest, AppError> {
+        manifest_reply(
+            self.remote_operation(
+                host_id,
+                request_id,
+                Operation::RestoreArchivedInstance {
+                    instance_id,
+                    expected_revision,
                     confirmed,
                 },
             )
@@ -1210,6 +1232,40 @@ mod tests {
                     .store
                     .save(request)
                     .map(|manifest| Reply::Manifest(Box::new(manifest))),
+                Operation::ArchiveInstance { request, confirmed } => self
+                    .store
+                    .remove(request, *confirmed)
+                    .map(|manifest| Reply::Manifest(Box::new(manifest))),
+                Operation::RestoreArchivedInstance {
+                    instance_id,
+                    expected_revision,
+                    confirmed,
+                } => {
+                    if !confirmed {
+                        Err(vam_authority::AuthorityError::InvalidState(
+                            "restore requires confirmation".into(),
+                        ))
+                    } else if let Some(manifest) = self
+                        .store
+                        .reconciled_archive_restore(
+                            *instance_id,
+                            *expected_revision,
+                            request.request_id,
+                        )
+                        .unwrap()
+                    {
+                        Ok(Reply::Manifest(Box::new(manifest)))
+                    } else {
+                        let context = self
+                            .store
+                            .archived_runtime_context(*instance_id, *expected_revision)
+                            .unwrap();
+                        context.begin_or_resume_removal(request.request_id).unwrap();
+                        let manifest = context.commit_archive_restore(request.request_id).unwrap();
+                        context.finish_mutation().unwrap();
+                        Ok(Reply::Manifest(Box::new(manifest)))
+                    }
+                }
                 Operation::ExportPeerPsk {
                     instance_id,
                     peer_id,
@@ -1366,6 +1422,70 @@ mod tests {
         assert!(b.legacy_candidates().await.unwrap().is_empty());
         b.delete_host(host_b.id).await.unwrap();
         assert_eq!(helper.store.discover().unwrap().instances.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn fresh_clients_can_discover_and_restore_archived_instances() {
+        let directory = tempfile::tempdir().unwrap();
+        let helper = helper(directory.path());
+        let (a, host_a) = client(helper.clone(), "server", true).await;
+        let created = a
+            .create_remote_instance(CreateInstanceInput {
+                host_id: host_a.id,
+                display_name: "recoverable".into(),
+                endpoint_host: "vpn.example.test".into(),
+                backend: VpnBackendKind::WireGuard,
+                backend_settings: None,
+                endpoint_port: None,
+                ipv4_subnet: "10.88.0.0/24".into(),
+                dns_zone: "vpn.internal".into(),
+                routing_mode: None,
+                xray_tls_import: None,
+            })
+            .await
+            .unwrap();
+        let archived = a
+            .remove_remote_configuration(
+                RemoteSaveInput {
+                    host_id: host_a.id,
+                    expected_revision: created.revision,
+                    request_id: Uuid::new_v4(),
+                    configuration: created.configuration.clone(),
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        let (b, host_b) = client(helper, "server", true).await;
+        let discovery = b.discover_remote(host_b.id).await.unwrap().discovery;
+        assert!(discovery.instances.is_empty());
+        assert_eq!(discovery.archived_instances, vec![archived.clone()]);
+        let operation = Uuid::new_v4();
+        let id = created.configuration.instance.id;
+        assert!(
+            b.restore_archived_instance(host_b.id, id, archived.revision, operation, false)
+                .await
+                .is_err()
+        );
+        let restored = b
+            .restore_archived_instance(host_b.id, id, archived.revision, operation, true)
+            .await
+            .unwrap();
+        assert_eq!(
+            b.restore_archived_instance(host_b.id, id, archived.revision, operation, true)
+                .await
+                .unwrap(),
+            restored
+        );
+        assert_eq!(restored.configuration, created.configuration);
+        assert_eq!(
+            a.discover_remote(host_a.id)
+                .await
+                .unwrap()
+                .discovery
+                .instances,
+            vec![restored]
+        );
     }
 
     #[tokio::test]

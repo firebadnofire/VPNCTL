@@ -179,6 +179,7 @@ pub fn run() {
             remote::export_remote_peer,
             remote::revoke_remote_peer,
             remote::remove_remote_configuration,
+            remote::restore_archived_instance,
             remote::preview_remote_deployment,
             remote::apply_remote_deployment,
             remote::inspect_remote_health,

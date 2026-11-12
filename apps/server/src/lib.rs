@@ -12,6 +12,7 @@ use vam_authority::{
     AuthorityRequestEnvelope, AuthorityResponseEnvelope,
 };
 
+mod archive;
 mod enrollment;
 mod manifest_rpc;
 mod runtime;

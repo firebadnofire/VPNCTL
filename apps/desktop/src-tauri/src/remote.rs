@@ -1,6 +1,27 @@
 use super::AppState;
 
 #[tauri::command]
+pub async fn restore_archived_instance(
+    state: State<'_, AppState>,
+    host_id: Uuid,
+    instance_id: Uuid,
+    expected_revision: u64,
+    request_id: Uuid,
+    confirmed: bool,
+) -> Result<Manifest, AppError> {
+    state
+        .0
+        .restore_archived_instance(
+            host_id,
+            instance_id,
+            expected_revision,
+            request_id,
+            confirmed,
+        )
+        .await
+}
+
+#[tauri::command]
 pub async fn list_remote_backups(
     state: State<'_, AppState>,
     host_id: Uuid,

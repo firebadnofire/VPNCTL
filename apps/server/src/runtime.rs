@@ -134,15 +134,50 @@ pub async fn remove_instance(
             "removal preview no longer matches the instance".into(),
         ));
     }
+    let root = Path::new("/opt/vpn-appliance-manager");
+    let current_path = root
+        .join("instances")
+        .join(request.configuration.instance.id.to_string());
+    crate::archive::checked_path(root, &current_path)?;
+    let backup_name = format!("archive-{}", request.request_id);
+    let backup = root
+        .join("backups")
+        .join(request.configuration.instance.id.to_string())
+        .join(&backup_name);
+    crate::archive::checked_path(root, &backup)?;
+    let runtime_present = current_path.try_exists()? || backup.try_exists()?;
+    if current_path.try_exists()? {
+        crate::archive::validate_snapshot(&current_path)?;
+    }
+    if backup.try_exists()? {
+        crate::archive::validate_snapshot(&backup)?;
+    }
+    let deployed_revision = context.deployed()?;
+    if deployed_revision.is_some() && !runtime_present {
+        return Err(AuthorityError::InvalidState("The deployed runtime tree is missing; archive refused because a restorable snapshot cannot be retained.".into()));
+    }
     let service = project_configuration(&context, &context.manifest.configuration)
         .await
         .map_err(|error| AuthorityError::InvalidState(error.message))?;
     context.begin_or_resume_removal(request.request_id)?;
+    context.remember_archive(&vam_authority::manifest::InstanceArchive {
+        instance_id: request.configuration.instance.id,
+        request_id: request.request_id,
+        desired_revision: context.manifest.revision,
+        deployed_revision,
+        backup_name: runtime_present.then_some(backup_name.clone()),
+    })?;
     match service
-        .delete_instance(request.configuration.instance.id)
+        .archive_instance_for_recovery(request.configuration.instance.id, request.request_id)
         .await
     {
-        Ok(_) => {
+        Ok(result) => {
+            if runtime_present && !result.remote_content_moved {
+                return Err(AuthorityError::InvalidState("The runtime snapshot disappeared during archival; the instance remains pending recovery.".into()));
+            }
+            if runtime_present {
+                context.remember_backup(&backup_name, deployed_revision)?;
+            }
             let manifest = context.commit_removal(request)?;
             context.finish_mutation()?;
             Ok(Reply::Manifest(Box::new(manifest)))
@@ -202,7 +237,14 @@ pub async fn execute(
             ));
         }
     };
-    let context = store.runtime_context(instance_id, revision)?;
+    let context = if matches!(operation, Operation::ListBackups { .. })
+        && let Some(manifest) = store.read(instance_id)?
+        && manifest.removed
+    {
+        store.archived_runtime_context(instance_id, manifest.revision)?
+    } else {
+        store.runtime_context(instance_id, revision)?
+    };
     let operation_hash = format!("{:x}", Sha256::digest(serde_json::to_vec(&operation)?));
     let operation_kind = match &operation {
         Operation::ApplyDeployment { .. } => "deploy",

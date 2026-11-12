@@ -4085,6 +4085,28 @@ fi
         &self,
         instance_id: Uuid,
     ) -> Result<DeleteInstanceResult, AppError> {
+        self.remove_instance_to(instance_id, None).await
+    }
+
+    /// Helper-only removal into a retained, deterministic runtime backup.
+    pub async fn archive_instance_for_recovery(
+        &self,
+        instance_id: Uuid,
+        archive_id: Uuid,
+    ) -> Result<DeleteInstanceResult, AppError> {
+        if self.runtime_projection.is_none() {
+            return Err(validation_error(
+                "Instance archival requires the authoritative helper.",
+            ));
+        }
+        self.remove_instance_to(instance_id, Some(archive_id)).await
+    }
+
+    async fn remove_instance_to(
+        &self,
+        instance_id: Uuid,
+        archive_id: Option<Uuid>,
+    ) -> Result<DeleteInstanceResult, AppError> {
         let lock = self.instance_lock(instance_id).await;
         let _guard = lock.lock().await;
         let instance = self
@@ -4109,15 +4131,24 @@ fi
             });
         }
         let (host, trusted, passphrase) = self.trusted_host(instance.host_id).await?;
-        let trash = format!(
-            "{APP_ROOT}/trash/{}-{}",
-            instance.id,
-            Utc::now().format("%Y%m%dT%H%M%SZ")
+        let parent = archive_id.map_or_else(
+            || format!("{APP_ROOT}/trash"),
+            |_| format!("{APP_ROOT}/backups/{instance_id}"),
+        );
+        let trash = archive_id.map_or_else(
+            || {
+                format!(
+                    "{parent}/{}-{}",
+                    instance.id,
+                    Utc::now().format("%Y%m%dT%H%M%SZ")
+                )
+            },
+            |id| format!("{parent}/archive-{id}"),
         );
         let command = format!(
-            "set -eu; if test -d {current}; then cd {current}; docker compose stop; cd /; install -d {trash_parent}; mv {current} {trash}; printf 'remote_content_moved=1\\n'; else printf 'remote_content_moved=0\\n'; fi",
+            "set -eu; if test -d {trash}; then test ! -e {current}; printf 'remote_content_moved=1\\n'; elif test -d {current}; then cd {current}; docker compose stop; cd /; install -d {trash_parent}; mv -- {current} {trash}; sync -f {trash_parent}; printf 'remote_content_moved=1\\n'; else printf 'remote_content_moved=0\\n'; fi",
             current = shell_quote(&instance.remote_path()),
-            trash_parent = shell_quote(&format!("{APP_ROOT}/trash")),
+            trash_parent = shell_quote(&parent),
             trash = shell_quote(&trash),
         );
         let cancellation = CancellationToken::new();
@@ -6508,7 +6539,7 @@ fn activation_command(
 fn prune_command(instance_id: Uuid, retention: usize) -> String {
     let root = format!("{APP_ROOT}/backups/{instance_id}");
     format!(
-        "set -eu; if test -d {root}; then find {root} -mindepth 1 -maxdepth 1 -type d -print | sort -r | tail -n +{start} | xargs -r rm -rf --; fi",
+        "set -eu; if test -d {root}; then find {root} -mindepth 1 -maxdepth 1 -type d ! -name 'archive-*' -print | sort -r | tail -n +{start} | xargs -r rm -rf --; fi",
         root = shell_quote(&root),
         start = retention + 1,
     )

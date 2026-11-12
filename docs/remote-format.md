@@ -16,7 +16,7 @@
   instances/<instance-uuid>/   # active Compose and backend artifacts
   staging/                     # validated deployment candidates
   backups/<instance-uuid>/     # runtime and persistent identity snapshots
-  trash/                       # archived runtime trees
+  trash/                       # legacy archived runtime trees and retained fragments
 ```
 
 The control store is outside `/opt/vpn-appliance-manager` so activation and rollback cannot overwrite committed desired state. Control directory entries are owner restricted; secret files are mode `0600`. The helper rejects symlinks, unsafe paths, oversized exchange messages and corrupt metadata. Per-instance discovery errors are returned alongside readable instances; a failed inventory read is never converted to an empty inventory.

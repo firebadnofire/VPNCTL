@@ -309,6 +309,8 @@ pub struct Manifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Discovery {
     pub instances: Vec<Manifest>,
+    #[serde(default)]
+    pub archived_instances: Vec<Manifest>,
     pub errors: BTreeMap<String, String>,
     pub deployments: BTreeMap<Uuid, DeploymentObservation>,
 }
@@ -331,6 +333,15 @@ pub struct Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    ArchiveInstance {
+        request: Box<SaveRequest>,
+        confirmed: bool,
+    },
+    RestoreArchivedInstance {
+        instance_id: Uuid,
+        expected_revision: u64,
+        confirmed: bool,
+    },
     ReconcileRuntime {
         instance_id: Uuid,
         mutation_id: Uuid,
@@ -536,7 +547,63 @@ pub struct RuntimeContext {
     store: ManifestStore,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InstanceArchive {
+    pub instance_id: Uuid,
+    pub request_id: Uuid,
+    pub desired_revision: u64,
+    pub deployed_revision: Option<u64>,
+    pub backup_name: Option<String>,
+}
+
 impl RuntimeContext {
+    pub fn archive(&self) -> Result<Option<InstanceArchive>, AuthorityError> {
+        optional_json(&self.directory.join("archive.json"))
+    }
+
+    pub fn remember_archive(&self, archive: &InstanceArchive) -> Result<(), AuthorityError> {
+        if archive.instance_id != self.manifest.configuration.instance.id {
+            return Err(invalid("archive belongs to another instance"));
+        }
+        private_directory(&self.directory)?;
+        replace_json(&self.directory.join("archive.json"), archive)
+    }
+
+    pub fn validate_archive_restore(&self) -> Result<(), AuthorityError> {
+        if !self.manifest.removed {
+            return Err(invalid("instance is not archived"));
+        }
+        let discovery = self.store.discover_locked()?;
+        if !discovery.errors.is_empty() {
+            return Err(invalid(
+                "repair unreadable instance metadata before restoring an archive",
+            ));
+        }
+        let mut instances: Vec<_> = discovery
+            .instances
+            .into_iter()
+            .map(|item| item.configuration.instance)
+            .collect();
+        instances.push(self.manifest.configuration.instance.clone());
+        validate_host_instances(&instances).map_err(|error| invalid(&error.to_string()))
+    }
+
+    pub fn commit_archive_restore(&self, request_id: Uuid) -> Result<Manifest, AuthorityError> {
+        self.validate_archive_restore()?;
+        let request = SaveRequest {
+            compatibility: Compatibility::default(),
+            appliance_id: self.manifest.appliance_id,
+            request_id,
+            expected_revision: self.manifest.revision,
+            configuration: self.manifest.configuration.clone(),
+            secrets: BTreeMap::new(),
+        };
+        let hash = archive_restore_digest(
+            self.manifest.configuration.instance.id,
+            self.manifest.revision,
+        );
+        self.store.commit_locked(&request, &hash, false, true, true)
+    }
     pub fn committed_request(
         &self,
         request_id: Uuid,
@@ -577,7 +644,7 @@ impl RuntimeContext {
             configuration,
             secrets: BTreeMap::new(),
         };
-        let result = self.store.commit_locked(&request, hash, false, true);
+        let result = self.store.commit_locked(&request, hash, false, true, false);
         match result {
             Ok(manifest) => Ok(manifest),
             Err(error) => {
@@ -602,7 +669,7 @@ impl RuntimeContext {
             ));
         }
         let hash = digest(&Zeroizing::new(serde_json::to_vec(&(request, "remove"))?));
-        self.store.commit_locked(request, &hash, true, true)
+        self.store.commit_locked(request, &hash, true, true, false)
     }
 
     /// Only resume an idempotent removal with the same request identity.
@@ -748,6 +815,33 @@ pub struct ManifestStore {
 }
 
 impl ManifestStore {
+    pub fn reconciled_archive_restore(
+        &self,
+        instance_id: Uuid,
+        expected_revision: u64,
+        request_id: Uuid,
+    ) -> Result<Option<Manifest>, AuthorityError> {
+        let hash = archive_restore_digest(instance_id, expected_revision);
+        for manifest in self.history(instance_id)? {
+            if manifest.request_id == request_id {
+                if manifest.request_digest != hash {
+                    return Err(invalid(
+                        "restore request UUID reused with different content",
+                    ));
+                }
+                // Finish bookkeeping after a lost reply or process exit after
+                // the manifest pointer committed. Do not overwrite later work.
+                let _lock = self.lock()?;
+                let runtime = self.instance_dir(instance_id).join("runtime");
+                if optional_json::<Uuid>(&runtime.join("pending.json"))? == Some(request_id) {
+                    std::fs::remove_file(runtime.join("pending.json"))?;
+                    sync_directory(&runtime)?;
+                }
+                return Ok(Some(manifest));
+            }
+        }
+        Ok(None)
+    }
     pub fn maintenance_lock(&self) -> Result<File, AuthorityError> {
         self.lock()
     }
@@ -756,9 +850,26 @@ impl ManifestStore {
         id: Uuid,
         expected_revision: Option<u64>,
     ) -> Result<RuntimeContext, AuthorityError> {
+        self.runtime_context_with_state(id, expected_revision, false)
+    }
+
+    pub fn archived_runtime_context(
+        &self,
+        id: Uuid,
+        expected_revision: u64,
+    ) -> Result<RuntimeContext, AuthorityError> {
+        self.runtime_context_with_state(id, Some(expected_revision), true)
+    }
+
+    fn runtime_context_with_state(
+        &self,
+        id: Uuid,
+        expected_revision: Option<u64>,
+        archived: bool,
+    ) -> Result<RuntimeContext, AuthorityError> {
         let lock = self.lock()?;
         let manifest = self.read_locked(id)?.ok_or(AuthorityError::NotFound)?;
-        if manifest.removed {
+        if manifest.removed != archived {
             return Err(AuthorityError::NotFound);
         }
         if let Some(expected) = expected_revision
@@ -837,6 +948,7 @@ impl ManifestStore {
     fn discover_locked(&self) -> Result<Discovery, AuthorityError> {
         let mut result = Discovery {
             instances: Vec::new(),
+            archived_instances: Vec::new(),
             errors: BTreeMap::new(),
             deployments: BTreeMap::new(),
         };
@@ -868,6 +980,27 @@ impl ManifestStore {
                     }
                     result.instances.push(manifest);
                 }
+                Ok(Some(manifest)) if manifest.removed => {
+                    let id = manifest.configuration.instance.id;
+                    let runtime = self.instance_dir(id).join("runtime");
+                    let observation = (|| {
+                        Ok::<_, AuthorityError>(DeploymentObservation {
+                            deployed_revision: optional_json(&runtime.join("deployed.json"))?,
+                            pending_operation: optional_json(&runtime.join("pending.json"))?,
+                        })
+                    })();
+                    match observation {
+                        Ok(observation) => {
+                            result.deployments.insert(id, observation);
+                        }
+                        Err(error) => {
+                            result
+                                .errors
+                                .insert(format!("{id}/runtime"), error.to_string());
+                        }
+                    }
+                    result.archived_instances.push(manifest);
+                }
                 Ok(_) => {}
                 Err(error) => {
                     result.errors.insert(name, error.to_string());
@@ -876,6 +1009,9 @@ impl ManifestStore {
         }
         result
             .instances
+            .sort_by_key(|manifest| manifest.configuration.instance.id);
+        result
+            .archived_instances
             .sort_by_key(|manifest| manifest.configuration.instance.id);
         Ok(result)
     }
@@ -950,7 +1086,7 @@ impl ManifestStore {
         let digest = digest(&Zeroizing::new(serde_json::to_vec(request)?));
         let _lock = self.lock()?;
         check()?;
-        self.commit_locked(request, &digest, false, credential_mutation)
+        self.commit_locked(request, &digest, false, credential_mutation, false)
     }
 
     fn commit_locked(
@@ -959,6 +1095,7 @@ impl ManifestStore {
         request_digest: &str,
         removed: bool,
         owned_runtime: bool,
+        restoring_archive: bool,
     ) -> Result<Manifest, AuthorityError> {
         let id = request.configuration.instance.id;
         let current = self.read_locked(id)?;
@@ -1032,7 +1169,14 @@ impl ManifestStore {
                 ));
             }
         }
-        if current.as_ref().is_some_and(|manifest| manifest.removed) {
+        if current.as_ref().is_some_and(|manifest| manifest.removed)
+            && !(restoring_archive
+                && owned_runtime
+                && !removed
+                && current
+                    .as_ref()
+                    .is_some_and(|manifest| manifest.configuration == request.configuration))
+        {
             return Err(invalid("removed instance cannot be overwritten"));
         }
         if current.as_ref().is_some_and(|manifest| {
@@ -1171,7 +1315,7 @@ impl ManifestStore {
             "restore_desired",
             revision,
         ))?);
-        self.commit_locked(&request, &digest, false, false)
+        self.commit_locked(&request, &digest, false, false, false)
     }
 
     /// Copy the complete protected control tree, including every retained
@@ -1231,7 +1375,7 @@ impl ManifestStore {
         if current.configuration != request.configuration {
             return Err(invalid("removal preview no longer matches instance"));
         }
-        self.commit_locked(request, &digest, true, false)
+        self.commit_locked(request, &digest, true, false, false)
     }
 
     /// Explicit export only; normal discovery never returns secret values.
@@ -1306,6 +1450,10 @@ fn copy_private_tree(source: &Path, destination: &Path) -> Result<(), AuthorityE
 }
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
+}
+
+fn archive_restore_digest(instance_id: Uuid, expected_revision: u64) -> String {
+    digest(format!("restore_archived_instance:{instance_id}:{expected_revision}").as_bytes())
 }
 
 fn reject_symlink(path: &Path) -> Result<(), AuthorityError> {
@@ -1691,6 +1839,94 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn archived_instances_are_discoverable_and_restore_without_replacing_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let appliance = Uuid::new_v4();
+        let store = ManifestStore::open(dir.path(), appliance).unwrap();
+        let mut input = request(appliance);
+        let (_, peer, value) = add_psk(&mut input);
+        let original = store.save(&input).unwrap();
+        input.expected_revision = original.revision;
+        input.request_id = Uuid::new_v4();
+        input.secrets.clear();
+        let archived = store.remove(&input, true).unwrap();
+        assert_eq!(store.discover().unwrap().archived_instances[0], archived);
+        assert!(store.discover().unwrap().instances.is_empty());
+        let mut ordinary = input.clone();
+        ordinary.request_id = Uuid::new_v4();
+        ordinary.expected_revision = archived.revision;
+        assert!(store.save(&ordinary).is_err());
+        let restore_id = Uuid::new_v4();
+        let restored = {
+            let context = store
+                .archived_runtime_context(original.configuration.instance.id, archived.revision)
+                .unwrap();
+            context.validate_archive_restore().unwrap();
+            context.begin_or_resume_removal(restore_id).unwrap();
+            // Simulate termination after publication but before pending cleanup.
+            context.commit_archive_restore(restore_id).unwrap()
+        };
+        assert_eq!(restored.configuration, original.configuration);
+        assert!(!restored.removed);
+        assert_eq!(restored.revision, archived.revision + 1);
+        assert_eq!(
+            store
+                .reconciled_archive_restore(
+                    original.configuration.instance.id,
+                    archived.revision,
+                    restore_id
+                )
+                .unwrap(),
+            Some(restored.clone())
+        );
+        assert!(
+            store
+                .runtime_context(original.configuration.instance.id, None)
+                .unwrap()
+                .pending_operation()
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.discover().unwrap().instances[0], restored);
+        assert!(store.discover().unwrap().archived_instances.is_empty());
+        assert_eq!(
+            store
+                .export_peer_psk(original.configuration.instance.id, peer, restored.revision)
+                .unwrap()
+                .unwrap()
+                .as_bytes(),
+            value.as_bytes()
+        );
+        assert!(
+            store
+                .reconciled_archive_restore(
+                    original.configuration.instance.id,
+                    archived.revision + 1,
+                    restore_id
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn archived_restore_rejects_port_conflicts_before_runtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let appliance = Uuid::new_v4();
+        let store = ManifestStore::open(dir.path(), appliance).unwrap();
+        let mut first = request(appliance);
+        store.save(&first).unwrap();
+        first.request_id = Uuid::new_v4();
+        first.expected_revision = 1;
+        let archived = store.remove(&first, true).unwrap();
+        store.save(&request(appliance)).unwrap();
+        let context = store
+            .archived_runtime_context(first.configuration.instance.id, archived.revision)
+            .unwrap();
+        assert!(context.validate_archive_restore().is_err());
+        assert!(context.pending_operation().unwrap().is_none());
     }
 
     #[test]

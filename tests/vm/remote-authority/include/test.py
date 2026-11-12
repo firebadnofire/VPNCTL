@@ -2,6 +2,7 @@
 """Disposable-guest acceptance. Never prints requests, PSKs, or artifacts."""
 import base64
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -49,6 +50,44 @@ def rpc(operation, *, request_id=None, compatibility=None, expect_error=None):
         return reply
     finally:
         subprocess.run([HELPER, "cleanup", request_id], env=ENV, check=True, capture_output=True)
+
+
+def archive_restore_roundtrip(instance_id, backend):
+    """Only runs inside the disposable guest; retain every runtime identity."""
+    current = rpc({"operation": "read", "instance_id": instance_id})["value"]
+    rpc({"operation": "stop_instance", "instance_id": instance_id, "expected_revision": current["revision"]})
+    runtime = Path("/opt/vpn-appliance-manager/instances") / instance_id
+    def contents(path):
+        return {str(p.relative_to(path)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in path.rglob("*") if p.is_file() and p.name != ".vpnctl-archive-restore"}
+    before = contents(runtime)
+    assert before, "runtime snapshot is empty before archive"
+    archive_id = str(uuid.uuid4())
+    archive_operation = {"operation": "archive_instance", "confirmed": True, "request": {
+        "compatibility": COMPATIBILITY, "appliance_id": APPLIANCE,
+        "request_id": archive_id, "expected_revision": current["revision"],
+        "configuration": current["configuration"], "secrets": {}}}
+    archived = rpc(archive_operation, request_id=archive_id)["value"]
+    assert rpc(archive_operation, request_id=archive_id)["value"] == archived, "archive retry changed the receipt"
+    inventory = rpc({"operation": "discover"})["value"]
+    assert any(m["configuration"]["instance"]["id"] == instance_id for m in inventory["archived_instances"]), "archived instance is missing from backups inventory"
+    snapshot = Path("/opt/vpn-appliance-manager/backups") / instance_id / ("archive-" + archive_id)
+    assert contents(snapshot) == before and not runtime.exists(), "archive did not retain the stopped runtime tree"
+    listed_while_archived = rpc({"operation": "list_backups", "instance_id": instance_id})["value"]
+    assert any(b["name"] == snapshot.name for b in listed_while_archived), "archived instance snapshots are not listed"
+    restore_id = str(uuid.uuid4())
+    restore_operation = {"operation": "restore_archived_instance", "instance_id": instance_id,
+                         "expected_revision": archived["revision"], "confirmed": True}
+    restored = rpc(restore_operation, request_id=restore_id)["value"]
+    assert rpc(restore_operation, request_id=restore_id)["value"] == restored, "restore retry changed the receipt"
+    assert restored["configuration"] == current["configuration"], "restore changed saved peers or identities"
+    assert contents(runtime) == before and contents(snapshot) == before, "restore changed or consumed runtime identity data"
+    assert not rpc({"operation": "health", "instance_id": instance_id})["value"]["gateway_running"], "restore unexpectedly started the gateway"
+    listed = rpc({"operation": "list_backups", "instance_id": instance_id})["value"]
+    assert any(b["name"] == snapshot.name for b in listed), "archive snapshot disappeared after restore"
+    health = rpc({"operation": "start_instance", "instance_id": instance_id, "expected_revision": restored["revision"]})["value"]
+    assert health["gateway_running"] and health["backend_ready"], "restored backend could not start"
+    emit("archive_restore_retains_" + backend + "_runtime_and_identity")
 
 
 def emit(name):
@@ -226,6 +265,7 @@ def run():
                     rpc({"operation": "export_certificate_material", "instance_id": candidate_id,
                          "peer_id": certificate_peer, "expected_revision": 3}, expect_error="invalid_request")
                 emit("scoped_" + kind + "_certificate_enrollment_export_and_revocation")
+            archive_restore_roundtrip(candidate_id, kind)
         runtime_history = rpc({"operation": "runtime_history", "instance_id": instance_id})["value"]
         assert any(item["operation"] == "deploy" and item["succeeded"] for item in runtime_history), "fresh client cannot inspect deployment results"
         assert private.decode() not in json.dumps(runtime_history) and psk.decode() not in json.dumps(runtime_history), "runtime history exposed secret material"
@@ -241,6 +281,7 @@ def run():
         finally:
             pending.unlink()
         emit("runtime_request_reconciliation_reports_all_three_outcomes")
+        archive_restore_roundtrip(instance_id, "wireguard")
     print(json.dumps({"suite": "remote-authority", "success": True}), flush=True)
 
 
