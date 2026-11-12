@@ -209,6 +209,45 @@ describe("remote-authoritative desktop workflows", () => {
     expect(screen.queryByText(/Unsaved changes ·/)).toBeNull();
     expect(invoke.mock.calls.some(([command]) => command === "save_remote_draft")).toBe(false);
   });
+  it.each([
+    { backend: "wireguard", custom: "", enabled: true, expectedName: "macbook" },
+    { backend: "amnezia_wg", custom: "", enabled: true, expectedName: "macbook" },
+    { backend: "wireguard", custom: "  travel-laptop  ", enabled: true, expectedName: "travel-laptop" },
+    { backend: "wireguard", custom: "macbook.internal", enabled: true, expectedName: "macbook.internal" },
+    { backend: "wireguard", custom: "   ", enabled: true, expectedName: "macbook" },
+    { backend: "wireguard", custom: "", enabled: false, expectedName: null },
+    { backend: "wireguard", custom: "custom", enabled: false, expectedName: null },
+  ] as const)("enrolls a $backend device with DNS enabled=$enabled and custom '$custom'", async ({ backend, custom, enabled, expectedName }) => {
+    const remote = manifest(); remote.configuration.instance.backend = backend;
+    remote.configuration.instance.dns.zone = "internal";
+    current = inventory([remote]);
+    const saved = { ...remote, revision: remote.revision + 1 };
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "add_remote_peer") { current = inventory([saved]); return saved; }
+      return base(command, args);
+    });
+    render(App); await screen.findByText("Remote WG");
+    await fireEvent.click(screen.getByRole("button", { name: /Devices/ }));
+    const name = await screen.findByLabelText("Device name");
+    await waitFor(() => expect((name as HTMLInputElement).disabled).toBe(false));
+    const checkbox = screen.getByRole("checkbox", { name: "Add DNS record" }) as HTMLInputElement;
+    expect(checkbox.checked).toBe(true);
+    expect(screen.getByText(/macbook becomes macbook.internal/)).toBeTruthy();
+    await fireEvent.input(name, { target: { value: "  macbook  " } });
+    if (custom) {
+      await fireEvent.click(screen.getByText("Advanced (optional)"));
+      await fireEvent.input(screen.getByLabelText("DNS name (optional)"), { target: { value: custom } });
+    }
+    if (!enabled) await fireEvent.click(checkbox);
+    expect((screen.getByLabelText("DNS name (optional)") as HTMLInputElement).disabled).toBe(!enabled);
+    await fireEvent.click(screen.getByRole("button", { name: "Add Device" }));
+    await screen.findByText("Device added to the saved configuration. Deploy when you are ready to enable access.");
+    expect(invoke).toHaveBeenCalledWith("add_remote_peer", expect.objectContaining({ expectedRevision: remote.revision, input: expect.objectContaining({ dns_name: expectedName, create_dns_record: enabled }) }));
+    expect(invoke.mock.calls.filter(([command]) => command === "add_remote_peer")).toHaveLength(1);
+    expect(invoke.mock.calls.some(([command]) => command === "apply_remote_deployment")).toBe(false);
+    expect(checkbox.checked).toBe(true);
+  });
   it("drains an in-flight draft write before saving a device", async () => {
     current = inventory([manifest()]);
     let local: RemoteDraft | null = null;

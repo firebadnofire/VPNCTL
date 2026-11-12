@@ -91,6 +91,10 @@ to read the server's deployment history.
 
 **Devices** represents VPN client identities, not automatically detected physical
 hardware. **Add Device** saves an identity on the server without deploying it.
+**Add DNS record** is enabled by default: leaving the optional DNS name blank
+uses the device name in the instance's private DNS zone (for example,
+`macbook.internal`). Specify a custom DNS name under **Advanced**, or uncheck
+**Add DNS record** to skip DNS enrollment.
 Choose **Review deployment**, preview the saved configuration, and explicitly
 apply it when ready. The first deployment establishes the server identity;
 certificate-based instances also require their initial deployment before enrollment.

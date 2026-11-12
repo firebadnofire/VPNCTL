@@ -79,6 +79,7 @@
   let settingsForm = newInstanceForm();
   let peerName = "";
   let peerDns = "";
+  let peerCreateDns = true;
   let dnsName = "";
   let dnsValue = "";
   let dnsType = "A";
@@ -333,10 +334,10 @@
     const saved = await task("Adding device", async () => {
       if (!await draftWrite) throw { code: "draft_write_failed", message: "A previous draft could not be saved. Reload from Server before adding a client." };
       return await call<Manifest>("add_remote_peer", { hostId, expectedRevision: selected!.revision,
-        input: { instance_id: instanceId, display_name: peerName, user_id: null, dns_name: peerDns || null, preshared_key: true, create_dns_record: Boolean(peerDns) } });
+        input: { instance_id: instanceId, display_name: peerName, user_id: null, dns_name: peerCreateDns ? peerDns.trim() || peerName.trim() : null, preshared_key: true, create_dns_record: peerCreateDns } });
     });
     if (!saved) return;
-    peerName = ""; peerDns = "";
+    peerName = ""; peerDns = ""; peerCreateDns = true;
     selected = saved; draft = copy(saved.configuration); baseRevision = saved.revision; plan = null;
     enrolledPeerId = saved.configuration.peers.find(peer => !existingPeerIds.has(peer.id))?.id ?? "";
     const cleared = await task("Clearing previous client draft", async () => {
@@ -401,7 +402,7 @@
       if (resetPreferences) {
         instanceForm = newInstanceForm(); settingsForm = newInstanceForm();
         hostForm = { display_name: "", hostname: "", username: defaultUsername, port: 22, private_key_path: "", passphrase: "" };
-        peerName = ""; peerDns = ""; dnsName = ""; dnsValue = ""; dnsType = "A";
+        peerName = ""; peerDns = ""; peerCreateDns = true; dnsName = ""; dnsValue = ""; dnsType = "A";
         fingerprint = ""; replaceChanged = false; migrationPreview = null; migrationDestination = "";
       }
       return true;
@@ -681,7 +682,7 @@
               </td><td>{#if (draft.instance.backend === "openvpn" || draft.instance.backend === "ikev2") && peer.enabled}<button class="secondary" disabled={Boolean(busy)} onclick={() => openDangerZone(draft!.instance.id, peer.id)}>Revoke in Danger Zone</button>{/if}</td></tr>{/each}</tbody></table>
             </div>
             {#if enrolledPeerId}<section class="notice enrollment-result" role="status"><strong>Device saved on the server</strong><p>Deploy the saved configuration to apply access changes. Configuration retrieval does not activate this device.</p><button class="secondary" disabled={Boolean(busy)} onclick={() => { tab = "Deployment"; serverTab = "Instances"; }}>Review deployment</button><button class="secondary" disabled={Boolean(exportReason) || Boolean(busy) || !availability.find(item => item.peer_id === enrolledPeerId)?.complete_export_available} onclick={(event) => openExport(enrolledPeerId, event.currentTarget)}>Get new device configuration</button>{#if exportReason}<p>{exportReason}</p>{/if}</section>{/if}
-            <form use:formFeedback class="remote-form" onsubmit={(event) => { event.preventDefault(); void addPeer(); }}><h3>Add Device</h3><p>A device is a VPN client identity. Create a separate identity for each client installation.</p><label>Device name<input required maxlength="128" bind:value={peerName} /></label><details><summary>Advanced (optional)</summary><label>DNS name (optional)<input bind:value={peerDns} /></label></details><p>Adding a device saves it on the server. Deploy separately to apply access changes.</p>{#if dirty || staleDraft}<p>Save or discard existing edits and resolve server changes before adding a device.</p>{/if}{#if !online}<p>Reconnect to add a device.</p>{/if}{#if !certificateAuthorityReady}<p>Deploy this instance once to establish its certificate authority before enrolling devices.</p>{/if}<button class="primary" disabled={!online || dirty || staleDraft || !peerName.trim() || !certificateAuthorityReady || Boolean(busy)}>Add Device</button></form>
+            <form use:formFeedback class="remote-form" onsubmit={(event) => { event.preventDefault(); void addPeer(); }}><h3>Add Device</h3><p>A device is a VPN client identity. Create a separate identity for each client installation.</p><label>Device name<input required maxlength="128" bind:value={peerName} /></label><label class="checkbox"><input type="checkbox" bind:checked={peerCreateDns} /> Add DNS record</label><p>Use the device name in the private DNS zone ({draft.instance.dns.zone}) unless you specify a custom DNS name. For example, macbook becomes macbook.{draft.instance.dns.zone}. The record takes effect after deployment.</p><details><summary>Advanced (optional)</summary><label>DNS name (optional)<input disabled={!peerCreateDns} placeholder="Uses device name when blank" bind:value={peerDns} /></label>{#if !peerCreateDns}<p>Enable Add DNS record to specify a DNS name.</p>{/if}</details><p>Adding a device saves it on the server. Deploy separately to apply access changes.</p>{#if dirty || staleDraft}<p>Save or discard existing edits and resolve server changes before adding a device.</p>{/if}{#if !online}<p>Reconnect to add a device.</p>{/if}{#if !certificateAuthorityReady}<p>Deploy this instance once to establish its certificate authority before enrolling devices.</p>{/if}<button class="primary" disabled={!online || dirty || staleDraft || !peerName.trim() || !certificateAuthorityReady || Boolean(busy)}>Add Device</button></form>
           {:else if tab === "DNS and Routing"}
             <label>Routing<select bind:value={draft.instance.routing_mode}><option value="split_tunnel">Split tunnel</option><option value="full_tunnel">Full tunnel</option></select></label>
             <div class="table-wrap">
