@@ -69,6 +69,8 @@ mod remote;
 mod remote_certificates;
 
 pub use migration::LegacyMigrationPreview;
+mod cleanup;
+pub use cleanup::LocalCleanupResult;
 pub use remote::RemoteRestorePreview;
 pub use remote::validate_remote_configuration;
 pub use remote::{
@@ -1076,6 +1078,7 @@ pub struct ApplicationService {
     backends: Arc<BackendRegistry>,
     instance_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
     cancellations: Arc<Mutex<HashMap<Uuid, CancellationToken>>>,
+    cleanup_guard: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl ApplicationService {
@@ -1108,6 +1111,7 @@ impl ApplicationService {
             backends: Arc::new(BackendRegistry::new(backends)),
             instance_locks: Arc::default(),
             cancellations: Arc::default(),
+            cleanup_guard: Arc::default(),
         }
     }
 
@@ -1189,6 +1193,7 @@ impl ApplicationService {
     }
 
     pub async fn create_host(&self, input: CreateHostInput) -> Result<DockerHost, AppError> {
+        let _guard = self.cleanup_guard.read().await;
         if input.display_name.trim().is_empty()
             || input.hostname.trim().is_empty()
             || input.username.trim().is_empty()
@@ -1233,6 +1238,11 @@ impl ApplicationService {
     }
 
     pub async fn update_host(&self, host: DockerHost) -> Result<DockerHost, AppError> {
+        let _guard = self.cleanup_guard.read().await;
+        self.storage
+            .get_host(host.id)
+            .await
+            .map_err(storage_error)?;
         if host.display_name.trim().is_empty() || host.ssh.hostname.trim().is_empty() {
             return Err(validation_error("Host name and address are required."));
         }
@@ -1257,13 +1267,15 @@ impl ApplicationService {
     }
 
     pub async fn delete_host(&self, id: Uuid) -> Result<(), AppError> {
-        self.storage.get_host(id).await.map_err(storage_error)?;
-        // Archive local recovery references without ever issuing a remote
-        // deletion or breaking legacy database foreign keys.
-        self.storage
-            .set_setting(&format!("archived_host_profile:{id}"), &true)
-            .await
-            .map_err(storage_error)
+        self.cleanup_local(
+            Uuid::new_v4(),
+            vam_storage::LocalCleanupScope {
+                host_ids: vec![id],
+                reset_preferences: false,
+            },
+        )
+        .await
+        .map(|_| ())
     }
 
     pub async fn probe_host_key(&self, host_id: Uuid) -> Result<HostKeyProbe, AppError> {
@@ -5707,8 +5719,19 @@ install -d {instances} {staging_root} {backups} {trash} {stage}
             .await
             .map_err(storage_error)?
         {
+            let Some(retirement) = self
+                .storage
+                .begin_secret_retirement(reference)
+                .await
+                .map_err(storage_error)?
+            else {
+                continue;
+            };
             let reference = SecretReference(reference);
             if let Err(error) = self.secrets.delete(&reference).await {
+                // Release SQLite exclusion before recording an event through
+                // another pooled connection.
+                drop(retirement);
                 let _ = self
                     .record_event(
                         plan.id,
@@ -5721,7 +5744,7 @@ install -d {instances} {staging_root} {backups} {trash} {stage}
                     .await;
                 continue;
             }
-            if let Err(error) = self.storage.remove_secret_reference(reference.0).await {
+            if let Err(error) = retirement.finish().await {
                 let _ = self
                     .record_event(
                         plan.id,

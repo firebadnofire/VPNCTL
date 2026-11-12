@@ -1,4 +1,7 @@
+mod cleanup;
 mod local;
+
+pub use cleanup::{LocalCleanupScope, LocalHostRecovery, SecretRetirement};
 
 pub use local::{AuthorityCache, CachedAuthoritySnapshot, ConnectionRecord, ConnectionStore};
 
@@ -8,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sqlx::{
     Row, Sqlite, SqlitePool, Transaction,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous},
 };
 use thiserror::Error;
 use uuid::Uuid;
@@ -136,6 +139,7 @@ impl Storage {
     pub async fn open(path: &Path) -> Result<Self, StorageError> {
         let options = SqliteConnectOptions::from_str(&format!("sqlite:{}", path.display()))?
             .create_if_missing(true)
+            .synchronous(SqliteSynchronous::Full)
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
@@ -1235,6 +1239,36 @@ impl Storage {
         key: &str,
         value: &T,
     ) -> Result<(), StorageError> {
+        // A delayed draft/cache write must not resurrect connection state after
+        // cleanup. Keep this condition in the same statement as the write.
+        let host_id = [
+            "remote_draft:",
+            "remote_inventory_cache:",
+            "remote_identity:",
+        ]
+        .iter()
+        .find_map(|prefix| key.strip_prefix(prefix))
+        .map(|suffix| suffix.split(':').next().unwrap_or_default())
+        .map(Uuid::parse_str)
+        .transpose()
+        .map_err(|_| StorageError::InvalidData("invalid connection setting key".into()))?;
+        if let Some(host_id) = host_id {
+            let result = sqlx::query(
+                "INSERT INTO settings (key, value_json)
+                 SELECT ?, ? WHERE EXISTS (SELECT 1 FROM docker_hosts WHERE id=?)
+                 ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+            )
+            .bind(key)
+            .bind(serde_json::to_string(value)?)
+            .bind(host_id.to_string())
+            .execute(&self.pool)
+            .await?;
+            return if result.rows_affected() == 0 {
+                Err(StorageError::NotFound)
+            } else {
+                Ok(())
+            };
+        }
         sqlx::query(
             "INSERT INTO settings (key, value_json) VALUES (?, ?)
              ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
@@ -1284,7 +1318,8 @@ impl Storage {
                s.owner_id=?
                OR s.owner_id IN (SELECT id FROM devices WHERE instance_id=?)
              )
-             AND s.pending_delete_at IS NOT NULL",
+             AND s.pending_delete_at IS NOT NULL
+             AND NOT EXISTS (SELECT 1 FROM local_recovery_secret_references r WHERE r.id=s.id)",
         )
         .bind(instance_id.to_string())
         .bind(instance_id.to_string())
@@ -1575,6 +1610,374 @@ mod tests {
                 .await
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_cleanup_preserves_recovery_and_retries_exact_scope() {
+        let storage = Storage::in_memory().await.unwrap();
+        let host = host();
+        let other = DockerHost {
+            id: Uuid::new_v4(),
+            ..host.clone()
+        };
+        storage.save_host(&host).await.unwrap();
+        storage.save_host(&other).await.unwrap();
+        let instance = instance(host.id, Uuid::new_v4(), 51_820);
+        storage.save_instance(&instance).await.unwrap();
+        let binding_key = format!(
+            "local_peer_binding:{}:{}:{}",
+            Uuid::new_v4(),
+            instance.id,
+            Uuid::new_v4()
+        );
+        let retired_reference = Uuid::new_v4();
+        storage
+            .register_secret_reference(retired_reference, "private_key", instance.id)
+            .await
+            .unwrap();
+        storage
+            .mark_secrets_pending_delete(instance.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            storage
+                .deletable_secret_references(instance.id, 10)
+                .await
+                .unwrap(),
+            vec![retired_reference]
+        );
+        storage
+            .set_setting(&binding_key, &"original-key-reference")
+            .await
+            .unwrap();
+        storage
+            .set_setting(
+                &format!("remote_identity:{}", host.id),
+                &"verified-identity",
+            )
+            .await
+            .unwrap();
+        storage
+            .set_setting(
+                &format!("remote_inventory_cache:{}", host.id),
+                &"configuration",
+            )
+            .await
+            .unwrap();
+        storage
+            .set_setting(
+                &format!("remote_draft:{}:{}", host.id, instance.id),
+                &"draft",
+            )
+            .await
+            .unwrap();
+        storage
+            .set_setting("dns_hostlists", &"preference")
+            .await
+            .unwrap();
+        let operation = Uuid::new_v4();
+        let scope = LocalCleanupScope {
+            host_ids: vec![host.id],
+            reset_preferences: false,
+        };
+        storage
+            .cleanup_local_profiles(operation, scope.clone())
+            .await
+            .unwrap();
+        storage
+            .cleanup_local_profiles(operation, scope)
+            .await
+            .unwrap();
+        assert!(matches!(
+            storage.get_host(host.id).await,
+            Err(StorageError::NotFound)
+        ));
+        assert_eq!(storage.get_host(other.id).await.unwrap(), other);
+        let recovery = storage.local_host_recovery(host.id).await.unwrap().unwrap();
+        assert_eq!(recovery.instances, vec![instance.clone()]);
+        assert_eq!(
+            recovery.identity,
+            Some(serde_json::json!("verified-identity"))
+        );
+        assert_eq!(recovery.inventory, Some(serde_json::json!("configuration")));
+        assert!(
+            storage
+                .deletable_secret_references(instance.id, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            storage
+                .get_setting::<String>(&binding_key)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("original-key-reference")
+        );
+        assert!(
+            storage
+                .get_setting::<serde_json::Value>(&format!(
+                    "remote_draft:{}:{}",
+                    host.id, instance.id
+                ))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_setting::<serde_json::Value>(&format!("remote_identity:{}", host.id))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_setting::<String>("dns_hostlists")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            storage
+                .cleanup_local_profiles(
+                    operation,
+                    LocalCleanupScope {
+                        host_ids: vec![other.id],
+                        reset_preferences: true
+                    }
+                )
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_cleanup_serializes_with_retirement_on_other_connections() {
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+        let directory = tempfile::tempdir().unwrap();
+        let storage = Storage::open(&directory.path().join("race.sqlite"))
+            .await
+            .unwrap();
+        let host = host();
+        storage.save_host(&host).await.unwrap();
+        let instance = instance(host.id, Uuid::new_v4(), 51_820);
+        storage.save_instance(&instance).await.unwrap();
+        let reference = Uuid::new_v4();
+        storage
+            .register_secret_reference(reference, "retired-key", instance.id)
+            .await
+            .unwrap();
+        storage
+            .mark_secrets_pending_delete(instance.id)
+            .await
+            .unwrap();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let cleanup = {
+            let storage = storage.clone();
+            let entered = entered.clone();
+            let release = release.clone();
+            tokio::spawn(async move {
+                storage
+                    .cleanup_local_profiles_checked(
+                        Uuid::new_v4(),
+                        LocalCleanupScope {
+                            host_ids: vec![host.id],
+                            reset_preferences: false,
+                        },
+                        move |_| {
+                            let entered = entered.clone();
+                            let release = release.clone();
+                            async move {
+                                entered.notify_one();
+                                release.notified().await;
+                                Ok(())
+                            }
+                        },
+                    )
+                    .await
+            })
+        };
+        entered.notified().await;
+        let mut retirement = {
+            let storage = storage.clone();
+            tokio::spawn(async move { storage.begin_secret_retirement(reference).await })
+        };
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(30), &mut retirement)
+                .await
+                .is_err()
+        );
+        release.notify_one();
+        cleanup.await.unwrap().unwrap();
+        // A candidate obtained before preservation must be checked again under
+        // exclusion; it is no longer eligible once the recovery pin commits.
+        assert!(retirement.await.unwrap().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn local_factory_reset_rejects_incomplete_profile_scope() {
+        let storage = Storage::in_memory().await.unwrap();
+        let host = host();
+        let other = DockerHost {
+            id: Uuid::new_v4(),
+            ..host.clone()
+        };
+        storage.save_host(&host).await.unwrap();
+        storage.save_host(&other).await.unwrap();
+        storage
+            .set_setting("dns_hostlists", &"preference")
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .cleanup_local_profiles(
+                    Uuid::new_v4(),
+                    LocalCleanupScope {
+                        host_ids: vec![host.id],
+                        reset_preferences: true,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(storage.list_hosts().await.unwrap().len(), 2);
+        assert!(
+            storage
+                .local_host_recovery(host.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            storage
+                .get_setting::<String>("dns_hostlists")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        storage
+            .cleanup_local_profiles(
+                Uuid::new_v4(),
+                LocalCleanupScope {
+                    host_ids: vec![host.id, other.id],
+                    reset_preferences: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(storage.list_hosts().await.unwrap().is_empty());
+        assert!(
+            storage
+                .local_host_recovery(host.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            storage
+                .local_host_recovery(other.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            storage
+                .get_setting::<String>("dns_hostlists")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_cleanup_rolls_back_preservation_and_deletion_together() {
+        let storage = Storage::in_memory().await.unwrap();
+        let host = host();
+        storage.save_host(&host).await.unwrap();
+        // Inject a failure after the recovery copy but before commit.
+        sqlx::query("CREATE TRIGGER fail_cleanup BEFORE DELETE ON docker_hosts BEGIN SELECT RAISE(ABORT, 'injected cleanup failure'); END")
+            .execute(&storage.pool).await.unwrap();
+        let operation = Uuid::new_v4();
+        let scope = LocalCleanupScope {
+            host_ids: vec![host.id],
+            reset_preferences: true,
+        };
+        assert!(
+            storage
+                .cleanup_local_profiles(operation, scope.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(storage.get_host(host.id).await.unwrap(), host);
+        assert!(
+            storage
+                .local_host_recovery(host.id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        sqlx::query("DROP TRIGGER fail_cleanup")
+            .execute(&storage.pool)
+            .await
+            .unwrap();
+        storage
+            .cleanup_local_profiles(operation, scope)
+            .await
+            .unwrap();
+        assert!(
+            storage
+                .local_host_recovery(host.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_cleanup_is_durable_after_database_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("cleanup.sqlite");
+        let storage = Storage::open(&path).await.unwrap();
+        let host = host();
+        storage.save_host(&host).await.unwrap();
+        storage
+            .set_setting("dns_hostlists", &"preference")
+            .await
+            .unwrap();
+        let operation = Uuid::new_v4();
+        let scope = LocalCleanupScope {
+            host_ids: vec![host.id],
+            reset_preferences: true,
+        };
+        storage
+            .cleanup_local_profiles(operation, scope.clone())
+            .await
+            .unwrap();
+        storage.pool.close().await;
+        let reopened = Storage::open(&path).await.unwrap();
+        reopened
+            .cleanup_local_profiles(operation, scope)
+            .await
+            .unwrap();
+        assert!(reopened.list_hosts().await.unwrap().is_empty());
+        assert!(
+            reopened
+                .local_host_recovery(host.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            reopened
+                .get_setting::<String>("dns_hostlists")
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 

@@ -21,6 +21,13 @@ The remote appliance UUID is independent of local SSH connection profiles. VPNCT
 
 SQLite on the client stores connection profiles, local credential bindings, drafts, caches, preferences, and legacy migration bookkeeping. A cached view is labeled with its last successful synchronization time and cannot be saved or deployed while offline. Deleting a local connection or cache does not remove remote instances.
 
+Local host removal preserves VPN configurations and original native credential
+references separately from active profiles, allowing verified reconnection.
+It never deletes SSH key files or exported client configurations and is not
+secure erasure. See [host removal implementation status](docs/host-removal.md)
+for recovery guarantees and the ownership constraints blocking full drop and
+the planned Factory Reset interface.
+
 ## Workflow
 
 1. Add a server connection and verify its SSH host-key fingerprint through an independent trusted channel.

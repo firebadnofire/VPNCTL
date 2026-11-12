@@ -210,6 +210,7 @@ impl ApplicationService {
         }
     }
     pub async fn save_remote_draft(&self, draft: RemoteDraft) -> Result<(), AppError> {
+        let _guard = self.cleanup_guard.read().await;
         self.storage
             .set_setting(
                 &format!(
@@ -655,6 +656,22 @@ impl ApplicationService {
                 });
             }
         }
+        for previous in self
+            .storage
+            .recovered_appliance_identities()
+            .await
+            .map_err(storage_error)?
+        {
+            let previous: ServerIdentity = serde_json::from_value(previous).map_err(|_| validation_error("Retained appliance identity is invalid; inspect local recovery data before reconnecting."))?;
+            if previous.appliance_id == identity.appliance_id
+                && (previous.machine_fingerprint != identity.machine_fingerprint
+                    || previous.ssh_public_key != identity.ssh_public_key)
+            {
+                return Err(validation_error(
+                    "This appliance UUID conflicts with a retained recovery identity. Resolve the machine or SSH identity change before reusing local credentials.",
+                ));
+            }
+        }
         self.storage
             .set_setting(&identity_key(host_id), &identity)
             .await
@@ -668,6 +685,7 @@ impl ApplicationService {
         request_id: Uuid,
         operation: Operation,
     ) -> Result<Reply, AppError> {
+        let _guard = self.cleanup_guard.read().await;
         let identity = self.remote_identity(host_id).await?;
         let (host, trusted, passphrase) = self.trusted_host(host_id).await?;
         let response = self
@@ -1377,7 +1395,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let helper = helper(&dir.path().join("remote"));
         let (a, host_a) = client(helper.clone(), "server", true).await;
-        let (b, host_b) = client(helper, "server", true).await;
+        let (b, host_b) = client(helper.clone(), "server", true).await;
         let created = a
             .create_remote_instance(CreateInstanceInput {
                 host_id: host_a.id,
@@ -1429,13 +1447,72 @@ mod tests {
         a.export_remote_peer(host_a.id, id, peer, &destination)
             .await
             .unwrap();
-        let contents = std::fs::read_to_string(destination).unwrap();
+        let contents = std::fs::read_to_string(&destination).unwrap();
         assert!(contents.contains("PrivateKey = "));
         assert!(contents.contains("PresharedKey = "));
         assert_eq!(
             saved.configuration.dns_records[0].managed_by_device_id,
             Some(peer)
         );
+        a.discover_remote(host_a.id).await.unwrap();
+        a.delete_host(host_a.id).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&destination).unwrap(), contents);
+        let reconnected = DockerHost {
+            id: Uuid::new_v4(),
+            ..host_a
+        };
+        a.storage.save_host(&reconnected).await.unwrap();
+        approve(&a, &reconnected).await;
+        assert_eq!(
+            a.discover_remote(reconnected.id)
+                .await
+                .unwrap()
+                .discovery
+                .instances
+                .len(),
+            1
+        );
+        assert!(
+            a.remote_peer_availability(reconnected.id, id)
+                .await
+                .unwrap()[0]
+                .complete_export_available
+        );
+        a.export_remote_peer(
+            reconnected.id,
+            id,
+            peer,
+            &dir.path().join("reconnected.conf"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("reconnected.conf")).unwrap(),
+            contents
+        );
+        helper
+            .store
+            .remove(
+                &SaveRequest {
+                    compatibility: Compatibility::default(),
+                    appliance_id: helper.appliance_id,
+                    request_id: Uuid::new_v4(),
+                    expected_revision: saved.revision,
+                    configuration: saved.configuration,
+                    secrets: BTreeMap::new(),
+                },
+                true,
+            )
+            .unwrap();
+        assert!(
+            a.discover_remote(reconnected.id)
+                .await
+                .unwrap()
+                .discovery
+                .instances
+                .is_empty()
+        );
+        assert!(helper.store.discover().unwrap().instances.is_empty());
     }
 
     #[tokio::test]
@@ -1460,6 +1537,9 @@ mod tests {
             service.discover_remote(clone.id).await.unwrap_err().code,
             "duplicate_appliance_identity"
         );
+        service.delete_host(host.id).await.unwrap();
+        let error = service.discover_remote(clone.id).await.unwrap_err();
+        assert!(error.message.contains("retained recovery identity"));
     }
 
     #[tokio::test]
