@@ -27,6 +27,7 @@ describe("remote-authoritative desktop workflows", () => {
       switch (command) {
         case "app_info": return { system_username: "tester" };
         case "list_hosts": return [host];
+        case "preview_local_factory_reset": return { host_ids: [host.id], reset_preferences: true };
         case "legacy_candidates": return candidates;
         case "discover_remote": return current;
         case "cached_remote_inventory": case "load_remote_draft": case "save_remote_draft": case "discard_remote_draft": return null;
@@ -35,6 +36,12 @@ describe("remote-authoritative desktop workflows", () => {
       }
     });
   });
+  async function enterDangerZone() {
+    const button = screen.getByRole("button", { name: "Danger Zone" });
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    await fireEvent.click(button);
+    await screen.findByRole("heading", { name: "Danger Zone", level: 1 });
+  }
   it("discovers the selected server and distinguishes an empty inventory", async () => {
     render(App);
     await screen.findByText("No VPN instances configured on this server.");
@@ -270,6 +277,179 @@ describe("remote-authoritative desktop workflows", () => {
     await fireEvent.click(screen.getByRole("button", { name: "Migrate Instances (1)" }));
     expect(screen.getByRole("heading", { name: "Old VPN" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Preview migration" })).toBeTruthy();
+  });
+  it("exposes Danger Zone even without a host and explains unavailable remote modes", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "list_hosts" ? [] : base(command, args));
+    render(App);
+    await screen.findByText("Connect your first VPN server");
+    await enterDangerZone();
+    expect(screen.getByRole("button", { name: "Danger Zone" }).getAttribute("aria-current")).toBe("page");
+    expect((screen.getByRole("button", { name: "Remove host locally" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Factory Reset local data" }) as HTMLButtonElement).disabled).toBe(false);
+    expect((screen.getByRole("button", { name: "Full drop unavailable" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Remote Factory Reset unavailable" }) as HTMLButtonElement).disabled).toBe(true);
+    expect(screen.getByText(/Factory Reset is not secure erasure/)).toBeTruthy();
+  });
+  it("allows offline local removal and never invokes cleanup after cancellation", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "discover_remote") return Promise.reject({ code: "offline", message: "Server offline" });
+      if (command === "cached_remote_inventory") return { ...inventory([manifest()]), cached: true };
+      return base(command, args);
+    });
+    confirm.mockResolvedValue(false);
+    render(App);
+    await screen.findByText(/Offline · showing cached information/);
+    await enterDangerZone();
+    expect((screen.getByRole("button", { name: "Archive instance on server" }) as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("button", { name: "Remove host locally" }) as HTMLButtonElement).disabled).toBe(false);
+    await fireEvent.click(screen.getByRole("button", { name: "Remove host locally" }));
+    await waitFor(() => expect(confirm).toHaveBeenCalledOnce());
+    expect(invoke.mock.calls.some(([command]) => command === "cleanup_local")).toBe(false);
+    expect(screen.getByLabelText("Danger Zone host")).toBeTruthy();
+  });
+  it("removes local host state through the shared coordinator and stays in Danger Zone", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "cleanup_local" ? {} : base(command, args));
+    render(App);
+    await screen.findByText("No VPN instances configured on this server.");
+    await enterDangerZone();
+    await fireEvent.click(screen.getByRole("button", { name: "Remove host locally" }));
+    await screen.findByText("Host removed locally. VPN recovery data is preserved; server instances keep running.");
+    expect(invoke).toHaveBeenCalledWith("cleanup_local", { operationId: expect.any(String), hostIds: [host.id], resetPreferences: false, confirmed: true });
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("SSH key files and exported VPN configurations are untouched"), expect.objectContaining({ title: "Local drop" }));
+    expect(screen.queryByLabelText("Danger Zone host")).toBeNull();
+    expect(screen.getByRole("heading", { name: "Danger Zone", level: 1 })).toBeTruthy();
+    expect(invoke.mock.calls.some(([command]) => ["remove_remote_configuration", "revoke_remote_peer"].includes(command))).toBe(false);
+  });
+  it("retains a failed local cleanup scope and reuses its operation ID on retry", async () => {
+    const base = invoke.getMockImplementation()!;
+    let fail = true;
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "cleanup_local") return fail ? Promise.reject({ code: "locked", message: "Recovery credential unavailable" }) : {};
+      return base(command, args);
+    });
+    render(App);
+    await screen.findByText("No VPN instances configured on this server.");
+    await enterDangerZone();
+    await fireEvent.click(screen.getByRole("button", { name: "Remove host locally" }));
+    await screen.findByText("Recovery credential unavailable");
+    expect(screen.getByLabelText("Danger Zone host")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Factory Reset local data" }) as HTMLButtonElement).disabled).toBe(true);
+    fail = false;
+    await fireEvent.click(screen.getByRole("button", { name: "Retry local drop" }));
+    await screen.findByText("Host removed locally. VPN recovery data is preserved; server instances keep running.");
+    const calls = invoke.mock.calls.filter(([command]) => command === "cleanup_local");
+    expect(calls).toHaveLength(2);
+    expect(calls[1][1]).toEqual(calls[0][1]);
+  });
+  it("drains and cancels draft saves before entering Danger Zone and removing a host", async () => {
+    current = inventory([manifest()]);
+    const base = invoke.getMockImplementation()!;
+    let releaseDraft: (() => void) | undefined;
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "save_remote_draft") return new Promise<void>((resolve) => { releaseDraft = resolve; });
+      if (command === "cleanup_local") return {};
+      return base(command, args);
+    });
+    render(App);
+    await screen.findByText("Remote WG");
+    await fireEvent.click(screen.getByRole("button", { name: /Remote WG.*WireGuard/ }));
+    await waitFor(() => expect(screen.queryByText(/Checking local export material/)).toBeNull());
+    await fireEvent.click(screen.getByRole("tab", { name: "Settings" }));
+    await fireEvent.input(screen.getByLabelText("Instance name"), { target: { value: "Retained edit" } });
+    await screen.findByText(/Unsaved local edits/);
+    await fireEvent.click(screen.getByRole("button", { name: "Danger Zone" }));
+    await waitFor(() => expect(releaseDraft).toBeTypeOf("function"));
+    expect(screen.queryByRole("heading", { name: "Danger Zone", level: 1 })).toBeNull();
+    expect(invoke.mock.calls.some(([command]) => command === "cleanup_local")).toBe(false);
+    releaseDraft!();
+    await screen.findByRole("heading", { name: "Danger Zone", level: 1 });
+    await fireEvent.click(screen.getByRole("button", { name: "Remove host locally" }));
+    await screen.findByText("Host removed locally. VPN recovery data is preserved; server instances keep running.");
+    await new Promise((resolve) => setTimeout(resolve, 350));
+    expect(invoke.mock.calls.filter(([command]) => command === "save_remote_draft")).toHaveLength(1);
+  });
+  it("confirms local Factory Reset across all saved profiles including older hidden ones", async () => {
+    const base = invoke.getMockImplementation()!;
+    const other = { ...host, id: "host-2", display_name: "Backup" };
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "list_hosts") return [host];
+      if (command === "preview_local_factory_reset") return { host_ids: [host.id, other.id], reset_preferences: true };
+      return command === "cleanup_local" ? {} : base(command, args);
+    });
+    render(App);
+    await screen.findByText("No VPN instances configured on this server.");
+    await enterDangerZone();
+    await fireEvent.click(screen.getByRole("button", { name: "Factory Reset local data" }));
+    await screen.findByText("Local Factory Reset completed. VPN recovery data is preserved; servers are unchanged.");
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("all 2 saved hosts"), expect.objectContaining({ title: "Factory Reset · local data only" }));
+    expect(invoke).toHaveBeenCalledWith("cleanup_local", expect.objectContaining({ hostIds: [host.id, other.id], resetPreferences: true, confirmed: true }));
+    expect(screen.queryByLabelText("Danger Zone host")).toBeNull();
+  });
+  it("blocks Factory Reset if its local scope cannot be read", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "preview_local_factory_reset" ? Promise.reject({ code: "storage", message: "Cannot inspect saved profiles" }) : base(command, args));
+    render(App);
+    await screen.findByText("No VPN instances configured on this server.");
+    await enterDangerZone();
+    await fireEvent.click(screen.getByRole("button", { name: "Factory Reset local data" }));
+    await screen.findByText("Cannot inspect saved profiles");
+    expect(confirm).not.toHaveBeenCalled();
+    expect(invoke.mock.calls.some(([command]) => command === "cleanup_local")).toBe(false);
+    expect(screen.getByLabelText("Danger Zone host")).toBeTruthy();
+  });
+  it("archives only the chosen instance using a freshly read revision", async () => {
+    const original = manifest();
+    const fresh = { ...original, revision: 9 };
+    current = inventory([original]);
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "read_remote") return fresh;
+      if (command === "remove_remote_configuration") { current = inventory(); return { ...fresh, removed: true }; }
+      return base(command, args);
+    });
+    render(App);
+    await screen.findByText("Remote WG");
+    await enterDangerZone();
+    await fireEvent.click(screen.getByRole("button", { name: "Archive instance on server" }));
+    await screen.findByText("Instance archived on server. History and recovery data are retained.");
+    expect(invoke).toHaveBeenCalledWith("remove_remote_configuration", { input: { host_id: host.id, expected_revision: 9, request_id: expect.any(String), configuration: fresh.configuration }, confirmed: true });
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("Connected VPN users will lose service"), expect.anything());
+    await screen.findByText("No managed instances available.");
+  });
+  it("does not archive an instance when its confirmation is cancelled", async () => {
+    current = inventory([manifest()]);
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "read_remote" ? manifest() : base(command, args));
+    confirm.mockResolvedValue(false);
+    render(App);
+    await screen.findByText("Remote WG");
+    await enterDangerZone();
+    await fireEvent.click(screen.getByRole("button", { name: "Archive instance on server" }));
+    await waitFor(() => expect(confirm).toHaveBeenCalledOnce());
+    expect(invoke.mock.calls.some(([command]) => command === "remove_remote_configuration")).toBe(false);
+  });
+  it("revokes a selected certificate in Danger Zone without removing its local keys", async () => {
+    const vpn = manifest();
+    vpn.configuration.instance.backend = "openvpn";
+    vpn.configuration.peers = [{ id: "peer-1", display_name: "Phone", enabled: true, user_id: null, ipv4_address: null, ipv6_address: null, dns_name: null, created_at: vpn.saved_at, identity: { backend: "openvpn", common_name: "phone", certificate_serial: "01" } }];
+    current = inventory([vpn]);
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "read_remote") return { ...vpn, revision: 7 };
+      if (command === "revoke_remote_peer") { current = inventory([{ ...vpn, configuration: { ...vpn.configuration, peers: [{ ...vpn.configuration.peers[0], enabled: false }] } }]); return current.discovery.instances[0]; }
+      return base(command, args);
+    });
+    render(App);
+    await screen.findByText("Remote WG");
+    await enterDangerZone();
+    await fireEvent.click(screen.getByRole("button", { name: "Revoke device certificate" }));
+    await screen.findByText("Certificate revoked in saved configuration. Deploy the instance to apply the revocation.");
+    expect(invoke).toHaveBeenCalledWith("revoke_remote_peer", { hostId: host.id, instanceId: vpn.configuration.instance.id, peerId: "peer-1", expectedRevision: 7, confirmed: true });
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("Local client keys are preserved"), expect.anything());
+    expect(invoke.mock.calls.some(([command]) => command === "cleanup_local")).toBe(false);
   });
   it("offers only four supported backends for creation", async () => {
     render(App);

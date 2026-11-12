@@ -51,6 +51,39 @@ async fn delete_host(state: State<'_, AppState>, host_id: Uuid) -> Result<(), Ap
 }
 
 #[tauri::command]
+async fn preview_local_factory_reset(
+    state: State<'_, AppState>,
+) -> Result<vam_storage::LocalCleanupScope, AppError> {
+    state.0.preview_local_factory_reset().await
+}
+
+#[tauri::command]
+async fn cleanup_local(
+    state: State<'_, AppState>,
+    operation_id: Uuid,
+    host_ids: Vec<Uuid>,
+    reset_preferences: bool,
+    confirmed: bool,
+) -> Result<vam_application::LocalCleanupResult, AppError> {
+    if !confirmed {
+        return Err(AppError::new(
+            "confirmation_required",
+            "Confirm local removal before continuing.",
+        ));
+    }
+    state
+        .0
+        .cleanup_local(
+            operation_id,
+            vam_storage::LocalCleanupScope {
+                host_ids,
+                reset_preferences,
+            },
+        )
+        .await
+}
+
+#[tauri::command]
 async fn probe_host_key(
     state: State<'_, AppState>,
     host_id: Uuid,
@@ -171,6 +204,8 @@ pub fn run() {
             update_host,
             list_hosts,
             delete_host,
+            cleanup_local,
+            preview_local_factory_reset,
             probe_host_key,
             approve_host_key,
             inspect_host,

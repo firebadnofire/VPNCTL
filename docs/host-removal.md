@@ -30,6 +30,14 @@ saved profiles and current preferences. An incomplete reset scope is rejected.
 This is not secure erasure: recovery configurations and native credentials
 intentionally survive.
 
+The desktop **Danger Zone** navigation page exposes confirmed local host
+removal and local Factory Reset. It also centralizes the existing individual
+instance archive and certificate revocation actions. Local cleanup works
+offline; remote instance/device actions require a live connection and re-read
+the authoritative revision before confirmation. A failed local cleanup retains
+its original operation ID for retry. Full drop and remote Factory Reset are
+shown as unavailable rather than falling back to a different operation.
+
 Reconnection requires fresh SSH verification and agreement with the retained
 appliance identity. A new connection to the same verified appliance can export
 existing peers using the original client keys. Discovery never recreates absent
@@ -38,8 +46,8 @@ server-only secrets.
 
 ## Blocked: destructive server cleanup
 
-Full drop, remote Factory Reset, recovery archive orchestration, and the new
-desktop controls are not implemented. No remote cleanup operation or reservation
+Full drop, remote Factory Reset, and recovery archive orchestration are not
+implemented. No remote cleanup operation or reservation
 is exposed. Existing individual instance removal retains its established
 behavior.
 

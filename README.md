@@ -26,7 +26,8 @@ references separately from active profiles, allowing verified reconnection.
 It never deletes SSH key files or exported client configurations and is not
 secure erasure. See [host removal implementation status](docs/host-removal.md)
 for recovery guarantees and the ownership constraints blocking full drop and
-the planned Factory Reset interface.
+remote Factory Reset. The desktop **Danger Zone** page contains local host
+removal, local Factory Reset, instance archiving, and certificate revocation.
 
 ## Workflow
 

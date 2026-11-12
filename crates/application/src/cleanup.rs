@@ -16,6 +16,23 @@ pub struct LocalCleanupResult {
 }
 
 impl ApplicationService {
+    /// Include profiles hidden by older versions as well as active connections.
+    /// The transaction rechecks this scope before resetting preferences.
+    pub async fn preview_local_factory_reset(&self) -> Result<LocalCleanupScope, AppError> {
+        let _guard = self.cleanup_guard.read().await;
+        Ok(LocalCleanupScope {
+            host_ids: self
+                .storage
+                .list_hosts()
+                .await
+                .map_err(storage_error)?
+                .into_iter()
+                .map(|host| host.id)
+                .collect(),
+            reset_preferences: true,
+        })
+    }
+
     pub async fn cleanup_local(
         &self,
         operation_id: Uuid,
@@ -84,6 +101,43 @@ mod tests {
     use vam_core::{DockerHost, SecretReference, SshConnectionConfig};
     use vam_secrets::{MemorySecretStore, SecretStore};
     use vam_storage::Storage;
+
+    #[tokio::test]
+    async fn local_reset_preview_includes_profiles_hidden_by_older_versions() {
+        let service = ApplicationService::new(
+            Storage::in_memory().await.unwrap(),
+            Arc::new(MemorySecretStore::default()),
+        );
+        let host = service
+            .create_host(super::super::CreateHostInput {
+                display_name: "hidden profile".into(),
+                hostname: "offline.invalid".into(),
+                port: 22,
+                username: "test".into(),
+                private_key_path: "/untouched".into(),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        service
+            .storage
+            .set_setting(&format!("archived_host_profile:{}", host.id), &true)
+            .await
+            .unwrap();
+        assert!(service.list_hosts().await.unwrap().is_empty());
+        let scope = service.preview_local_factory_reset().await.unwrap();
+        assert_eq!(scope.host_ids, vec![host.id]);
+        assert!(scope.reset_preferences);
+        service.cleanup_local(Uuid::new_v4(), scope).await.unwrap();
+        assert!(
+            service
+                .storage
+                .local_host_recovery(host.id)
+                .await
+                .unwrap()
+                .is_some()
+        );
+    }
 
     #[tokio::test]
     async fn local_cleanup_preserves_native_credentials_and_user_files() {

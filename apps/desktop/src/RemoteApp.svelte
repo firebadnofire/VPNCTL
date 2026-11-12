@@ -51,7 +51,11 @@
   let dnsValue = "";
   let dnsType = "A";
   let hostForm = { display_name: "", hostname: "", username: "", port: 22, private_key_path: "", passphrase: "" };
+  let defaultUsername = "";
   let draftTimer: ReturnType<typeof setTimeout> | undefined;
+  let dangerInstanceId = "";
+  let dangerPeerId = "";
+  let pendingCleanup: { operationId: string; hostIds: string[]; resetPreferences: boolean } | null = null;
   onDestroy(() => clearTimeout(draftTimer));
   function scheduleDraft() { clearTimeout(draftTimer); draftTimer = setTimeout(() => { void retainDraft(); }, 300); }
   $: host = hosts.find((item) => item.id === selectedHostId);
@@ -68,6 +72,9 @@
   $: certificateAuthorityReady = !certificateBackend || observation?.deployed_revision != null;
   $: BackendForm = backendForms[instanceForm.backend];
   $: SettingsBackendForm = backendForms[settingsForm.backend];
+  $: dangerInstance = inventory?.discovery.instances.find((item) => item.configuration.instance.id === dangerInstanceId) ?? inventory?.discovery.instances[0] ?? null;
+  $: dangerPeers = dangerInstance && ["openvpn", "ikev2"].includes(dangerInstance.configuration.instance.backend) ? dangerInstance.configuration.peers.filter((peer) => peer.enabled) : [];
+  $: dangerPeer = dangerPeers.find((peer) => peer.id === dangerPeerId) ?? dangerPeers[0] ?? null;
   const copy = <T,>(value: T): T => JSON.parse(JSON.stringify(value));
   const nameOf = (kind: VpnBackendKind) => backends.find((backend) => backend.kind === kind)?.name ?? "Unsupported backend";
 
@@ -80,15 +87,16 @@
   onMount(async () => {
     await task("Loading saved servers", async () => {
       const [savedHosts, legacy, info] = await Promise.all([call<DockerHost[]>("list_hosts"), call<LegacyCandidate[]>("legacy_candidates"), call<{ system_username: string }>("app_info")]);
-      hosts = savedHosts; candidates = legacy; hostForm.username = info.system_username;
+      hosts = savedHosts; candidates = legacy; defaultUsername = info.system_username; hostForm.username = defaultUsername;
     });
     if (hosts.length) await selectServer(hosts[0].id);
     initialized = true;
   });
-  async function selectServer(id: string) {
+  async function selectServer(id: string, section = "Overview") {
     if (dirty && !(await retainDraft())) return;
     selectedHostId = id; selected = null; draft = null; inventory = null; inspection = null; probe = null;
-    plan = null; health = null; backups = []; restorePreview = null; page = "server"; serverTab = "Overview"; await refreshServer();
+    dangerInstanceId = ""; dangerPeerId = "";
+    plan = null; health = null; backups = []; restorePreview = null; page = "server"; serverTab = section; await refreshServer();
   }
   async function navigateSection(section: string) {
     if (dirty && !(await retainDraft())) return;
@@ -208,15 +216,69 @@
     const destination = await save({ title: "Export complete client configuration", defaultPath: extension });
     if (destination) await task("Exporting through native credential storage", () => call<void>("export_remote_peer", { hostId: selectedHostId, instanceId: selected!.configuration.instance.id, peerId, destination }));
   }
-  async function revokePeer(peerId: string, peerName: string) {
-    if (!selected || dirty || !await confirm("Revoke the certificate for " + peerName + "? This cannot be reversed. Deployment is still required to apply the revocation.", { title: "Revoke peer certificate", kind: "warning" })) return;
-    const saved = await task("Revoking peer certificate", () => call<Manifest>("revoke_remote_peer", { hostId: selectedHostId, instanceId: selected!.configuration.instance.id, peerId, expectedRevision: baseRevision, confirmed: true }));
-    if (saved) { selected = null; draft = null; await refreshServer(); await openInstance(saved); tab = "Peers / Devices"; }
+  async function openDangerZone(instanceId?: string, peerId?: string) {
+    await navigateSection("Danger Zone");
+    if (serverTab === "Danger Zone") { dangerInstanceId = instanceId ?? ""; dangerPeerId = peerId ?? ""; }
   }
-  async function removeInstance() {
-    if (!selected || dirty || !await confirm("Stop and archive this instance on " + host?.display_name + "? Its saved history and recovery backup will be retained.", { title: "Remove instance", kind: "warning" })) return;
-    const removed = await task("Archiving instance", () => call<Manifest>("remove_remote_configuration", { input: { host_id: selectedHostId, expected_revision: baseRevision, request_id: crypto.randomUUID(), configuration: selected!.configuration }, confirmed: true }));
-    if (removed) { selected = null; draft = null; plan = null; notice = "Instance archived on server."; await refreshServer(); }
+  async function cleanupLocal(resetPreferences: boolean) {
+    if (busy || (!resetPreferences && !host)) return;
+    if (pendingCleanup && pendingCleanup.resetPreferences !== resetPreferences) return;
+    const completed = await task(resetPreferences ? "Resetting local application data" : "Removing local host", async () => {
+      const scope = resetPreferences && !pendingCleanup ? await call<{ host_ids: string[] }>("preview_local_factory_reset") : null;
+      const target = pendingCleanup ?? { operationId: crypto.randomUUID(), hostIds: scope?.host_ids ?? [selectedHostId], resetPreferences };
+      const targetName = hosts.find((item) => item.id === target.hostIds[0])?.display_name ?? "the selected host";
+      const message = resetPreferences
+        ? `Reset local data for all ${target.hostIds.length} saved hosts and restore application preferences to defaults? Server instances keep running. VPN configurations, client keys, and recovery bindings are preserved. SSH key files and exported VPN configurations are untouched. This is not secure erasure.`
+        : `Remove ${targetName} from this machine? Its connection, cache, and drafts will be removed. Server instances keep running. VPN configurations, client keys, and recovery bindings are preserved for verified reconnection. SSH key files and exported VPN configurations are untouched.`;
+      if (!await confirm(message, { title: resetPreferences ? "Factory Reset · local data only" : "Local drop", kind: "warning" })) return false;
+      clearTimeout(draftTimer);
+      pendingCleanup = target;
+      await call("cleanup_local", { ...target, confirmed: true });
+      pendingCleanup = null;
+      hosts = hosts.filter((item) => !target.hostIds.includes(item.id));
+      candidates = candidates.filter((item) => !target.hostIds.includes(item.host_id));
+      selectedHostId = ""; inventory = null; selected = null; draft = null; inspection = null; probe = null;
+      plan = null; health = null; backups = []; restorePreview = null; availability = []; history = []; runtimeHistory = [];
+      dangerInstanceId = ""; dangerPeerId = ""; connection = "disconnected";
+      if (resetPreferences) {
+        instanceForm = newInstanceForm(); settingsForm = newInstanceForm();
+        hostForm = { display_name: "", hostname: "", username: defaultUsername, port: 22, private_key_path: "", passphrase: "" };
+        peerName = ""; peerDns = ""; dnsName = ""; dnsValue = ""; dnsType = "A";
+        fingerprint = ""; replaceChanged = false; migrationPreview = null; migrationDestination = "";
+      }
+      return true;
+    });
+    if (completed) {
+      notice = resetPreferences ? "Local Factory Reset completed. VPN recovery data is preserved; servers are unchanged." : "Host removed locally. VPN recovery data is preserved; server instances keep running.";
+      if (hosts.length) await selectServer(hosts[0].id, "Danger Zone");
+    }
+  }
+  async function archiveDangerInstance() {
+    if (busy || !online || !dangerInstance || pendingCleanup) return;
+    const hostId = selectedHostId;
+    const instanceId = dangerInstance.configuration.instance.id;
+    const completed = await task("Archiving instance", async () => {
+      const fresh = await call<Manifest>("read_remote", { hostId, instanceId });
+      if (!await confirm(`Stop and archive ${fresh.configuration.instance.display_name} on ${host?.display_name}? Connected VPN users will lose service. Saved history, server recovery data, and local client keys are retained. Local drafts are not applied.`, { title: "Archive instance on server", kind: "warning" })) return false;
+      await call("remove_remote_configuration", { input: { host_id: hostId, expected_revision: fresh.revision, request_id: crypto.randomUUID(), configuration: fresh.configuration }, confirmed: true });
+      return true;
+    });
+    if (completed) { notice = "Instance archived on server. History and recovery data are retained."; await refreshServer(); }
+  }
+  async function revokeDangerPeer() {
+    if (busy || !online || !dangerInstance || !dangerPeer || pendingCleanup) return;
+    const hostId = selectedHostId;
+    const instanceId = dangerInstance.configuration.instance.id;
+    const peerId = dangerPeer.id;
+    const completed = await task("Revoking peer certificate", async () => {
+      const fresh = await call<Manifest>("read_remote", { hostId, instanceId });
+      const peer = fresh.configuration.peers.find((item) => item.id === peerId && item.enabled);
+      if (!peer) throw { code: "peer_changed", message: "This device changed on the server. Refresh before revoking its certificate." };
+      if (!await confirm(`Revoke the certificate for ${peer.display_name} in ${fresh.configuration.instance.display_name} on ${host?.display_name}? This cannot be reversed. Deployment is still required to apply the revocation. Local client keys are preserved.`, { title: "Revoke peer certificate", kind: "warning" })) return false;
+      await call("revoke_remote_peer", { hostId, instanceId, peerId, expectedRevision: fresh.revision, confirmed: true });
+      return true;
+    });
+    if (completed) { notice = "Certificate revoked in saved configuration. Deploy the instance to apply the revocation."; await refreshServer(); }
   }
   function addDns() {
     if (!draft) return;
@@ -319,6 +381,7 @@
       <button disabled={Boolean(busy)} class:active={page === "server" && serverTab === "DNS"} aria-current={page === "server" && serverTab === "DNS" ? "page" : undefined} onclick={() => navigateSection("DNS")}><svg class="nav-glyph" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg><span class="nav-label">DNS</span></button>
       <button disabled={Boolean(busy)} class:active={page === "server" && serverTab === "Backups"} aria-current={page === "server" && serverTab === "Backups" ? "page" : undefined} onclick={() => navigateSection("Backups")}><svg class="nav-glyph" viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14c0 1.7 4 3 9 3s9-1.3 9-3V5M3 12c0 1.7 4 3 9 3s9-1.3 9-3"/></svg><span class="nav-label">Backups</span></button>
       <button disabled={Boolean(busy)} class:active={page === "server" && serverTab === "Logs"} aria-current={page === "server" && serverTab === "Logs" ? "page" : undefined} onclick={() => navigateSection("Logs")}><svg class="nav-glyph" viewBox="0 0 24 24" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6Z"/><path d="M14 2v6h6M8 13h8M8 17h8"/></svg><span class="nav-label">Logs</span></button>
+      <button disabled={Boolean(busy)} class="danger-nav" class:active={page === "server" && serverTab === "Danger Zone"} aria-label="Danger Zone" aria-current={page === "server" && serverTab === "Danger Zone" ? "page" : undefined} onclick={() => navigateSection("Danger Zone")}><svg class="nav-glyph" viewBox="0 0 24 24" aria-hidden="true"><path d="m12 3 10 18H2L12 3Z"/><path d="M12 9v5m0 3v1"/></svg><span class="nav-label">Danger Zone</span></button>
     </nav>
     {#if showMigrationUI}<button class="sidebar-migration" disabled={!initialized || Boolean(busy)} onclick={() => { page = "migration"; migrationDestination = selectedHostId; }}>Migrate Instances ({eligibleLocalLegacyInstances.length})</button>{/if}
   </aside>
@@ -328,7 +391,27 @@
     {#if busy}<div class="progress" role="status">{busy}…</div>{/if}
     {#if notice}<div class="notice" role="status"><span>{notice}</span><button aria-label="Dismiss notice" onclick={() => notice = ""}>×</button></div>{/if}
     {#if error}<div class="alert" role="alert"><div><strong>{error.message}</strong>{#if error.remediation}<p>{error.remediation}</p>{/if}{#if error.code === "revision_conflict"}<p>Your local draft is retained. Reload after reviewing the server’s changes.</p>{/if}</div><button aria-label="Dismiss error" onclick={() => error = null}>×</button></div>{/if}
-    {#if page === "add-server"}
+    {#if page === "server" && serverTab === "Danger Zone"}
+      <header class="page-head"><div><p class="eyebrow">Workspace / Destructive actions</p><h1>Danger Zone</h1><p class="subtitle">Remove local connections, reset the client, or archive a server instance. Every action requires confirmation.</p></div></header>
+      <div class="danger-zone">
+        <section class="card danger-preservation"><h2>Recovery data stays protected</h2><p>Local removal and reset preserve VPN configurations, generated client keys, and recovery bindings. SSH key files and exported VPN configurations are never deleted. Factory Reset is not secure erasure.</p></section>
+        {#if pendingCleanup}<div class="alert" role="status">A local cleanup needs reconciliation. Retry the same action to check its original operation; its host selection will not change.</div>{/if}
+        {#if hosts.length}<section class="card"><label>Danger Zone host<select value={selectedHostId} disabled={Boolean(busy) || Boolean(pendingCleanup)} onchange={(event) => selectServer(event.currentTarget.value, "Danger Zone")}>{#each hosts as server}<option value={server.id}>{server.display_name} · {server.ssh.username}@{server.ssh.hostname}:{server.ssh.port}</option>{/each}</select></label><p>Remote actions affect this host only. Factory Reset applies to all saved hosts.</p></section>{/if}
+        <section class="card danger-row"><div><h2>Local drop</h2><p>Remove {host?.display_name ?? "the selected host"} from this machine, including its connection, cache, and drafts. Server instances keep running. Reconnect to the verified appliance to access them again.</p></div><button class="danger-action" disabled={!initialized || !host || Boolean(busy) || (Boolean(pendingCleanup) && pendingCleanup?.resetPreferences !== false)} onclick={() => cleanupLocal(false)}>{pendingCleanup && !pendingCleanup.resetPreferences ? "Retry local drop" : "Remove host locally"}</button></section>
+        <section class="card danger-row"><div><h2>Full drop</h2><p>Would permanently remove all current VPNCTL-managed instances from this server, then remove the local connection.</p><p id="full-drop-unavailable">Unavailable: safe server ownership checks and recovery archives are not ready. No full-server deletion will run.</p></div><button class="danger-action" disabled aria-describedby="full-drop-unavailable">Full drop unavailable</button></section>
+        <section class="card danger-row"><div><h2>Factory Reset · local data only</h2><p>Remove all saved host profiles, connection state, caches, and drafts, and reset application preferences. You will confirm the full profile count before continuing. Servers remain unchanged; VPN recovery data survives.</p></div><button class="danger-action" disabled={!initialized || Boolean(busy) || (Boolean(pendingCleanup) && pendingCleanup?.resetPreferences !== true)} onclick={() => cleanupLocal(true)}>{pendingCleanup?.resetPreferences ? "Retry local Factory Reset" : "Factory Reset local data"}</button></section>
+        <section class="card danger-row"><div><h2>Factory Reset · remove remote data</h2><p>Would clean each distinct verified saved appliance before resetting the client.</p><p id="remote-reset-unavailable">Unavailable for the same server ownership and archive requirements as full drop.</p></div><button class="danger-action" disabled aria-describedby="remote-reset-unavailable">Remote Factory Reset unavailable</button></section>
+        <section class="card"><h2>Instance and device actions</h2>
+          {#if !host}<p>Add a host to manage its instances.</p>{:else}
+            <p>{host.display_name} · {online ? "Live connection" : "Remote actions require a live connection."}</p>
+            <button class="secondary" disabled={Boolean(busy) || Boolean(pendingCleanup)} onclick={refreshServer}>Refresh / Reconnect</button>
+            {#if inventory?.discovery.instances.length}<label>Managed instance<select value={dangerInstance?.configuration.instance.id ?? ""} disabled={Boolean(busy) || Boolean(pendingCleanup)} onchange={(event) => { dangerInstanceId = event.currentTarget.value; dangerPeerId = ""; }}>{#each inventory.discovery.instances as item}<option value={item.configuration.instance.id}>{item.configuration.instance.display_name}</option>{/each}</select></label>{:else}<p>{online ? "No managed instances available." : "Connect to load the server inventory."}</p>{/if}
+            <div class="danger-row"><div><h3>Archive instance on server</h3><p>Stop the selected VPN instance and disconnect its users. Saved history and server recovery data are retained. This does not permanently erase the instance.</p></div><button class="danger-action" disabled={!online || !dangerInstance || Boolean(busy) || Boolean(pendingCleanup)} onclick={archiveDangerInstance}>Archive instance on server</button></div>
+            {#if dangerPeers.length}<label>Device certificate<select value={dangerPeer?.id ?? ""} disabled={Boolean(busy) || Boolean(pendingCleanup)} onchange={(event) => dangerPeerId = event.currentTarget.value}>{#each dangerPeers as peer}<option value={peer.id}>{peer.display_name}</option>{/each}</select></label><div class="danger-row"><div><h3>Revoke device certificate</h3><p>Revocation cannot be reversed. Deploy the instance afterward to apply it. Local client keys are preserved.</p></div><button class="danger-action" disabled={!online || !dangerPeer || Boolean(busy) || Boolean(pendingCleanup)} onclick={revokeDangerPeer}>Revoke device certificate</button></div>{/if}
+          {/if}
+        </section>
+      </div>
+    {:else if page === "add-server"}
       <header class="page-head"><div><p class="eyebrow">Server connection</p><h1>Add Server</h1><p class="subtitle">Connect a Linux appliance using a verified SSH identity.</p></div></header>
       <form class="card remote-form setup-form" onsubmit={(event) => { event.preventDefault(); void addServer(); }}>
         <label>Server name<input required bind:value={hostForm.display_name} /></label><label>SSH hostname<input required bind:value={hostForm.hostname} /></label>
@@ -374,7 +457,7 @@
           {#if tab === "Overview"}<h3>Remote configuration</h3><dl class="overview-facts"><div><dt>Owning server</dt><dd>{host.display_name}</dd></div><div><dt>Endpoint</dt><dd>{draft.instance.endpoint.host}:{draft.instance.endpoint.port}</dd></div><div><dt>Peers / devices</dt><dd>{draft.peers.length}</dd></div><div><dt>Network</dt><dd>{draft.instance.network.ipv4_subnet}</dd></div><div><dt>Last saved</dt><dd>{new Date(selected.saved_at).toLocaleString()}</dd></div></dl>
           {:else if tab === "Peers / Devices"}
             <div class="table-wrap">
-            <table><thead><tr><th>Name</th><th>Address</th><th>State</th><th>Local export</th><th>Action</th></tr></thead><tbody>{#each draft.peers as peer}<tr><td><input aria-label={"Peer name " + peer.display_name} bind:value={peer.display_name} /></td><td>{peer.ipv4_address}</td><td>{#if draft.instance.backend === "openvpn" || draft.instance.backend === "ikev2"}{peer.enabled ? "Active" : "Revoked"}{:else}<input aria-label={"Enable " + peer.display_name} type="checkbox" bind:checked={peer.enabled} />{/if}</td><td><button class="secondary" disabled={!online || dirty || !availability.find((item) => item.peer_id === peer.id)?.complete_export_available} onclick={() => exportPeer(peer.id)}>Export configuration</button>{#if !availability.find((item) => item.peer_id === peer.id)?.complete_export_available}<p>Private material unavailable on this client</p>{/if}</td><td>{#if (draft.instance.backend === "openvpn" || draft.instance.backend === "ikev2") && peer.enabled}<button class="secondary" disabled={!online || dirty || Boolean(busy)} onclick={() => revokePeer(peer.id, peer.display_name)}>Revoke certificate</button>{/if}</td></tr>{/each}</tbody></table>
+            <table><thead><tr><th>Name</th><th>Address</th><th>State</th><th>Local export</th><th>Action</th></tr></thead><tbody>{#each draft.peers as peer}<tr><td><input aria-label={"Peer name " + peer.display_name} bind:value={peer.display_name} /></td><td>{peer.ipv4_address}</td><td>{#if draft.instance.backend === "openvpn" || draft.instance.backend === "ikev2"}{peer.enabled ? "Active" : "Revoked"}{:else}<input aria-label={"Enable " + peer.display_name} type="checkbox" bind:checked={peer.enabled} />{/if}</td><td><button class="secondary" disabled={!online || dirty || !availability.find((item) => item.peer_id === peer.id)?.complete_export_available} onclick={() => exportPeer(peer.id)}>Export configuration</button>{#if !availability.find((item) => item.peer_id === peer.id)?.complete_export_available}<p>Private material unavailable on this client</p>{/if}</td><td>{#if (draft.instance.backend === "openvpn" || draft.instance.backend === "ikev2") && peer.enabled}<button class="secondary" disabled={Boolean(busy)} onclick={() => openDangerZone(draft!.instance.id, peer.id)}>Revoke in Danger Zone</button>{/if}</td></tr>{/each}</tbody></table>
             </div>
             <form class="remote-form" onsubmit={(event) => { event.preventDefault(); void addPeer(); }}><h3>Add peer / device</h3><label>Peer name<input required bind:value={peerName} /></label><label>DNS name (optional)<input bind:value={peerDns} /></label><p>Save or discard existing edits before creating a peer.</p>{#if !certificateAuthorityReady}<p>Deploy this instance once to establish its certificate authority before enrolling peers.</p>{/if}<button class="primary" disabled={!online || dirty || !certificateAuthorityReady || Boolean(busy)}>Create Peer on Server</button></form>
           {:else if tab === "DNS and Routing"}
@@ -385,7 +468,7 @@
             <form class="remote-form" onsubmit={(event) => { event.preventDefault(); addDns(); }}><label>DNS record name<input required bind:value={dnsName} /></label><label>Record type<select bind:value={dnsType}>{#each ["A", "AAAA", "CNAME", "TXT", "SRV"] as type}<option>{type}</option>{/each}</select></label><label>Record value<input required bind:value={dnsValue} /></label><button class="secondary">Add to draft</button></form>
           {:else if tab === "Settings"}
             <form class="remote-form" oninput={applySettings} onchange={applySettings} onsubmit={(event) => { event.preventDefault(); applySettings(); }}><label>Instance name<input required bind:value={settingsForm.display_name} /></label><label>VPN endpoint<input required bind:value={settingsForm.endpoint_host} /></label><label>Listener port<input required type="number" min="1" max="65535" disabled={settingsForm.backend === "ikev2"} bind:value={settingsForm.endpoint_port} /></label><label>Private DNS zone<input required bind:value={settingsForm.dns_zone} /></label>{#if SettingsBackendForm}<SettingsBackendForm bind:form={settingsForm} />{/if}<button class="secondary">Keep local draft</button></form>
-            <button class="danger" disabled={!online || dirty || Boolean(busy)} onclick={removeInstance}>Remove instance from server</button>
+            <button class="secondary" disabled={Boolean(busy)} onclick={() => openDangerZone(draft!.instance.id)}>Open Danger Zone</button>
           {:else if tab === "Deployment"}
             {#if serverTab === "Logs"}
               <div class="table-wrap"><table><thead><tr><th>Operation</th><th>Desired revision</th><th>Result</th><th>Deployed revision</th><th>Recovery</th></tr></thead><tbody>{#each runtimeHistory as event}<tr><td>{event.operation.replaceAll("_", " ")}</td><td>{event.desired_revision}</td><td><span class="instance-state" data-state={event.succeeded ? "healthy" : "needs_deployment"}>{event.succeeded ? "Succeeded" : "Failed"}</span></td><td>{event.deployed_revision ?? "Unknown"}</td><td>{event.requires_recovery ? "Required" : "None"}</td></tr>{/each}</tbody></table>{#if !runtimeHistory.length}<div class="inventory-empty"><h3>No deployment history</h3><p>Remote operations for this instance will appear here.</p></div>{/if}</div>
