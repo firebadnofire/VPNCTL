@@ -2,7 +2,7 @@ import { fireEvent, render, screen, waitFor } from "@testing-library/svelte";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App.svelte";
 import { summary } from "./test/fixtures";
-import type { LegacyCandidate, Manifest, RemoteInventory } from "./lib/remote-types";
+import type { LegacyCandidate, Manifest, RemoteDraft, RemoteInventory } from "./lib/remote-types";
 
 const invoke = vi.hoisted(() => vi.fn());
 const confirm = vi.hoisted(() => vi.fn());
@@ -38,10 +38,42 @@ describe("remote-authoritative desktop workflows", () => {
   it("discovers the selected server and distinguishes an empty inventory", async () => {
     render(App);
     await screen.findByText("No VPN instances configured on this server.");
-    expect(screen.getByRole("navigation", { name: "Servers" })).toBeTruthy();
+    expect(screen.getByRole("navigation", { name: "Control plane" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Create Instance" })).toBeTruthy();
     expect(screen.queryByText(/Migrate Instances/)).toBeNull();
     expect(invoke.mock.calls.some(([command]) => ["list_instances", "list_instance_summaries", "create_instance"].includes(command))).toBe(false);
+  });
+  it("routes prototype navigation through the selected server", async () => {
+    current = inventory([manifest()]);
+    render(App);
+    await screen.findByText("Remote WG");
+    expect(screen.getByRole("heading", { name: "Overview", level: 1 })).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: "Instances" }));
+    expect(screen.getByRole("heading", { name: "Your instances" })).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: /Remote WG.*WireGuard/ }));
+    expect(screen.getByRole("heading", { name: "Remote WG" })).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: /Devices/ }));
+    expect(screen.getByRole("heading", { name: "Devices", level: 1 })).toBeTruthy();
+    expect(screen.getByLabelText("Instance")).toBeTruthy();
+    expect(screen.queryByRole("tablist", { name: "Instance sections" })).toBeNull();
+  });
+  it("shows remote deployment history and backups in their navigation pages", async () => {
+    current = inventory([manifest()]);
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "remote_runtime_history") return [{ request_id: "operation-1", desired_revision: 4, operation: "deploy", succeeded: true, requires_recovery: false, deployed_revision: 4 }];
+      if (command === "list_remote_backups") return [{ name: "snapshot-1", created_at: "2026-11-11T12:00:00Z" }];
+      return base(command, args);
+    });
+    render(App);
+    await screen.findByText("Remote WG");
+    await fireEvent.click(screen.getByRole("button", { name: "Logs" }));
+    await screen.findByRole("heading", { name: "Deployment history" });
+    await screen.findByText("deploy");
+    await fireEvent.click(screen.getByRole("button", { name: "Backups" }));
+    await screen.findByRole("heading", { name: "Backup inventory" });
+    await screen.findByText("snapshot-1");
+    expect(invoke).toHaveBeenCalledWith("list_remote_backups", expect.objectContaining({ hostId: host.id }));
   });
   it("keeps fresh onboarding free of legacy UI", async () => {
     const base = invoke.getMockImplementation()!;
@@ -94,6 +126,80 @@ describe("remote-authoritative desktop workflows", () => {
     expect((screen.getByLabelText("Instance name") as HTMLInputElement).value).toBe("My draft");
     expect(invoke).toHaveBeenCalledWith("save_remote_configuration", expect.objectContaining({ input: expect.objectContaining({ expected_revision: 4 }) }));
     expect(invoke.mock.calls.some(([command]) => command === "apply_remote_deployment")).toBe(false);
+  });
+  it("does not save a discarded draft again while reloading from the server", async () => {
+    const remote = manifest();
+    current = inventory([remote]);
+    const stale = structuredClone(remote.configuration);
+    stale.instance.display_name = "Stale local draft";
+    let local: RemoteDraft | null = { host_id: host.id, base_revision: 3, configuration: stale };
+    const fresh = structuredClone(remote);
+    fresh.revision = 5;
+    fresh.configuration.instance.display_name = "Current server configuration";
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "load_remote_draft") return local;
+      if (command === "read_remote") return fresh;
+      if (command === "discard_remote_draft") { local = null; return null; }
+      if (command === "save_remote_draft") { local = (args as { draft: RemoteDraft }).draft; return null; }
+      return base(command, args);
+    });
+    render(App);
+    await screen.findByText("Remote WG");
+    await fireEvent.click(screen.getByRole("button", { name: /Remote WG.*WireGuard/ }));
+    await screen.findByText(/Unsaved local edits · based on revision 3/);
+    await fireEvent.click(screen.getByRole("button", { name: "Reload from Server" }));
+    await screen.findByRole("heading", { name: "Current server configuration" });
+    expect(screen.queryByText(/Unsaved local edits · based on revision 3/)).toBeNull();
+    expect(invoke.mock.calls.some(([command]) => command === "save_remote_draft")).toBe(false);
+  });
+  it("does not restore the previous revision as a draft after creating a peer", async () => {
+    const remote = manifest();
+    current = inventory([remote]);
+    const saved = structuredClone(remote);
+    saved.revision = 5;
+    saved.configuration.peers.push({ id: "peer-1", user_id: null, display_name: "Phone", ipv4_address: "10.64.0.2", ipv6_address: null,
+      dns_name: null, enabled: true, created_at: "2026-11-10T12:00:00Z", identity: { backend: "wireguard", public_key: "public", preshared_key: "psk-1" } });
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "add_remote_peer") { current = inventory([saved]); return saved; }
+      return base(command, args);
+    });
+    render(App);
+    await screen.findByText("Remote WG");
+    await fireEvent.click(screen.getByRole("button", { name: /Remote WG.*WireGuard/ }));
+    await waitFor(() => expect(screen.queryByText(/Checking local export material/)).toBeNull());
+    await fireEvent.click(screen.getByRole("tab", { name: "Peers / Devices" }));
+    await fireEvent.input(screen.getByLabelText("Peer name"), { target: { value: "Phone" } });
+    await fireEvent.click(screen.getByRole("button", { name: "Create Peer on Server" }));
+    await screen.findByText(/saved revision 5/);
+    await screen.findByDisplayValue("Phone");
+    expect(screen.queryByText(/Unsaved local edits/)).toBeNull();
+    expect(invoke.mock.calls.some(([command]) => command === "save_remote_draft")).toBe(false);
+  });
+  it("clears health from the previous instance when switching instances", async () => {
+    const first = manifest();
+    const second = structuredClone(first);
+    second.configuration.instance.id = "instance-2";
+    second.configuration.instance.display_name = "Second WG";
+    current = inventory([first, second]);
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "inspect_remote_health" ? {
+      gateway_running: true, backend_ready: true, listeners_ready: true, client_state_matches: true,
+      dns_required: false, private_dns_resolves: false, public_dns_resolves: false, details: [],
+    } : base(command, args));
+    render(App);
+    await screen.findByText("Remote WG");
+    await fireEvent.click(screen.getByRole("button", { name: /Remote WG.*WireGuard/ }));
+    await waitFor(() => expect(screen.queryByText(/Checking local export material/)).toBeNull());
+    await fireEvent.click(screen.getByRole("tab", { name: "Deployment" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Check health" }));
+    await screen.findByText("Deployment health");
+    await fireEvent.click(screen.getByRole("button", { name: "Instances" }));
+    await fireEvent.click(screen.getByRole("button", { name: /Second WG.*WireGuard/ }));
+    await waitFor(() => expect(screen.queryByText(/Checking local export material/)).toBeNull());
+    await fireEvent.click(screen.getByRole("tab", { name: "Deployment" }));
+    expect(screen.queryByText("Deployment health")).toBeNull();
   });
   it("shows pending deployment independently of saved configuration", async () => {
     current = inventory([manifest()]);
