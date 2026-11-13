@@ -43,8 +43,38 @@ A pre-existing remote SQLite authority database is not automatically imported. P
 
 ## Desktop client enrollment and export
 
-Adding a client saves its credentials and public configuration, clears the previous local draft, then automatically previews and applies that exact saved revision through the existing revision/hash checks. Internal revisions remain mandatory concurrency evidence; no manual revision or save step is required for enrollment. If activation fails, the saved client and local keys survive. Inspect interrupted operations and retry client activation rather than creating the client again. Existing unrelated local edits must be saved or discarded first. Deployment cannot use an unsaved or obsolete draft revision.
+Adding a device saves its credentials and public configuration and clears the
+previous local draft without deploying. Review deployment, preview, and explicit
+apply remain separate revision/hash-checked steps. Existing unrelated local edits
+must be saved or discarded before enrollment. A blank optional DNS name uses the
+device name when Add DNS record is enabled.
 
 Retained drafts that exactly match a known committed server generation are obsolete copies and may be discarded; differing edits remain available for explicit reconciliation. Draft writes are drained before enrollment and local cleanup.
 
-WireGuard and AmneziaWG client configurations can be displayed as QR codes. QR rendering shares the file-export renderer, requires the verified appliance and matching locally held private key, and never uploads the client private key. QR codes contain sensitive credentials; they are kept in the current view only and cleared on navigation, editing, or refresh. Certificate backends retain private file export. Oversized configurations report a QR error and must be exported as files.
+WireGuard and AmneziaWG client configurations can be displayed as QR codes. QR rendering shares the file-export renderer, requires the verified appliance and matching locally held private key, and never uploads the client private key. QR codes contain sensitive credentials; they are kept in the current view only and cleared on navigation, editing, or refresh. OpenVPN supports native text copy and private file export; IKEv2 uses private PKCS#12 file export. Oversized configurations report a QR error and must be exported as files.
+
+
+## Capability-gated device removal and DNS blocking
+
+Protocol 2 and manifest schema 1 are unchanged. `drop_peer_v1` adds the confirmed,
+revision-bound `drop_peer` operation with distinct removal and revocation request
+IDs. Certificate revocation commits first, then device metadata and linked DNS
+records are removed. Each committed step remains in immutable desired history.
+Retries validate the original request content; conflicting newer work is refused.
+
+`dns_blocking_v1` adds a per-instance `blocking` operation with `read`, `save`,
+`refresh`, and `resume` actions. Saving expects the blocking policy revision,
+independent from VPN configuration revisions. Source definitions, statuses,
+pending intent, and receipts live under `instances/<uuid>/blocking/` beside the
+existing generations/secrets/runtime directories. Public configuration manifests
+retain their existing `dns_blocklist_domains` field as baseline rules. Downloaded
+source data is stored in immutable UUID directories, indexed into bounded shards;
+it is not sent in discovery or inserted into the public manifest.
+
+Blocking read responses include the current policy, source refresh metadata,
+compiled/applied dataset versions, errors, pending request ID, and scheduler
+availability. Resume resolves the saved original intent rather than accepting a
+replacement mutation after a timeout. Unsupported helpers refuse the new
+operations; clients must check capabilities before exposing them as available.
+The fixed privileged `blocking-refresh` helper subcommand services the optional
+systemd timer and accepts no client paths or arbitrary commands.

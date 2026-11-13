@@ -68,11 +68,22 @@ impl ServerRuntime {
                 appliance_id,
                 machine_fingerprint,
                 software_version: env!("CARGO_PKG_VERSION").into(),
-                capabilities: vec![vam_authority::manifest::INSTANCE_ARCHIVE_CAPABILITY.into()],
+                capabilities: vec![
+                    vam_authority::manifest::INSTANCE_ARCHIVE_CAPABILITY.into(),
+                    vam_authority::manifest::DROP_PEER_CAPABILITY.into(),
+                    vam_authority::manifest::blocking::CAPABILITY.into(),
+                ],
             });
         }
         let store = ManifestStore::open(&self.paths.control_dir(), appliance_id)?;
         match request.operation {
+            Operation::Blocking {
+                instance_id,
+                action,
+            } => crate::blocking::execute(&store, instance_id, request.request_id, action).await,
+            operation @ Operation::DropPeer { .. } => {
+                crate::drop_peer::execute(&store, request.request_id, operation).await
+            }
             operation @ (Operation::EnrollPeer { .. } | Operation::RevokePeer { .. }) => {
                 crate::enrollment::mutate(&store, request.request_id, operation).await
             }
@@ -130,7 +141,7 @@ impl ServerRuntime {
             Operation::ReconcileRuntime {
                 instance_id,
                 mutation_id,
-            } => crate::runtime::reconcile(&store, instance_id, mutation_id),
+            } => crate::runtime::reconcile(&store, instance_id, mutation_id).await,
             Operation::Reconcile {
                 instance_id,
                 mutation_id,
@@ -309,7 +320,7 @@ impl ServerRuntime {
     }
 }
 
-fn read_machine_identity() -> Result<String, AuthorityError> {
+pub(crate) fn read_machine_identity() -> Result<String, AuthorityError> {
     let machine = std::path::Path::new("/etc/machine-id");
     match read_bounded(machine, 128) {
         Ok(bytes) if bytes.len() >= 16 => return Ok(format!("{:x}", Sha256::digest(bytes))),
@@ -361,7 +372,7 @@ fn read_machine_identity() -> Result<String, AuthorityError> {
     ))
 }
 
-fn bind_machine_identity(
+pub(crate) fn bind_machine_identity(
     paths: &super::ServerPaths,
     fingerprint: &str,
 ) -> Result<String, AuthorityError> {

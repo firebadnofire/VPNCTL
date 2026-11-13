@@ -12,6 +12,8 @@ use vam_core::{DnsRecord, DnsRecordType};
 pub enum DnsError {
     #[error("DNS zone is invalid")]
     InvalidZone,
+    #[error("hostlist domain limit exceeded")]
+    HostlistLimit,
     #[error("record name {0} is outside the private zone")]
     OutsideZone(String),
     #[error("record {0} has an invalid value")]
@@ -89,27 +91,34 @@ pub fn render_corefile(zone: &str) -> Result<String, DnsError> {
 }
 
 pub fn parse_hostslist_domains(contents: &str) -> Vec<String> {
+    parse_hostslist_domains_bounded(contents, usize::MAX).expect("unbounded hostlist parse")
+}
+
+pub fn parse_hostslist_domains_bounded(
+    contents: &str,
+    max_domains: usize,
+) -> Result<Vec<String>, DnsError> {
     let mut domains = BTreeSet::new();
     for line in contents.lines() {
         let line = line.split('#').next().unwrap_or_default().trim();
         if line.is_empty() {
             continue;
         }
-        let fields: Vec<_> = line.split_whitespace().collect();
-        let candidates = if fields.first().is_some_and(|field| {
-            field.parse::<Ipv4Addr>().is_ok() || field.parse::<Ipv6Addr>().is_ok()
-        }) {
-            &fields[1..]
-        } else {
-            &fields[..]
-        };
+        let mut fields = line.split_whitespace();
+        let first = fields.next().filter(|field| {
+            field.parse::<Ipv4Addr>().is_err() && field.parse::<Ipv6Addr>().is_err()
+        });
+        let candidates = first.into_iter().chain(fields);
         for candidate in candidates {
             if let Some(domain) = normalize_blocklist_domain(candidate) {
                 domains.insert(domain);
+                if domains.len() > max_domains {
+                    return Err(DnsError::HostlistLimit);
+                }
             }
         }
     }
-    domains.into_iter().collect()
+    Ok(domains.into_iter().collect())
 }
 
 pub fn render_blocklist_hosts(domains: &[String]) -> String {
@@ -271,6 +280,18 @@ mod tests {
             enabled: true,
             managed_by_device_id: None,
         }
+    }
+
+    #[test]
+    fn hostlist_limit_counts_unique_domains_and_stops_before_growing_further() {
+        assert_eq!(
+            parse_hostslist_domains_bounded("ads.example ads.example", 1).unwrap(),
+            vec!["ads.example"]
+        );
+        assert_eq!(
+            parse_hostslist_domains_bounded("ads.example track.example", 1).unwrap_err(),
+            DnsError::HostlistLimit
+        );
     }
 
     #[test]

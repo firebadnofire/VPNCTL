@@ -21,9 +21,16 @@ async fn main() -> ExitCode {
 async fn run() -> Result<String, vam_server::ServerError> {
     ensure_privileged()?;
     let command = parse_invocation(std::env::args_os())?;
+    if matches!(command, Command::BlockingRefresh) {
+        ServerRuntime::new(MANAGEMENT_ROOT)
+            .refresh_due_blocklists()
+            .await?;
+        return Ok("blocking_refresh_checked".into());
+    }
     let caller = CallerIdentity::from_sudo_environment()?;
     let runtime = ServerRuntime::new(MANAGEMENT_ROOT);
     match command {
+        Command::BlockingRefresh => unreachable!("handled without a sudo exchange"),
         Command::Prepare => {
             runtime.prepare_exchange(caller)?;
             Ok(format!("exchange_uid={}", caller.uid))

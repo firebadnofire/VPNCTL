@@ -324,6 +324,76 @@ impl ApplicationService {
         }
         Ok(availability)
     }
+    pub async fn remote_blocking(
+        &self,
+        host_id: Uuid,
+        instance_id: Uuid,
+        request_id: Uuid,
+        action: vam_authority::manifest::blocking::Action,
+    ) -> Result<vam_authority::manifest::blocking::View, AppError> {
+        let identity = self.remote_identity(host_id).await?;
+        if !identity
+            .capabilities
+            .iter()
+            .any(|value| value == vam_authority::manifest::blocking::CAPABILITY)
+        {
+            return Err(validation_error(
+                "Update the server helper to manage per-instance DNS blocking.",
+            ));
+        }
+        match self
+            .remote_operation(
+                host_id,
+                request_id,
+                Operation::Blocking {
+                    instance_id,
+                    action,
+                },
+            )
+            .await.map_err(|mut error| {
+                if error.code == "revision_conflict" {
+                    error.code = "blocking_revision_conflict".into();
+                    error.message = "Blocking settings changed on the server. Reload blocking settings before saving again.".into();
+                    error.remediation = Some("Your unsaved blocking edits remain in this view. Review them before confirming a reload.".into());
+                }
+                error
+            })?
+        {
+            Reply::Blocking(view) => Ok(*view),
+            _ => Err(validation_error("Unexpected DNS blocking response.")),
+        }
+    }
+
+    pub async fn drop_remote_peer(
+        &self,
+        host_id: Uuid,
+        request_id: Uuid,
+        operation: vam_authority::manifest::Operation,
+    ) -> Result<Manifest, AppError> {
+        if !matches!(
+            operation,
+            Operation::DropPeer {
+                confirmed: true,
+                ..
+            }
+        ) {
+            return Err(validation_error("Confirmed device removal is required."));
+        }
+        let identity = self.remote_identity(host_id).await?;
+        if !identity
+            .capabilities
+            .contains(&vam_authority::manifest::DROP_PEER_CAPABILITY.to_owned())
+        {
+            return Err(validation_error(
+                "Update the server helper to support device removal.",
+            ));
+        }
+        manifest_reply(
+            self.remote_operation(host_id, request_id, operation)
+                .await?,
+        )
+    }
+
     pub async fn add_remote_peer(
         &self,
         host_id: Uuid,

@@ -114,3 +114,36 @@ Unknown deployment state is shown as unknown rather than pending deployment.
 **Review differences** compares the original draft, local edits, and the latest
 server values. Resolution is explicit discard-and-reload; reapply desired edits
 manually. Saving and deploying retain all server-side concurrency checks.
+
+## Device removal and DNS blocking
+
+**Danger Zone → Drop Device** selects an instance, then a device (including
+previously disabled or revoked identities). Confirmation names the server,
+instance, and device. Removal deletes only that identity and its linked managed
+DNS records. OpenVPN/IKEv2 certificates are revoked first; a partial removal
+remains visible and can be retried with the same request. Local private keys,
+exported profiles, unrelated DNS records, and recovery history are retained.
+Deploy separately to apply access changes.
+
+**DNS → Blocking** manages server-owned sources for the selected instance.
+Add HTTP/HTTPS hosts-file or plain-domain URLs, enable individual sources, and
+choose **Save blocking settings**. Unlike **Save to Server** for VPN drafts,
+this explicitly downloads and applies DNS blocking rules independently; it
+never deploys unrelated pending VPN changes. **Refresh now** repeats downloads
+without changing the policy revision. Failed downloads show source-specific
+errors and retain an unchanged source's last successful data. A new or edited
+source must download successfully before a replacement dataset is applied.
+
+Automatic refresh defaults to every seven days, with an hourly server-side due
+check and a small randomized delay. Turn off **Refresh automatically** for
+manual-only updates. Scheduling requires systemd and uses the on-demand helper;
+VPNCTL need not remain open. Hosts without systemd support manual refresh.
+Turning off **Enable DNS blocking** preserves sources and cached data and removes
+their blocking rules. Existing manually configured blocked domains are preserved
+and included when blocking is enabled. DNS caches can retain old answers for up
+to their TTL (normally 60 seconds).
+
+These features require a helper advertising `drop_peer_v1` and `dns_blocking_v1`.
+The interface explains when a helper upgrade is needed. No sources are installed
+automatically. Blocking policy, downloaded datasets, and refresh results are
+shared across independent VPNCTL installations connecting to the same instance.

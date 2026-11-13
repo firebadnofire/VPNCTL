@@ -4,6 +4,8 @@
 //! Protected secrets are durable before the current-generation pointer changes.
 //! No secret or generation is deleted: retained backups may reference either.
 
+pub mod blocking;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
@@ -26,6 +28,7 @@ use zeroize::Zeroizing;
 use crate::{AuthorityError, SecretValue};
 
 pub const PROTOCOL_VERSION: u32 = 2;
+pub const DROP_PEER_CAPABILITY: &str = "drop_peer_v1";
 pub const INSTANCE_ARCHIVE_CAPABILITY: &str = "instance_archives_v1";
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
@@ -334,6 +337,17 @@ pub struct Request {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    Blocking {
+        instance_id: Uuid,
+        action: blocking::Action,
+    },
+    DropPeer {
+        instance_id: Uuid,
+        peer_id: Uuid,
+        expected_revision: u64,
+        revoke_request_id: Uuid,
+        confirmed: bool,
+    },
     ArchiveInstance {
         request: Box<SaveRequest>,
         confirmed: bool,
@@ -463,6 +477,7 @@ pub struct Response {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "response", content = "value", rename_all = "snake_case")]
 pub enum Reply {
+    Blocking(Box<blocking::View>),
     RuntimeReconciled(RuntimeReconciliation),
     RuntimeHistory(Vec<RuntimeHistoryEntry>),
     Enrollment {
@@ -698,6 +713,32 @@ impl RuntimeContext {
         let revisions: BTreeMap<String, Option<u64>> =
             optional_json(&self.directory.join("backup-revisions.json"))?.unwrap_or_default();
         Ok(revisions.get(name).copied().flatten())
+    }
+
+    /// A runtime backup predating any certificate revocation cannot prove it
+    /// retains that revocation, even after the device metadata was dropped.
+    pub fn validate_certificate_backup_revision(
+        &self,
+        revision: u64,
+    ) -> Result<(), AuthorityError> {
+        if revision > self.manifest.revision {
+            return Err(invalid("Backup revision is newer than saved history."));
+        }
+        for next in revision.saturating_add(1)..=self.manifest.revision {
+            let configuration = self.historical_configuration(next)?;
+            if configuration.peers.iter().any(|peer| {
+                !peer.enabled
+                    && matches!(
+                        peer.identity,
+                        PublicIdentity::Openvpn { .. } | PublicIdentity::Ikev2 { .. }
+                    )
+            }) {
+                return Err(invalid(
+                    "This runtime backup predates a certificate revocation and cannot safely restore its CA/CRL state. Preserve it for operator recovery; newer device removal does not undo revocation.",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn historical_configuration(&self, revision: u64) -> Result<Configuration, AuthorityError> {

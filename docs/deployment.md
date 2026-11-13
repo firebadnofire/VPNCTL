@@ -39,3 +39,42 @@ A complete disaster-recovery bundle is created through the helper and includes t
 The helper must already be installed at `/usr/local/libexec/vam-server` on a new host. Installing or replacing that executable is a trusted host administration step outside the manifest RPC. The current desktop/CLI do not automatically install or upgrade it. Ensure the installed helper and client support the same protocol and schema before performing writes; incompatible versions refuse them.
 
 Restorable instance archival requires a helper advertising `instance_archives_v1`. If the desktop reports a helper update is required, update `/usr/local/libexec/vam-server` using the validated Linux helper deployment procedure, then Refresh / Reconnect. Updating the desktop alone does not update the server. A rejected archive request leaves the instance active; do not use legacy removal as a workaround.
+
+## Independent DNS blocking updates
+
+Blocking policy has its own revision and applied dataset hash. Source refresh
+never advances the VPN desired or deployed revision. It uses the active deployed
+configuration's baseline domains, so unrelated newer desired settings stay
+pending. Initial deployment is required before a cached dataset can be applied.
+
+The helper serializes blocking updates with deployments and configuration writes
+using the existing authority lock. It stores a durable request intent and pending
+marker, copies the current blocking file to a checked recovery path, and atomically
+publishes the compiled file. Fresh reserved DNS verification names avoid stale negative-cache answers while
+CoreDNS reloads the dataset; DNS readiness is checked independently. Failure restores the
+previous file. An incomplete rollback leaves a durable pending journal, blocking
+conflicting mutations until the same operation is resumed or recovered.
+
+Normal deployment previews/rendering include the current blocking policy.
+Deployment, runtime restore, and instance start verify/reapply that policy rather
+than silently retaining an older snapshot's blocking data. Blocking verification
+failures are recorded separately with an unknown applied version; a rollback
+failure leaves an explicit recovery condition. Reconciliation of a deployment
+whose blocking rollback failed retries the DNS-only recovery without applying
+another VPN revision. Stop, archive, backups, and certificate revocation remain
+available when a source configuration needs correction.
+
+Archive/restore preserves the authoritative policy and cached source datasets in
+the control store. Whole-appliance control backups include policy, receipts,
+intents, and bounded dataset shards; runtime backups include the operational DNS
+file. Do not downgrade to a helper without `dns_blocking_v1` while managed policies
+are configured: older helpers cannot enforce this independent policy. Preserve
+a complete verified control/runtime backup before changing helper versions.
+
+Device removal does not erase the certificate revocation recorded in desired
+history. Runtime restore previews reject backups whose recorded deployed revision
+predates a later certificate revocation, including when that device's metadata
+has since been dropped. The older snapshot cannot prove it retains the newer
+CA/CRL state. This conservative check can also refuse a snapshot taken after a
+revocation but before a subsequent VPN deployment; preserve such snapshots for
+explicit operator recovery rather than weakening certificate trust.

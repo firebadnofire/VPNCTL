@@ -90,6 +90,86 @@ def archive_restore_roundtrip(instance_id, backend):
     emit("archive_restore_retains_" + backend + "_runtime_and_identity")
 
 
+def blocking_roundtrip(instance_id):
+    """Real CoreDNS + systemd checks, confined to this disposable guest."""
+    import datetime
+    import http.server
+    import threading
+    import time
+    payload = {"body": b"0.0.0.0 ads.vpnctl.example\ntrack.vpnctl.example\n", "status": 200, "requests": 0}
+    class SourceHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            payload["requests"] += 1
+            body = payload["body"]
+            self.send_response(payload["status"])
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *_args):
+            pass
+    server = http.server.ThreadingHTTPServer(("0.0.0.0", 0), SourceHandler)
+    guest_ip = json.loads(subprocess.run(["ip", "-j", "route", "get", "1.1.1.1"], check=True, capture_output=True, text=True).stdout)[0]["prefsrc"]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    def blocking(action, request_id=None):
+        return rpc({"operation": "blocking", "instance_id": instance_id, "action": action}, request_id=request_id)["value"]
+    runtime = Path("/opt/vpn-appliance-manager/instances") / instance_id
+    def lookup(domain):
+        result = subprocess.run(["docker", "compose", "--project-directory", str(runtime), "exec", "-T", "gateway", "nslookup", domain, "127.0.0.1"], capture_output=True, text=True)
+        return result.stdout
+    try:
+        original = rpc({"operation": "read", "instance_id": instance_id})["value"]
+        deployed = rpc({"operation": "discover"})["value"]["deployments"][instance_id]["deployed_revision"]
+        draft = copy.deepcopy(original["configuration"])
+        draft["instance"]["display_name"] = "Pending VPN edit retained across blocking updates"
+        pending = save(draft, original["revision"])["value"]
+        policy = blocking({"action": "read"})["state"]["policy"]
+        assert policy["interval_days"] == 7 and policy["schedule_enabled"], "default refresh schedule changed"
+        policy.update(enabled=True, sources=[{"id": str(uuid.uuid4()), "name": "Guest HTTP source", "url": "http://" + guest_ip + ":" + str(server.server_port) + "/hosts", "enabled": True}])
+        request = str(uuid.uuid4())
+        action = {"action": "save", "expected_revision": 0, "policy": policy}
+        saved = blocking(action, request)
+        if saved["state"]["error"]:
+            logs = subprocess.run(["docker", "compose", "--project-directory", str(runtime), "logs", "--no-color", "--tail", "10", "dns"], capture_output=True, text=True)
+            print(json.dumps({"diagnostic": "blocking_verification", "file_mode": oct((runtime / "dns/hosts/blocklist.hosts").stat().st_mode & 0o777), "test_domain_answer": lookup("ads.vpnctl.example")[:2048], "dns_log": logs.stdout[-4096:]}), flush=True)
+        assert not saved["state"]["error"], "blocking apply failed: " + str(saved["state"]["error"])
+        assert saved["scheduler_available"] and saved["state"]["sources"][0]["domain_count"] == 2, "source status missing"
+        assert "0.0.0.0" in lookup("ads.vpnctl.example"), "CoreDNS did not block the downloaded domain"
+        assert "10.88.0.1" in lookup("gateway.vpn.internal"), "blocking broke private-zone DNS"
+        assert blocking(action, request) == saved, "blocking retry changed the receipt"
+        assert rpc({"operation": "read", "instance_id": instance_id})["value"]["revision"] == pending["revision"], "blocking advanced VPN desired revision"
+        assert rpc({"operation": "discover"})["value"]["deployments"][instance_id]["deployed_revision"] == deployed, "blocking deployed pending VPN changes"
+        subprocess.run(["systemctl", "is-enabled", "vpnctl-blocking.timer"], check=True, capture_output=True)
+        payload["status"] = 503
+        failed = blocking({"action": "refresh", "expected_revision": 1})
+        assert failed["state"]["error"] and failed["state"]["sources"][0]["stale"], "failed source was not reported stale"
+        assert failed["state"]["applied_version"] == saved["state"]["applied_version"], "failed download discarded working data"
+        payload.update(status=200, body=b"0.0.0.0 scheduled.vpnctl.example\n")
+        state_path = Path("/var/lib/vpn-appliance-manager/control/instances") / instance_id / "blocking/state.json"
+        state = json.loads(state_path.read_text())
+        state["last_attempt"] = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=8)).isoformat()
+        state_path.write_text(json.dumps(state))
+        subprocess.run(["systemctl", "start", "vpnctl-blocking.service"], check=True, capture_output=True, text=True)
+        assert "0.0.0.0" in lookup("scheduled.vpnctl.example"), "server-side due refresh did not update DNS"
+        latest = blocking({"action": "read"})
+        policy = latest["state"]["policy"]
+        policy.update(enabled=False, schedule_enabled=False)
+        disabled = blocking({"action": "save", "expected_revision": 1, "policy": policy})
+        assert not disabled["state"]["error"], "blocking disable failed"
+        assert "scheduled.vpnctl.example" not in (runtime / "dns/hosts/blocklist.hosts").read_text(), "disabled blocking retained source rules"
+        requests = payload["requests"]
+        subprocess.run(["systemctl", "start", "vpnctl-blocking.service"], check=True, capture_output=True, text=True)
+        assert payload["requests"] == requests, "disabled schedule still downloaded sources"
+        deadline = time.monotonic() + 75
+        while "0.0.0.0" in lookup("scheduled.vpnctl.example") and time.monotonic() < deadline:
+            time.sleep(3)
+        assert "0.0.0.0" not in lookup("scheduled.vpnctl.example"), "disabled blocking did not clear after DNS cache expiry"
+        emit("per_instance_blocking_manual_stale_scheduled_disabled_and_vpn_revision_isolation")
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
 def emit(name):
     print(json.dumps({"test": name, "success": True}), flush=True)
 
@@ -264,7 +344,28 @@ def run():
                     assert revoked["value"]["revision"] == 3 and not revoked["value"]["configuration"]["peers"][0]["enabled"]
                     rpc({"operation": "export_certificate_material", "instance_id": candidate_id,
                          "peer_id": certificate_peer, "expected_revision": 3}, expect_error="invalid_request")
+                dropped_peer = copy.deepcopy(peer)
+                dropped_peer["id"] = str(uuid.uuid4())
+                dropped_peer["display_name"] = "Drop certificate target"
+                dropped_peer["ipv4_address"] = "10." + str(offset) + ".0.3"
+                dropped_peer["dns_name"] = "drop.vpn.internal"
+                new_identity = "drop-" + dropped_peer["id"].replace("-", "")[:12]
+                dropped_peer["identity"][("common_name" if kind == "openvpn" else "identity")] = new_identity
+                with tempfile.TemporaryDirectory(prefix="vpnctl-drop-client-") as client_dir:
+                    key_file = Path(client_dir) / "client.key"
+                    csr_file = Path(client_dir) / "client.csr"
+                    subprocess.run(["openssl", "ecparam", "-name", curve, "-genkey", "-noout", "-out", str(key_file)], check=True, capture_output=True)
+                    subprocess.run(["openssl", "req", "-new", "-key", str(key_file), digest, "-subj", "/CN=" + new_identity, "-out", str(csr_file)], check=True, capture_output=True)
+                    rpc({"operation": "enroll_peer", "instance_id": candidate_id, "expected_revision": 3, "peer": dropped_peer, "csr": csr_file.read_text(), "create_dns_record": True})
+                    operation = {"operation": "drop_peer", "instance_id": candidate_id, "peer_id": dropped_peer["id"], "expected_revision": 4, "revoke_request_id": str(uuid.uuid4()), "confirmed": True}
+                    request = str(uuid.uuid4())
+                    removed = rpc(operation, request_id=request)
+                    assert removed["value"]["revision"] == 6, "certificate drop skipped revocation revision"
+                    assert rpc(operation, request_id=request) == removed, "certificate drop retry changed history"
+                    assert len(removed["value"]["configuration"]["peers"]) == 1, "certificate drop removed an unrelated device"
+                    assert not removed["value"]["configuration"]["dns_records"], "certificate drop retained linked DNS"
                 emit("scoped_" + kind + "_certificate_enrollment_export_and_revocation")
+                emit("revoke_then_drop_" + kind + "_device")
             archive_restore_roundtrip(candidate_id, kind)
         runtime_history = rpc({"operation": "runtime_history", "instance_id": instance_id})["value"]
         assert any(item["operation"] == "deploy" and item["succeeded"] for item in runtime_history), "fresh client cannot inspect deployment results"
@@ -281,6 +382,16 @@ def run():
         finally:
             pending.unlink()
         emit("runtime_request_reconciliation_reports_all_three_outcomes")
+        blocking_roundtrip(instance_id)
+        current = rpc({"operation": "read", "instance_id": instance_id})["value"]
+        target = current["configuration"]["peers"][0]["id"]
+        drop_id = str(uuid.uuid4())
+        drop = {"operation": "drop_peer", "instance_id": instance_id, "peer_id": target, "expected_revision": current["revision"], "revoke_request_id": str(uuid.uuid4()), "confirmed": True}
+        dropped = rpc(drop, request_id=drop_id)
+        assert not any(peer["id"] == target for peer in dropped["value"]["configuration"]["peers"]), "drop retained selected device"
+        assert rpc(drop, request_id=drop_id) == dropped, "drop retry changed the result"
+        assert (root / "secrets" / secret_id).exists(), "drop erased recovery secret material"
+        emit("drop_device_preserves_history_secrets_and_is_retryable")
         archive_restore_roundtrip(instance_id, "wireguard")
     print(json.dumps({"suite": "remote-authority", "success": True}), flush=True)
 

@@ -29,3 +29,13 @@ export interface MigrationPreview {
 export interface RemotePlan { id: string; instance_id: string; operations: { operation: string; path?: string; service?: string; name?: string }[]; warnings: string[]; desired_state_hash: string }
 export interface RemoteRestorePreview { backup_name: string; expected_state_hash: string; identity_impact: string; desired_revision: number; deployed_revision: number | null }
 export interface RuntimeHistoryEntry { request_id: string; desired_revision: number; operation: string; succeeded: boolean; requires_recovery: boolean; deployed_revision: number | null }
+
+export interface BlockingSource { id: string; name: string; url: string; enabled: boolean }
+export interface BlockingPolicy { revision: number; enabled: boolean; schedule_enabled: boolean; interval_days: number; sources: BlockingSource[] }
+export interface BlockingState {
+  policy: BlockingPolicy;
+  sources: { id: string; url: string; last_attempt: string | null; last_success: string | null; domain_count: number; error: string | null; stale: boolean; dataset_id: string | null }[];
+  last_attempt: string | null; last_success: string | null; dataset_version: string | null; applied_version: string | null; applied_at: string | null; error: string | null; pending_request: string | null;
+}
+export interface BlockingView { state: BlockingState; scheduler_available: boolean }
+export type BlockingAction = { action: "read" | "resume" } | { action: "refresh"; expected_revision: number } | { action: "save"; expected_revision: number; policy: BlockingPolicy };

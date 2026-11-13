@@ -373,3 +373,43 @@ pub async fn copy_remote_peer_configuration(
         "Could not copy the configuration to the system clipboard. Download the configuration file instead.",
     ))
 }
+
+#[tauri::command]
+pub async fn drop_remote_peer(
+    state: State<'_, AppState>,
+    host_id: Uuid,
+    request_id: Uuid,
+    operation: vam_authority::manifest::Operation,
+) -> Result<Manifest, AppError> {
+    state
+        .0
+        .drop_remote_peer(host_id, request_id, operation)
+        .await
+}
+
+#[tauri::command]
+pub async fn remote_blocking(
+    state: State<'_, AppState>,
+    host_id: Uuid,
+    instance_id: Uuid,
+    request_id: Uuid,
+    action: vam_authority::manifest::blocking::Action,
+) -> Result<vam_authority::manifest::blocking::View, AppError> {
+    state
+        .0
+        .remote_blocking(host_id, instance_id, request_id, action)
+        .await
+}
+
+#[tauri::command]
+pub async fn reconcile_remote_save(
+    state: State<'_, AppState>,
+    host_id: Uuid,
+    instance_id: Uuid,
+    mutation_id: Uuid,
+) -> Result<Option<Manifest>, AppError> {
+    state
+        .0
+        .reconcile_remote_save(host_id, instance_id, mutation_id)
+        .await
+}

@@ -6,6 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+reqwest.workspace = true
+url.workspace = true
+vam-dns = { path = "../../crates/dns" }
 async-trait.workspace = true
 chrono.workspace = true
 serde_json.workspace = true

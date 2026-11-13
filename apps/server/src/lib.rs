@@ -13,9 +13,13 @@ use vam_authority::{
 };
 
 mod archive;
+mod blocking;
+mod drop_peer;
 mod enrollment;
 mod manifest_rpc;
 mod runtime;
+#[cfg(test)]
+mod test_support;
 
 pub const MANAGEMENT_ROOT: &str = "/var/lib/vpn-appliance-manager";
 pub const MAX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
@@ -254,6 +258,7 @@ pub fn parse_invocation(
         .into_string()
         .map_err(|_| ServerError::InvalidInvocation("command is not UTF-8".into()))?;
     match command.as_str() {
+        "blocking-refresh" if arguments.next().is_none() => Ok(Command::BlockingRefresh),
         "prepare" if arguments.next().is_none() => Ok(Command::Prepare),
         "rpc" | "manifest-rpc" | "cleanup" => {
             let request_id = arguments
@@ -286,6 +291,7 @@ pub fn parse_invocation(
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
+    BlockingRefresh,
     Prepare,
     Rpc(Uuid),
     ManifestRpc(Uuid),
@@ -642,6 +648,22 @@ mod tests {
 
     #[test]
     fn invocation_accepts_only_fixed_commands_and_uuid_arguments() {
+        assert_eq!(
+            parse_invocation([
+                OsString::from("vam-server"),
+                OsString::from("blocking-refresh")
+            ])
+            .unwrap(),
+            Command::BlockingRefresh
+        );
+        assert!(
+            parse_invocation([
+                OsString::from("vam-server"),
+                OsString::from("blocking-refresh"),
+                OsString::from("arbitrary")
+            ])
+            .is_err()
+        );
         let request_id = Uuid::new_v4();
         assert_eq!(
             parse_invocation([

@@ -46,3 +46,38 @@ reopen it. No QR generation service, temporary QR file, or configuration-bearing
 navigation URL is used. Clearing UI references is not a guarantee of immediate
 memory erasure by the webview. Session activity stores curated public operation
 summaries, never exported configurations, credential material, or raw errors.
+
+## Blocking source trust and scheduled execution
+
+Blocking sources are server-owned network inputs, not instructions. Downloads
+accept only HTTP/HTTPS URLs without embedded credentials or fragments. HTTPS
+uses certificate validation and TLS 1.2 or newer; HTTP contents can be altered in
+transit and the interface warns about this. The helper does not use environment
+proxies. It resolves and validates every initial/redirect destination, then pins
+those addresses for the connection while preserving hostname certificate checks.
+Loopback, link-local, unspecified, multicast, shared-address metadata ranges,
+IPv4-mapped equivalents, and the EC2 IPv6 metadata endpoint are rejected.
+Private LAN sources are supported intentionally; administrators should trust
+both the source operator and the reachable LAN service. HTTPS-to-HTTP redirects
+and more than five redirects are rejected. Download errors omit raw response
+bodies and URL-bearing transport diagnostics.
+
+Limits are 30 seconds and 20 MiB per source, four simultaneous downloads,
+64 sources per instance, one million unique domains, and 64 MiB of combined
+domain names. Domain parsing stops at its unique-domain limit. Existing runtime
+files must be regular files within the 256 MiB recovery limit. Downloaded data is
+never executed. Datasets are protected and sharded, with unchanged downloads
+reusing their previous dataset; old changed datasets and operation receipts are
+retained for recovery, so monitor control-store disk usage.
+
+The optional `vpnctl-blocking.timer` starts a root, oneshot helper invocation
+without an RPC exchange or network listener. Its owned unit files are clearly
+marked; unknown existing units are not overwritten. The service restricts
+filesystem writes to VPNCTL control/runtime roots, disables new privileges and
+capabilities, and isolates devices, home directories, and temporary files. It
+still needs the existing privileged Docker access to verify instance DNS. DNS
+probes use an empty, dedicated Docker client configuration under the control
+root, so they do not need access to home directories or registry credentials. Only
+an explicitly saved policy enables a source or schedule; archived instances are
+skipped. Disabling a schedule changes that instance's policy; the shared timer
+may remain installed to serve other instances.

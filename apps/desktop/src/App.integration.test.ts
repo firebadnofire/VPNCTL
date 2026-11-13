@@ -818,4 +818,60 @@ describe("remote-authoritative desktop workflows", () => {
     expect((screen.getByRole("button", { name: "Save to Server" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  it("drops the selected device only after confirmation and reuses a lost-response request", async () => {
+    const remote = manifest(); remote.configuration.peers = [{ id: "drop-me", user_id: null, display_name: "Old laptop", ipv4_address: "10.64.0.2", ipv6_address: null, dns_name: null, enabled: false, created_at: remote.saved_at, identity: { backend: "wireguard", public_key: "public" } }];
+    current = inventory([remote]); current.identity.capabilities!.push("drop_peer_v1");
+    const base = invoke.getMockImplementation()!; let attempts = 0;
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "read_remote") return remote;
+      if (command === "drop_remote_peer") { if (++attempts === 1) return Promise.reject({ code: "ssh_timeout", message: "Response lost; retry the same removal" }); current.discovery.instances = [{ ...remote, revision: 5, configuration: { ...remote.configuration, peers: [] } }]; return current.discovery.instances[0]; }
+      return base(command, args);
+    });
+    render(App); await screen.findByText("Remote WG"); await enterDangerZone();
+    expect(screen.getByLabelText("Managed instance")).toBeTruthy();
+    expect(screen.getByLabelText("Device").textContent).toContain("Old laptop (disabled / revoked)");
+    confirm.mockResolvedValueOnce(false);
+    await fireEvent.click(screen.getByRole("button", { name: "Drop Device" }));
+    await waitFor(() => expect(confirm).toHaveBeenCalled());
+    expect(invoke.mock.calls.some(([command]) => command === "drop_remote_peer")).toBe(false);
+    await waitFor(() => expect((screen.getByRole("button", { name: "Drop Device" }) as HTMLButtonElement).disabled).toBe(false));
+    await fireEvent.click(screen.getByRole("button", { name: "Drop Device" }));
+    await screen.findByText("Response lost; retry the same removal");
+    await fireEvent.click(screen.getByRole("button", { name: "Retry device removal" }));
+    await screen.findByText("Device dropped from saved configuration. Deploy to apply access changes.");
+    const calls = invoke.mock.calls.filter(([command]) => command === "drop_remote_peer");
+    expect(calls).toHaveLength(2); expect(calls[0][1]).toEqual(calls[1][1]);
+    expect(invoke.mock.calls.some(([command]) => command === "apply_remote_deployment")).toBe(false);
+  });
+
+  it("resets the device dropdown to the selected instance's own identities", async () => {
+    const first = manifest(), second = structuredClone(first);
+    second.configuration.instance.id = "second-instance"; second.configuration.instance.display_name = "Second VPN";
+    const peer = { id: "first-peer", user_id: null, display_name: "First device", ipv4_address: "10.64.0.2", ipv6_address: null, dns_name: null, enabled: true, created_at: first.saved_at, identity: { backend: "wireguard", public_key: "public" } };
+    first.configuration.peers = [peer]; second.configuration.peers = [{ ...peer, id: "second-peer", display_name: "Second device" }];
+    current = inventory([first, second]); current.identity.capabilities!.push("drop_peer_v1");
+    render(App); await screen.findByText("Remote WG"); await enterDangerZone();
+    expect((screen.getByLabelText("Device") as HTMLSelectElement).value).toBe("first-peer");
+    await fireEvent.change(screen.getByLabelText("Managed instance"), { target: { value: "second-instance" } });
+    const devices = screen.getByLabelText("Device") as HTMLSelectElement;
+    expect(devices.value).toBe("second-peer"); expect(devices.textContent).toContain("Second device"); expect(devices.textContent).not.toContain("First device");
+  });
+  it("asks before discarding unsaved blocking edits during navigation", async () => {
+    current = inventory([manifest()]); current.identity.capabilities!.push("dns_blocking_v1");
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "remote_blocking" ? { scheduler_available: true, state: { policy: { revision: 0, enabled: false, schedule_enabled: true, interval_days: 7, sources: [] }, sources: [], error: null, pending_request: null, last_success: null, applied_at: null, applied_version: null } } : base(command, args));
+    render(App); await screen.findByText("Remote WG");
+    await fireEvent.click(screen.getByRole("button", { name: "DNS" }));
+    await screen.findByRole("button", { name: "Add blocking source" });
+    await waitFor(() => expect((screen.getByRole("button", { name: "Add blocking source" }) as HTMLButtonElement).disabled).toBe(false));
+    await fireEvent.click(screen.getByRole("button", { name: "Add blocking source" }));
+    await screen.findByLabelText("Source 1 name");
+    confirm.mockResolvedValueOnce(false);
+    await fireEvent.click(screen.getByRole("button", { name: /Hosts/ }));
+    await waitFor(() => expect(confirm).toHaveBeenCalledWith(expect.stringContaining("Discard unsaved blocking settings"), expect.anything()));
+    expect(screen.getByRole("heading", { name: "DNS", level: 1 })).toBeTruthy(); expect(screen.getByLabelText("Source 1 name")).toBeTruthy();
+    await fireEvent.click(screen.getByRole("button", { name: /Hosts/ }));
+    await screen.findByRole("heading", { name: "Hosts", level: 1 });
+  });
+
 });

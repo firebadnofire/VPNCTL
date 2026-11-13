@@ -75,14 +75,39 @@ pub fn history(store: &ManifestStore, instance_id: Uuid) -> Result<Reply, Author
     Ok(Reply::RuntimeHistory(entries))
 }
 
-pub fn reconcile(
+pub async fn reconcile(
     store: &ManifestStore,
     instance_id: Uuid,
     mutation_id: Uuid,
 ) -> Result<Reply, AuthorityError> {
     let context = store.runtime_context(instance_id, None)?;
     let pending = context.pending_operation()?;
-    let status = if let Some(receipt) = context.read_record::<Receipt>(mutation_id)? {
+    let status = if let Some(mut receipt) = context.read_record::<Receipt>(mutation_id)? {
+        if receipt.requires_recovery
+            && matches!(&receipt.reply, Reply::OperationFailure(error) if error.code == "dns_blocking_apply_failed")
+        {
+            let revision = receipt.deployed_revision.ok_or_else(|| {
+                AuthorityError::InvalidState("Missing active revision for DNS recovery.".into())
+            })?;
+            let configuration = context.historical_configuration(revision)?;
+            crate::blocking::apply_cached(
+                &context,
+                &configuration,
+                Path::new("/opt/vpn-appliance-manager"),
+            )
+            .await?;
+            let service = project_configuration(&context, &configuration)
+                .await
+                .map_err(|error| AuthorityError::InvalidState(error.message))?;
+            receipt.reply = Reply::Health(
+                service
+                    .health(instance_id)
+                    .await
+                    .map_err(|error| AuthorityError::InvalidState(error.message))?,
+            );
+            receipt.requires_recovery = false;
+            context.record(mutation_id, &receipt)?;
+        }
         if receipt.requires_recovery {
             RuntimeReconciliation::Unresolved
         } else {
@@ -282,6 +307,7 @@ pub async fn execute(
         .flatten();
     let restore_configuration = if restore.is_some() {
         let revision = restored_revision.ok_or_else(|| AuthorityError::InvalidState("This backup lacks a verified configuration revision. Preserve it and use the documented legacy recovery procedure.".into()))?;
+        context.validate_certificate_backup_revision(revision)?;
         let configuration = context.historical_configuration(revision)?;
         if matches!(
             configuration.instance.backend,
@@ -306,14 +332,35 @@ pub async fn execute(
     } else {
         None
     };
-    let service = project_configuration(
-        &context,
-        restore_configuration
-            .as_ref()
-            .unwrap_or(&context.manifest.configuration),
-    )
-    .await
-    .map_err(|error| AuthorityError::InvalidState(error.message))?;
+    let blocking_after = matches!(
+        &operation,
+        Operation::ApplyDeployment { .. }
+            | Operation::RestoreDeployment { .. }
+            | Operation::StartInstance { .. }
+    );
+    let blocking_configuration = restore_configuration
+        .as_ref()
+        .unwrap_or(&context.manifest.configuration)
+        .clone();
+    let mut projection = restore_configuration
+        .as_ref()
+        .unwrap_or(&context.manifest.configuration)
+        .clone();
+    if matches!(
+        &operation,
+        Operation::PreviewDeployment { .. } | Operation::ApplyDeployment { .. }
+    ) {
+        let blocking = context.blocking_state()?;
+        projection.dns_blocklist_domains = crate::blocking::effective_domains(
+            &context,
+            &blocking.policy,
+            &blocking.sources,
+            &projection.dns_blocklist_domains,
+        )?;
+    }
+    let service = project_configuration(&context, &projection)
+        .await
+        .map_err(|error| AuthorityError::InvalidState(error.message))?;
     let prior_deployed_revision = context.deployed()?;
     if mutating {
         context.begin_mutation(request_id)?;
@@ -452,10 +499,36 @@ pub async fn execute(
         }
         _ => unreachable!("operation checked before acquiring runtime lock"),
     };
-    let reply = match result {
+    let mut reply = match result {
         Ok(reply) => reply,
         Err(error) => Reply::OperationFailure(error),
     };
+    let activated_before_blocking = matches!(&reply, Reply::DeploymentResult(result) if result.status == vam_protocol::DeploymentStatus::Succeeded)
+        || (restore.is_some() && matches!(&reply, Reply::Health(_)));
+    if blocking_after
+        && !matches!(reply, Reply::OperationFailure(_))
+        && !matches!(&reply, Reply::DeploymentResult(result) if result.status != vam_protocol::DeploymentStatus::Succeeded)
+        && let Err(error) = crate::blocking::apply_cached(
+            &context,
+            &blocking_configuration,
+            Path::new("/opt/vpn-appliance-manager"),
+        )
+        .await
+    {
+        if context.blocking_state()?.apply_journal.is_some() {
+            let mut failure = AppError::new("dns_blocking_apply_failed", error.to_string());
+            failure.remote_state_changed = true;
+            failure.rollback_succeeded = Some(false);
+            reply = Reply::OperationFailure(failure);
+        } else {
+            let message = format!("DNS blocking needs attention: {error}");
+            match &mut reply {
+                Reply::DeploymentResult(result) => result.health.details.push(message),
+                Reply::Health(health) => health.details.push(message),
+                _ => {}
+            }
+        }
+    }
     if mutating {
         for backup in service
             .list_backups(instance_id)
@@ -467,9 +540,12 @@ pub async fn execute(
             }
         }
         let requires_recovery = matches!(&reply, Reply::OperationFailure(error) if error.remote_state_changed && error.rollback_succeeded != Some(true));
-        let updates_deployment = matches!(&reply, Reply::DeploymentResult(result) if result.status == vam_protocol::DeploymentStatus::Succeeded)
+        let updates_deployment = activated_before_blocking
+            || matches!(&reply, Reply::DeploymentResult(result) if result.status == vam_protocol::DeploymentStatus::Succeeded)
             || (restore.is_some() && matches!(&reply, Reply::Health(_)));
-        let deployed_revision = if restore.is_some() {
+        let deployed_revision = if operation_kind == "start" {
+            prior_deployed_revision
+        } else if restore.is_some() {
             restored_revision
         } else {
             Some(context.manifest.revision)
