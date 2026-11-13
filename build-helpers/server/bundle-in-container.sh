@@ -10,6 +10,10 @@ export CARGO_HOME="/workspace/target/helper-cargo/${architecture}"
 export RUSTUP_TOOLCHAIN=1.97.1
 export CC=musl-gcc
 export OPENSSL_STATIC=1
+if [[ -n "${VAM_RELEASE_TAG:-}" ]]; then
+  node /workspace/build-helpers/release/version.mjs "$VAM_RELEASE_TAG"
+  cargo update --workspace
+fi
 cargo build --locked --release -p vam-server --features bundled-helper --target "$target"
 binary="${CARGO_TARGET_DIR}/${target}/release/vam-server"
 # Execute in the build container to catch ABI/dependency mistakes before embedding.

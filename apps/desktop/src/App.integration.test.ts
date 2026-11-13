@@ -25,7 +25,7 @@ describe("remote-authoritative desktop workflows", () => {
     current = inventory(); candidates = [];
     invoke.mockImplementation(async (command: string) => {
       switch (command) {
-        case "app_info": return { system_username: "tester" };
+        case "app_info": return { system_username: "tester", version: "0.3.10" };
         case "list_hosts": return [host];
         case "preview_local_factory_reset": return { host_ids: [host.id], reset_preferences: true };
         case "legacy_candidates": return candidates;
@@ -48,6 +48,15 @@ describe("remote-authoritative desktop workflows", () => {
     await fireEvent.click(button);
     await screen.findByRole("heading", { name: "Danger Zone", level: 1 });
   }
+  it("displays the version reported by the native application", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "app_info"
+      ? { system_username: "tester", version: "8.7.6-rc.2" } : base(command, args));
+    render(App);
+    await screen.findByText("Version 8.7.6-rc.2");
+    expect(screen.queryByText("Version 0.3.10")).toBeNull();
+    expect(invoke.mock.calls.some(([command]) => command === "discover_remote")).toBe(false);
+  });
   it("loads profiles without connecting until a host is clicked", async () => {
     render(App);
     await screen.findByText("Choose a host to connect");

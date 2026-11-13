@@ -51,10 +51,36 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          missing_tools=""
+          packages=(ca-certificates)
           for tool in git curl docker tar xz sha256sum; do
-            command -v "$tool" >/dev/null || { echo "Missing helper build tool: $tool" >&2; exit 1; }
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              missing_tools="$missing_tools $tool"
+              case "$tool" in
+                docker) packages+=(docker.io) ;;
+                xz) packages+=(xz-utils) ;;
+                sha256sum) packages+=(coreutils) ;;
+                *) packages+=("$tool") ;;
+              esac
+            fi
           done
-          docker info >/dev/null
+          if [ -n "$missing_tools" ]; then
+            command -v apt-get >/dev/null || { echo "Missing helper build tools:$missing_tools. This job requires an apt-based Linux runner image." >&2; exit 1; }
+            elevate=()
+            if [ "$(id -u)" != 0 ]; then
+              command -v sudo >/dev/null || { echo 'Installing helper build tools requires root or passwordless sudo.' >&2; exit 1; }
+              elevate=(sudo -n)
+            fi
+            "${elevate[@]}" apt-get update
+            "${elevate[@]}" env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${packages[@]}"
+          fi
+          for tool in git curl docker tar xz sha256sum; do
+            command -v "$tool" >/dev/null || { echo "Missing helper build tool after bootstrap: $tool" >&2; exit 1; }
+          done
+          if ! docker info >/dev/null; then
+            echo 'Helper builds require a reachable Docker endpoint supplied by the runner. Check DOCKER_HOST or the configured Docker socket; installing the CLI does not provide daemon access.' >&2
+            exit 1
+          fi
           if ! command -v node >/dev/null || [ "$(node --version)" != v24.18.0 ]; then
             case "$(uname -m)" in
               x86_64) node_arch=x64 ;;
@@ -79,6 +105,8 @@ jobs:
       - name: Enable Linux ARM builds
         uses: https://github.com/docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       - name: Build static helper payloads from release source
+        env:
+          VAM_RELEASE_TAG: ${{ forgejo.ref || github.ref }}
         run: bash build-helpers/server/bundle.sh
       # Forgejo requires its patched v4 artifact actions.
       - uses: https://code.forgejo.org/forgejo/upload-artifact@16871d9e8cfcf27ff31822cac382bbb5450f1e1e # v4
@@ -685,6 +713,15 @@ jobs:
         if: ${{ matrix.package.setup_command != '' }}
         shell: ${{ matrix.package.build_shell }}
         run: ${{ matrix.package.setup_command }}
+
+      - name: Derive application version from release tag
+        shell: bash
+        env:
+          VAM_RELEASE_TAG: ${{ forgejo.ref || github.ref }}
+        run: |
+          set -euo pipefail
+          node build-helpers/release/version.mjs "$VAM_RELEASE_TAG"
+          cargo update --workspace
 
       - name: Retrieve matching trusted helper builds
         uses: https://code.forgejo.org/forgejo/download-artifact@d8d0a99033603453ad2255e58720b460a0555e1e # v4

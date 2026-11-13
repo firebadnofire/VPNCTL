@@ -70,7 +70,14 @@ the desktop package's signature covers these embedded bytes.
 
 The helper builder pins Rust 1.97.1 and the existing immutable Node Bookworm base,
 uses musl and vendored OpenSSL, runs a storage-free executable check, and emits
-SHA-256 sidecars. It supports SELinux as the existing Linux desktop builder does.
+SHA-256 sidecars. Helper builds transfer tracked working-tree files through the
+Docker API and copy checked artifacts back; the checkout need not exist at the
+same path on the Docker daemon host. Stage new source files before bundling.
+Ignored/untracked files and Git metadata are not transferred. The builder image
+uses an empty build context, and build containers retain normal SELinux confinement.
+Cargo and compilation caches live in named Docker volumes, retained across runs.
+Set `VAM_HELPER_BUILD_NAMESPACE` to isolate image/cache names (default
+`vpnctl-helper`).
 Build containers default to 4 CPUs/6 GiB (`VAM_HELPER_BUILD_CPUS` and
 `VAM_HELPER_BUILD_MEMORY` override these). `VAM_HELPER_ARCHITECTURES=x86_64` can
 limit a development validation build; production packaging requires both.
@@ -89,3 +96,13 @@ fixture on a managed host.
 For the complete SSH/SFTP repair acceptance check, see
 [`tests/helper-update/README.md`](../tests/helper-update/README.md). It uses a
 loopback-only disposable SSH container and generated keys, not a managed server.
+
+The helper release job bootstraps missing Linux tools before checkout. It needs
+an apt-based job image and an existing reachable Docker endpoint. Runner setup
+must supply that endpoint; installing the Docker CLI does not start a daemon or
+grant socket access. Prefer an isolated builder as described in the
+[Forgejo Docker access documentation](https://forgejo.org/docs/latest/admin/actions/docker-access/).
+
+Run `bash tests/build-helpers/helper-bundle.sh` on a Docker host with amd64/arm64
+emulation to check source/artifact transfer and failure cleanup without compiling
+Rust. The test uses isolated image/cache names and removes its containers/caches.

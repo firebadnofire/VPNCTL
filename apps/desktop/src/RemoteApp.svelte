@@ -24,6 +24,7 @@
   ];
   const tabs = ["Overview", "Peers / Devices", "DNS and Routing", "Deployment", "Settings"];
   let hosts: DockerHost[] = [];
+  let appVersion = "";
   let selectedHostId = "";
   let inventory: RemoteInventory | null = null;
   type ConnectionState = "disconnected" | "loading" | "connected" | "offline" | "error";
@@ -192,8 +193,8 @@
   }
   onMount(async () => {
     await task("Loading saved servers", async () => {
-      const [savedHosts, legacy, info] = await Promise.all([call<DockerHost[]>("list_hosts"), call<LegacyCandidate[]>("legacy_candidates"), call<{ system_username: string }>("app_info")]);
-      hosts = savedHosts; candidates = legacy; defaultUsername = info.system_username; hostForm.username = defaultUsername;
+      const [savedHosts, legacy, info] = await Promise.all([call<DockerHost[]>("list_hosts"), call<LegacyCandidate[]>("legacy_candidates"), call<{ system_username: string; version: string }>("app_info")]);
+      hosts = savedHosts; candidates = legacy; appVersion = info.version; defaultUsername = info.system_username; hostForm.username = defaultUsername;
     });
     // Loading profiles is local only. A host click establishes its connection.
     initialized = true;
@@ -664,7 +665,7 @@
 <svelte:head><title>{host?.display_name ?? "Servers"} · VPNCTL</title></svelte:head>
 <div class="shell">
   <aside class="sidebar" aria-label="Primary navigation">
-    <div class="brand"><div class="mark" aria-hidden="true">VA</div><div><strong>VPNCTL</strong><span>Appliance Manager</span></div></div>
+    <div class="brand"><div class="mark" aria-hidden="true">VA</div><div><strong>VPNCTL</strong><span>Appliance Manager</span>{#if appVersion}<span>Version {appVersion}</span>{/if}</div></div>
     <nav aria-label="Control plane"><h2>Control plane</h2>
       <button disabled={Boolean(busy)} class:active={page === "server" && serverTab === "Overview"} aria-current={page === "server" && serverTab === "Overview" ? "page" : undefined} onclick={() => navigateSection("Overview")}><svg class="nav-glyph" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/></svg><span class="nav-label">Overview</span></button>
       <button disabled={Boolean(busy)} class:active={page === "server" && serverTab === "Hosts"} aria-current={page === "server" && serverTab === "Hosts" ? "page" : undefined} onclick={() => navigateSection("Hosts")}><svg class="nav-glyph" viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="18" height="8" rx="2"/><rect x="3" y="13" width="18" height="8" rx="2"/><path d="M11 7h6M11 17h6"/></svg><span class="nav-label">Hosts</span><span class="nav-count">{hosts.length}</span></button>
