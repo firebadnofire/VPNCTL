@@ -32,7 +32,7 @@ removal, local Factory Reset, instance archiving, and certificate revocation.
 ## Workflow
 
 1. Add a server connection and verify its SSH host-key fingerprint through an independent trusted channel.
-2. Inspect OS, Docker, and Compose readiness. Install the matching helper through the host's trusted administration process.
+2. Click a host to connect; saved hosts are not contacted at startup. Multiple selected hosts stay connected until the app closes. Inspect OS, Docker, and Compose readiness. Install the matching helper through the host's trusted administration process.
 3. Discover or create an instance under the selected server. Manage peers, DNS, routing, and settings there.
 4. Keep unsaved edits as a local draft. **Save to Server** advances desired revision only.
 5. **Preview / Deploy** binds the saved revision and observed deployed state. Deployment stages, validates, backs up, activates, and checks health through the helper.
@@ -144,6 +144,6 @@ and included when blocking is enabled. DNS caches can retain old answers for up
 to their TTL (normally 60 seconds).
 
 These features require a helper advertising `drop_peer_v1` and `dns_blocking_v1`.
-The interface explains when a helper upgrade is needed. No sources are installed
+The desktop automatically repairs compatible older helpers when you select a host or reconnect; failures expose Technical details and a retry path. No sources are installed
 automatically. Blocking policy, downloaded datasets, and refresh results are
 shared across independent VPNCTL installations connecting to the same instance.

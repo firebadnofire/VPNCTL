@@ -248,8 +248,9 @@ fn publish_snapshot(
     checked_path(root, parent)?;
     #[cfg(target_os = "linux")]
     {
-        use nix::fcntl::{OFlag, RenameFlags, open, renameat2};
+        use nix::fcntl::{OFlag, open};
         use nix::sys::stat::Mode;
+        use rustix::fs::{RenameFlags, renameat_with};
         let from = open(
             staging
                 .parent()
@@ -264,7 +265,7 @@ fn publish_snapshot(
             Mode::empty(),
         )
         .map_err(std::io::Error::from)?;
-        renameat2(
+        renameat_with(
             &from,
             staging
                 .file_name()
@@ -273,7 +274,7 @@ fn publish_snapshot(
             destination
                 .file_name()
                 .ok_or_else(|| invalid("missing destination name"))?,
-            RenameFlags::RENAME_NOREPLACE,
+            RenameFlags::NOREPLACE,
         )
         .map_err(std::io::Error::from)?;
     }

@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+bundled-helper = ["reqwest/native-tls-vendored"]
+
 [dependencies]
 reqwest.workspace = true
 url.workspace = true
@@ -30,6 +33,9 @@ x509-parser.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true, features = ["dir"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
 
 [dev-dependencies]
 tempfile.workspace = true

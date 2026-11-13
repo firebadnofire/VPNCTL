@@ -58,7 +58,7 @@ describe("backend-aware presentation components", () => {
     expect(screen.queryByRole("button", { name: "Enable" })).toBeNull();
   });
 
-  it("renders readiness outcomes for every backend", () => {
+  it("renders supported readiness outcomes and omits Xray", () => {
     render(HostReadinessMatrix, {
       view: {
         inspection: {} as never,
@@ -73,7 +73,8 @@ describe("backend-aware presentation components", () => {
         })),
       },
     });
-    expect(screen.getAllByText("Requirements evaluated from one inspection")).toHaveLength(5);
+    expect(screen.getAllByText("Requirements evaluated from one inspection")).toHaveLength(4);
+    expect(screen.queryByText(/xray/i)).toBeNull();
     expect(screen.getByText("Ready with fallback")).toBeTruthy();
   });
 

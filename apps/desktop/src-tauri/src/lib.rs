@@ -12,6 +12,11 @@ mod remote;
 struct AppState(Arc<ApplicationService>);
 
 #[tauri::command]
+async fn connected_hosts(state: State<'_, AppState>) -> Result<Vec<Uuid>, AppError> {
+    state.0.connected_hosts().await
+}
+
+#[tauri::command]
 fn app_info() -> serde_json::Value {
     serde_json::json!({
         "name": "VPNCTL",
@@ -153,8 +158,10 @@ async fn apply_host_provisioning_view(
         .await
 }
 
+include!(concat!(env!("OUT_DIR"), "/helper_payloads.rs"));
+
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .setup(|app| {
@@ -163,10 +170,10 @@ pub fn run() {
             let storage =
                 tauri::async_runtime::block_on(Storage::open(&data_dir.join("state.sqlite")))
                     .map_err(|error| -> Box<dyn std::error::Error> { Box::new(error) })?;
-            app.manage(AppState(Arc::new(ApplicationService::new(
-                storage,
-                Arc::new(KeychainSecretStore),
-            ))));
+            app.manage(AppState(Arc::new(
+                ApplicationService::new(storage, Arc::new(KeychainSecretStore))
+                    .with_helper_payloads(bundled_helpers()),
+            )));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -207,6 +214,7 @@ pub fn run() {
             remote::load_remote_draft,
             remote::discard_remote_draft,
             app_info,
+            connected_hosts,
             create_host,
             update_host,
             list_hosts,
@@ -221,6 +229,17 @@ pub fn run() {
             apply_host_provisioning,
             apply_host_provisioning_view,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running VPNCTL");
+        .build(tauri::generate_context!())
+        .expect("error while building VPNCTL");
+    app.run(|handle, event| {
+        let window_closed = matches!(&event, tauri::RunEvent::WindowEvent { label, event: tauri::WindowEvent::Destroyed, .. } if label == "main");
+        if window_closed || matches!(&event, tauri::RunEvent::ExitRequested { .. }) {
+            if let Err(error) = tauri::async_runtime::block_on(handle.state::<AppState>().0.shutdown_connections()) {
+                eprintln!("SSH shutdown: {}", error.message);
+            }
+            // Closing the last window also quits on macOS; no hidden application
+            // process is left holding management connections.
+            if window_closed { handle.exit(0); }
+        }
+    });
 }

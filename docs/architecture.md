@@ -13,7 +13,19 @@ vam-dev CLI -----------------------+         |                                  
 
 The desktop and CLI use the same Rust service. A local connection profile identifies an SSH destination and approved host key. The appliance UUID is stored on the remote host and is independent of that profile. SSH host-key verification always precedes authentication; the appliance UUID cannot override it. A clone with the same appliance UUID at another verified SSH identity is reported as a duplicate.
 
-`vam-server` is invoked over verified SSH per operation. It does not run as a daemon. Requests and responses are bounded files in an owner-restricted exchange directory; SFTP transfers only those files. The helper validates the caller, protocol and schema, request ID, appliance identity, expected revision, paths, configuration, host-wide allocations and listeners before mutation. Authoritative state and managed runtime changes happen only in the helper.
+Hosts are not contacted at desktop startup. Selecting a host establishes a verified
+SSH session, retained in memory and reused for command and SFTP channels. Multiple
+hosts may stay connected; switching the view does not disconnect them. Idle
+sessions send keepalives; broken sockets are reported without automatic background
+reconnection. Closing the main window or quitting permanently stops new
+connections, closes all retained sessions, and exits the desktop process,
+including on macOS. The operating system closes sockets on forced termination.
+No connection or passphrase is persisted as part of the session pool. Removing a
+profile, changing its SSH settings, or explicitly replacing its approved host key
+closes the affected session. Closing the desktop does not stop server VPN services;
+an interrupted remote operation is reconciled on the next connection.
+
+`vam-server` is invoked over verified SSH per operation. It does not run as a daemon. Requests and responses are bounded files in an owner-restricted exchange directory; SFTP transfers exchange files and, during automatic helper repair, a private executable staging file; it never writes authoritative manifests. The helper validates the caller, protocol and schema, request ID, appliance identity, expected revision, paths, configuration, host-wide allocations and listeners before mutation. Authoritative state and managed runtime changes happen only in the helper.
 
 The active remote manifest format is protocol 2, schema 1. Its public configuration contains stable instance and peer UUIDs, backend settings, DNS, routing, listeners, allocations and public secret references. It omits local credential references and private keys. Each instance has immutable desired generations and a synchronized, atomically replaced `current` pointer. An exclusive filesystem lock serializes helper mutations. New PSKs are stored and synchronized before their referencing manifest commits. Retained generations, deployment backups and recovery bundles keep referenced material; no routine garbage collection removes it.
 

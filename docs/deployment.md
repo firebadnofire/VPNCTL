@@ -36,9 +36,9 @@ changing data. The older `remove` operation remains an alias on updated helpers.
 
 A complete disaster-recovery bundle is created through the helper and includes the control directory, active runtime trees and retained backups. It contains secrets and must be stored with restricted permissions. Recovery should restore the bundle as a unit on a compatible host, verify the appliance identity and SSH host key separately, inspect all manifests and runtime state, then resume mutation traffic. Never copy an appliance UUID to a clone and treat it as SSH trust.
 
-The helper must already be installed at `/usr/local/libexec/vam-server` on a new host. Installing or replacing that executable is a trusted host administration step outside the manifest RPC. The current desktop/CLI do not automatically install or upgrade it. Ensure the installed helper and client support the same protocol and schema before performing writes; incompatible versions refuse them.
+The helper must already be installed at `/usr/local/libexec/vam-server` on a new host. Installing or replacing that executable is a trusted host administration step outside the manifest RPC. First installation remains an explicit administration step. The desktop automatically repairs missing supported capabilities on a verified, compatible helper when the user connects or synchronizes; the CLI retains separately administered upgrades. Ensure the installed helper and client support the same protocol and schema before performing writes; incompatible versions refuse them.
 
-Restorable instance archival requires a helper advertising `instance_archives_v1`. If the desktop reports a helper update is required, update `/usr/local/libexec/vam-server` using the validated Linux helper deployment procedure, then Refresh / Reconnect. Updating the desktop alone does not update the server. A rejected archive request leaves the instance active; do not use legacy removal as a workaround.
+Restorable instance archival requires a helper advertising `instance_archives_v1`. The desktop bundles matching Linux x86_64/aarch64 helpers and automatically repairs a compatible older helper on connection. No host is contacted merely by starting the app. If automatic repair fails, expand Technical details and use Refresh / Reconnect after addressing the reported prerequisite (for example passwordless sudo or disk space). A rejected archive request leaves the instance active; do not use legacy removal as a workaround.
 
 ## Independent DNS blocking updates
 
@@ -78,3 +78,30 @@ has since been dropped. The older snapshot cannot prove it retains the newer
 CA/CRL state. This conservative check can also refuse a snapshot taken after a
 revocation but before a subsequent VPN deployment; preserve such snapshots for
 explicit operator recovery rather than weakening certificate trust.
+
+## Automatic helper repair and recovery
+
+Repair requires the existing protocol 2/schema 1 Info handshake, approved SSH key,
+and unchanged appliance/machine identities. It never approves a fingerprint,
+converts a schema, deploys desired configuration, or restarts VPN containers.
+Helpers already advertising all required capabilities are left untouched.
+Unsupported platforms, incompatible schemas, missing build payloads, and changed
+identities produce explicit failures instead of an attempted migration.
+
+The desktop contains immutable helper bytes built from the release source. There
+is no runtime code download. A private SSH upload is copied to a root-owned
+candidate, SHA-256 checked, and executed with `self-check` before installation.
+The installer checks ownership, rejects symlinks and writable system directories,
+and locks both helper installation and the existing control-store mutation lock.
+It rechecks the previous executable checksum under the lock, preserves a concurrently
+installed capable helper, and refuses unrecognized concurrent changes. It keeps
+`/usr/local/libexec/vam-server.backup-<old-sha256>` and atomically replaces
+only the executable. Failed post-install verification restores that backup.
+A lost response is resolved by fresh identity/capability discovery on reconnect;
+no VPN mutation is replayed. A rollback failure is exposed in Technical details.
+
+Backup helpers remain on the server for operator recovery. To restore one, stop
+management traffic, verify its checksum and compatibility, copy it to a
+root-owned sibling candidate, and atomically replace the executable under both
+locks. Preserve a complete control/runtime recovery backup for any manual helper
+version change; executable rollback cannot reverse a schema migration.

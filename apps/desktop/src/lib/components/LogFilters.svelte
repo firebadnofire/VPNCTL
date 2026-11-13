@@ -1,7 +1,7 @@
 <script lang="ts">
   import type { ActivityFilter, DockerHost, VpnBackendKind, VpnInstance } from "../types";
   let { value, hosts, instances, onchange }: { value: ActivityFilter; hosts: DockerHost[]; instances: VpnInstance[]; onchange: (value: ActivityFilter) => void } = $props();
-  const backends: VpnBackendKind[] = ["wireguard", "amnezia_wg", "openvpn", "ikev2", "xray"];
+  const backends: VpnBackendKind[] = ["wireguard", "amnezia_wg", "openvpn", "ikev2"];
   function update(field: keyof ActivityFilter, next: string) { onchange({ ...value, [field]: next || null }); }
 </script>
 <div class="log-filters">

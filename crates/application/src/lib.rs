@@ -64,9 +64,11 @@ use vam_ssh::{CommandResult, RusshTransport, SshError, SshTransport, UploadReque
 use vam_storage::{ActivityRecord, BackupRecord, Storage, StorageError};
 
 mod authority_sync;
+mod helper_update;
 mod migration;
 mod remote;
 mod remote_certificates;
+pub use helper_update::HelperPayload;
 
 pub use migration::LegacyMigrationPreview;
 mod cleanup;
@@ -1074,6 +1076,7 @@ pub struct ApplicationService {
     pub secrets: Arc<dyn SecretStore>,
     transport: Arc<dyn SshTransport>,
     manifest_exchange: Arc<dyn vam_authority_client::ManifestExchange>,
+    helper_payloads: Option<Arc<Vec<HelperPayload>>>,
     runtime_projection: Option<Arc<DesiredState>>,
     backends: Arc<BackendRegistry>,
     instance_locks: Arc<Mutex<HashMap<Uuid, Arc<Mutex<()>>>>>,
@@ -1107,6 +1110,7 @@ impl ApplicationService {
                 transport.clone(),
             )),
             transport,
+            helper_payloads: None,
             runtime_projection: None,
             backends: Arc::new(BackendRegistry::new(backends)),
             instance_locks: Arc::default(),
@@ -1121,6 +1125,37 @@ impl ApplicationService {
         exchange: Arc<dyn vam_authority_client::ManifestExchange>,
     ) -> Self {
         self.manifest_exchange = exchange;
+        self
+    }
+
+    pub async fn shutdown_connections(&self) -> Result<(), AppError> {
+        self.transport.shutdown().await.map_err(ssh_error)
+    }
+
+    /// Inspect only existing sockets; never initiates SSH or reads credentials.
+    pub async fn connected_hosts(&self) -> Result<Vec<Uuid>, AppError> {
+        let mut connected = Vec::new();
+        for host in self.list_hosts().await? {
+            if let Some(trusted) = self
+                .storage
+                .known_host_key(host.id)
+                .await
+                .map_err(storage_error)?
+                && self
+                    .transport
+                    .is_connected(&host.ssh, &trusted.public_key_base64)
+                    .await
+            {
+                connected.push(host.id);
+            }
+        }
+        Ok(connected)
+    }
+
+    /// Payloads must come from the signed desktop build, never a runtime URL.
+    #[must_use]
+    pub fn with_helper_payloads(mut self, payloads: Vec<HelperPayload>) -> Self {
+        self.helper_payloads = Some(Arc::new(payloads));
         self
     }
 
@@ -1239,12 +1274,19 @@ impl ApplicationService {
 
     pub async fn update_host(&self, host: DockerHost) -> Result<DockerHost, AppError> {
         let _guard = self.cleanup_guard.read().await;
-        self.storage
+        let previous = self
+            .storage
             .get_host(host.id)
             .await
             .map_err(storage_error)?;
         if host.display_name.trim().is_empty() || host.ssh.hostname.trim().is_empty() {
             return Err(validation_error("Host name and address are required."));
+        }
+        if previous.ssh != host.ssh {
+            self.transport
+                .disconnect_host(&previous.ssh)
+                .await
+                .map_err(ssh_error)?;
         }
         self.storage.save_host(&host).await.map_err(storage_error)?;
         Ok(host)
@@ -1351,6 +1393,17 @@ impl ApplicationService {
                 ),
                 technical_detail: None,
             });
+        }
+        if replace_changed_key {
+            let host = self
+                .storage
+                .get_host(host_id)
+                .await
+                .map_err(storage_error)?;
+            self.transport
+                .disconnect_host(&host.ssh)
+                .await
+                .map_err(ssh_error)?;
         }
         self.storage
             .approve_host_key(host_id, &current.key, replace_changed_key)
@@ -1586,7 +1639,6 @@ fi
             VpnBackendKind::AmneziaWg,
             VpnBackendKind::OpenVpn,
             VpnBackendKind::Ikev2,
-            VpnBackendKind::Xray,
         ]
         .into_iter()
         .filter_map(|backend| {

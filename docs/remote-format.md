@@ -35,7 +35,7 @@ Deployment backup and rollback act on runtime trees, not control generations. A 
 
 Desktop/CLI and helper exchange protocol version 2 and manifest schema version 1. The helper negotiates compatibility before opening or creating authoritative storage. A mismatched client receives `incompatible` and must not write. The schema number is checked when reading every committed generation.
 
-Helper Info also advertises optional capabilities. Restorable instance archive and restore require `instance_archives_v1`; protocol version 2 alone does not imply support. Missing capabilities default to empty for older helpers. Clients refuse these operations until the helper is updated and freshly verified; they never fall back to legacy removal.
+Helper Info also advertises optional capabilities. Restorable instance archive and restore require `instance_archives_v1`; protocol version 2 alone does not imply support. Missing capabilities default to empty for older helpers. The desktop repairs a compatible older helper from its embedded release payload on user-initiated connection/synchronization; CLI users administer upgrades separately. Clients refuse unsupported operations until the helper is updated and freshly verified; they never fall back to legacy removal.
 
 There is no in-place schema upgrader in this version. To move to a future schema: stop mutation traffic, create and verify a complete control/recovery backup, install a helper and clients that explicitly support both source and destination schemas, validate a conversion of every retained generation and secret reference, and atomically publish upgraded generations only after validation. Keep the original backup until discovery, history, deployment observation and recovery have been verified. A version without a reviewed converter must refuse the write and leave control state untouched.
 
@@ -78,3 +78,10 @@ replacement mutation after a timeout. Unsupported helpers refuse the new
 operations; clients must check capabilities before exposing them as available.
 The fixed privileged `blocking-refresh` helper subcommand services the optional
 systemd timer and accepts no client paths or arbitrary commands.
+
+The fixed `self-check` subcommand reports executable protocol/schema/capabilities
+without opening the control store or requiring sudo identity. It is used only to
+validate root-owned update candidates. It does not initialize an appliance or
+perform a manifest/schema conversion. Automatic repair changes no remote format,
+revision, pending-operation marker, blocking policy, or deployed state. See
+[deployment and recovery](deployment.md#automatic-helper-repair-and-recovery).

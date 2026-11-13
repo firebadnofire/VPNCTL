@@ -56,7 +56,7 @@
 </script>
 <section class="blocking-panel" aria-label="DNS blocking">
   <header class="section-toolbar"><div><h3>Blocking</h3><p>Lists belong to this instance and are shared across VPNCTL installations. Blocking updates do not deploy pending VPN changes.</p></div></header>
-  {#if !supported}<p>Update this server’s VPNCTL helper to enable per-instance DNS blocking.</p>
+  {#if !supported}<p>Reconnect to repair this server’s VPNCTL helper automatically and enable per-instance DNS blocking.</p>
   {:else if !online}<p>Reconnect to read and manage blocking. Saved server schedules continue while VPNCTL is closed.</p>
   {:else}
     <button class="secondary" type="button" disabled={loading || Boolean(busy)} onclick={load}>Reload blocking settings</button>

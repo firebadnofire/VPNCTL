@@ -19,8 +19,15 @@ async fn main() -> ExitCode {
 }
 
 async fn run() -> Result<String, vam_server::ServerError> {
-    ensure_privileged()?;
     let command = parse_invocation(std::env::args_os())?;
+    // Executable/ABI check for a root-owned upgrade candidate. No storage is opened.
+    if matches!(command, Command::SelfCheck) {
+        return Ok(
+            "vpnctl-helper protocol=2 schema=1 instance_archives_v1 drop_peer_v1 dns_blocking_v1"
+                .into(),
+        );
+    }
+    ensure_privileged()?;
     if matches!(command, Command::BlockingRefresh) {
         ServerRuntime::new(MANAGEMENT_ROOT)
             .refresh_due_blocklists()
@@ -30,7 +37,9 @@ async fn run() -> Result<String, vam_server::ServerError> {
     let caller = CallerIdentity::from_sudo_environment()?;
     let runtime = ServerRuntime::new(MANAGEMENT_ROOT);
     match command {
-        Command::BlockingRefresh => unreachable!("handled without a sudo exchange"),
+        Command::SelfCheck | Command::BlockingRefresh => {
+            unreachable!("handled without a sudo exchange")
+        }
         Command::Prepare => {
             runtime.prepare_exchange(caller)?;
             Ok(format!("exchange_uid={}", caller.uid))

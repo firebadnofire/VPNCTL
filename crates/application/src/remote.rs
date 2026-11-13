@@ -886,6 +886,7 @@ impl ApplicationService {
     }
 
     pub async fn discover_remote(&self, host_id: Uuid) -> Result<RemoteInventory, AppError> {
+        self.ensure_remote_helper(host_id).await?;
         let Reply::Discovery(discovery) = self
             .remote_operation(host_id, Uuid::new_v4(), Operation::Discover)
             .await?
@@ -1362,7 +1363,7 @@ fn archive_upgrade_required() -> AppError {
         "helper_upgrade_required",
         "The server helper does not support restorable archives. The archive or restore operation has not run.",
     );
-    error.remediation = Some("Update the VPNCTL helper at /usr/local/libexec/vam-server on this server, then Refresh / Reconnect. The desktop app and server helper must both support archived-instance recovery.".into());
+    error.remediation = Some("Use Refresh / Reconnect in the desktop to repair a compatible older helper automatically. CLI users must install a validated helper at /usr/local/libexec/vam-server. The desktop app and server helper must both support archived-instance recovery.".into());
     error
 }
 

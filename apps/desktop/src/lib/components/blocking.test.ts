@@ -51,5 +51,5 @@ it("retries a lost refresh response with the same request and shows stale status
   expect(invoke.mock.calls[1][1]).toEqual(invoke.mock.calls[2][1]);
 });
 it("explains missing helper support without issuing a request", () => {
-  mount(false); expect(screen.getByText(/Update this server/)).toBeTruthy(); expect(invoke).not.toHaveBeenCalled();
+  mount(false); expect(screen.getByText(/Reconnect to repair this server/)).toBeTruthy(); expect(invoke).not.toHaveBeenCalled();
 });

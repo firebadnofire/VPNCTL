@@ -58,3 +58,34 @@ The clean helpers remove only these generated paths:
 
 The Linux builder image is retained as a cache. Set
 `VAM_CLEAN_DOCKER_IMAGE=1` when invoking `linux/clean.sh` to remove it too.
+
+## Embedded server helpers
+
+Release desktop builds require matching Linux x86_64 and aarch64 helper payloads
+in `target/vam-server-dist/<architecture>-unknown-linux-musl/vam-server`.
+Run `bash build-helpers/server/bundle.sh` with Docker and amd64/arm64 emulation
+before packaging, or set `VAM_HELPER_BUNDLE_DIR` to that directory from a trusted
+build of the same source. Never use an unverified downloaded executable here:
+the desktop package's signature covers these embedded bytes.
+
+The helper builder pins Rust 1.97.1 and the existing immutable Node Bookworm base,
+uses musl and vendored OpenSSL, runs a storage-free executable check, and emits
+SHA-256 sidecars. It supports SELinux as the existing Linux desktop builder does.
+Build containers default to 4 CPUs/6 GiB (`VAM_HELPER_BUILD_CPUS` and
+`VAM_HELPER_BUILD_MEMORY` override these). `VAM_HELPER_ARCHITECTURES=x86_64` can
+limit a development validation build; production packaging requires both.
+Tagged release CI builds these artifacts once, then embeds the same artifacts in
+each desktop package. Debug builds allow absent payloads and report automatic
+repair as unavailable rather than downloading replacement code. Release builds
+fail clearly when either payload is absent or has the wrong ELF architecture.
+
+`tests/helper-update/installer.sh` exercises install, idempotence, checksum/ABI
+failure, post-install rollback, symlink refusal, and control-data preservation.
+Run it only in a disposable Linux container with
+`VPNCTL_DISPOSABLE_INSTALLER_TEST=1`; optionally set `VPNCTL_TEST_HELPER` to a
+built static helper to exercise the real executable. Never run this root-path
+fixture on a managed host.
+
+For the complete SSH/SFTP repair acceptance check, see
+[`tests/helper-update/README.md`](../tests/helper-update/README.md). It uses a
+loopback-only disposable SSH container and generated keys, not a managed server.

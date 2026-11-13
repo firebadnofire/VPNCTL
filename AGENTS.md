@@ -70,7 +70,7 @@ Known remote locations (verify in code before changing their use):
 
 The control store is deliberately outside the runtime activation tree. Never make rollback, Compose replacement, or instance archival overwrite committed desired generations.
 
-Installing or upgrading the remote helper is a separately trusted host-administration operation. Do not imply that simply updating the desktop updates `/usr/local/libexec/vam-server`.
+First installation of the remote helper is a separately trusted host-administration operation. On a user-initiated connection or synchronization, the desktop may automatically repair a compatible older helper from its embedded release payload, with verified SSH/appliance identities, protected staging, locking, backup, and rollback. This does not authorize schema conversion, VPN deployment, or connecting to saved hosts at app startup. CLI helper upgrades remain separately administered.
 
 ## 4. Server authority, reconciliation, and concurrency
 

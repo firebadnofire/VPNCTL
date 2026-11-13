@@ -1,5 +1,5 @@
 //! Shared desktop/CLI cleanup entry points. Local cleanup never performs SSH
-//! or rewrites native credentials; its only mutation is a durable `SQLite` commit.
+//! or rewrites native credentials; its only persistent mutation is a durable `SQLite` commit. Retained sockets are closed.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -41,6 +41,21 @@ impl ApplicationService {
         let _guard = self.cleanup_guard.write().await;
         scope.host_ids.sort_unstable();
         scope.host_ids.dedup();
+        for host_id in &scope.host_ids {
+            if let Some(host) = self
+                .storage
+                .list_hosts()
+                .await
+                .map_err(storage_error)?
+                .into_iter()
+                .find(|host| host.id == *host_id)
+            {
+                self.transport
+                    .disconnect_host(&host.ssh)
+                    .await
+                    .map_err(super::ssh_error)?;
+            }
+        }
         // Existing legacy deployment/credential mutations use these locks.
         // Drain them before validating or pinning any recovery references.
         let mut instance_ids = Vec::new();

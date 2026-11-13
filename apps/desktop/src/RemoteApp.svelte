@@ -26,7 +26,32 @@
   let hosts: DockerHost[] = [];
   let selectedHostId = "";
   let inventory: RemoteInventory | null = null;
-  let connection: "disconnected" | "loading" | "connected" | "offline" | "error" = "disconnected";
+  type ConnectionState = "disconnected" | "loading" | "connected" | "offline" | "error";
+  let connection: ConnectionState = "disconnected";
+  let hostSessions: Record<string, { inventory: RemoteInventory | null; connection: ConnectionState; error: AppError | null; errorOperation: string }> = {};
+  let connectionTimer: ReturnType<typeof setInterval> | undefined;
+  let connectionGeneration = 0;
+  function rememberHost() {
+    if (selectedHostId) hostSessions = { ...hostSessions, [selectedHostId]: { inventory, connection, error, errorOperation } };
+  }
+  async function checkConnections() {
+    if (busy || !Object.values(hostSessions).some(session => session.connection === "connected")) return;
+    const epoch = contextEpoch, generation = connectionGeneration, sessions = hostSessions;
+    try {
+      const connected = await call<string[]>("connected_hosts");
+      if (epoch !== contextEpoch || generation !== connectionGeneration) return;
+      for (const [id, session] of Object.entries(sessions)) {
+        if (hostSessions[id] !== session) continue;
+        if (session.connection === "connected" && !connected.includes(id)) {
+          const retained = session.inventory ? { ...session.inventory, cached: true } : null;
+          hostSessions = { ...hostSessions, [id]: { ...session, inventory: retained, connection: retained ? "offline" : "disconnected" } };
+          if (selectedHostId === id && connection === "connected") { inventory = retained; connection = retained ? "offline" : "disconnected"; closeExport(); }
+        }
+      }
+    } catch (cause) {
+      if (epoch === contextEpoch && generation === connectionGeneration && !error) { error = cause as AppError; errorOperation = "Checking SSH connections"; }
+    }
+  }
   let page: "server" | "add-server" | "create-instance" | "migration" = "server";
   let serverTab = "Overview";
   let blockingDirty = false;
@@ -112,7 +137,8 @@
   let pendingCleanup: { operationId: string; hostIds: string[]; resetPreferences: boolean } | null = null;
   let pendingArchiveRestore: { hostId: string; instanceId: string; expectedRevision: number; requestId: string } | null = null;
   let pendingInstanceArchive: { hostId: string; instanceId: string; input: { host_id: string; expected_revision: number; request_id: string; configuration: Configuration } } | null = null;
-  onDestroy(() => { contextEpoch++; closeExport(); clearTimeout(draftTimer); notifications.destroy(); });
+  onDestroy(() => {
+    clearInterval(connectionTimer); contextEpoch++; closeExport(); clearTimeout(draftTimer); notifications.destroy(); });
   function scheduleDraft() { closeExport(); clearTimeout(draftTimer); draftTimer = setTimeout(() => { void retainDraft(); }, 300); }
   $: host = hosts.find((item) => item.id === selectedHostId);
   $: eligibleLocalLegacyInstances = candidates.filter((candidate) => candidate.supported);
@@ -143,6 +169,7 @@
 
   async function task<T>(label: string, action: () => Promise<T>): Promise<T | undefined> {
     const epoch = contextEpoch;
+    connectionGeneration++;
     busy = label; lastTaskFailed = false;
     try {
       const result = await action();
@@ -168,17 +195,23 @@
       const [savedHosts, legacy, info] = await Promise.all([call<DockerHost[]>("list_hosts"), call<LegacyCandidate[]>("legacy_candidates"), call<{ system_username: string }>("app_info")]);
       hosts = savedHosts; candidates = legacy; defaultUsername = info.system_username; hostForm.username = defaultUsername;
     });
-    if (hosts.length) await selectServer(hosts[0].id);
+    // Loading profiles is local only. A host click establishes its connection.
     initialized = true;
+    connectionTimer = setInterval(checkConnections, 5000);
   });
-  async function selectServer(id: string, section = "Overview") {
+  async function selectServer(id: string, section = "Overview", connect = true) {
     if (blockingDirty && !await leaveBlocking()) return;
     if (dirty && !(await retainDraft())) return;
+    rememberHost();
     closeExport(); enrolledPeerId = "";
     contextEpoch++; busy = ""; review = null; error = null; errorOperation = "";
     selectedHostId = id; selected = null; draft = null; inventory = null; inspection = null; probe = null;
     dangerInstanceId = ""; dangerPeerId = "";
-    plan = null; health = null; backups = []; restorePreview = null; page = "server"; serverTab = section; await refreshServer();
+    plan = null; health = null; backups = []; restorePreview = null; page = "server"; serverTab = section;
+    const session = hostSessions[id];
+    connection = session?.connection ?? "disconnected";
+    inventory = session?.inventory ?? null; error = session?.error ?? null; errorOperation = session?.errorOperation ?? "";
+    if (connect && connection !== "connected") await refreshServer();
   }
   async function navigateSection(section: string) {
     if (blockingDirty && !await leaveBlocking()) return;
@@ -206,7 +239,7 @@
     connection = "loading";
     // Reconnection invalidates earlier health observations; SSH alone never verifies VPN health.
     observedHealth = {}; health = null;
-    const fresh = await task("Synchronizing server", () => call<RemoteInventory>("discover_remote", { hostId: id }));
+    const fresh = await task("Synchronizing server and checking helper", () => call<RemoteInventory>("discover_remote", { hostId: id }));
     if (selectedHostId !== id || epoch !== contextEpoch) return;
     if (fresh) {
       const hadEdits = dirty;
@@ -232,6 +265,7 @@
       try { const cached = await call<RemoteInventory | null>("cached_remote_inventory", { hostId: id }); if (epoch !== contextEpoch) return; inventory = cached; if (inventory) connection = "offline"; }
       catch (cause) { if (epoch === contextEpoch) error = cause as AppError; }
     }
+    if (epoch === contextEpoch) rememberHost();
   }
   async function retainDraft() {
     clearTimeout(draftTimer);
@@ -410,6 +444,7 @@
       await call("cleanup_local", { ...target, confirmed: true });
       pendingCleanup = null;
       hosts = hosts.filter((item) => !target.hostIds.includes(item.id));
+      hostSessions = Object.fromEntries(Object.entries(hostSessions).filter(([id]) => !target.hostIds.includes(id)));
       candidates = candidates.filter((item) => !target.hostIds.includes(item.host_id));
       selectedHostId = ""; inventory = null; selected = null; draft = null; inspection = null; probe = null;
       plan = null; health = null; backups = []; restorePreview = null; availability = []; history = []; runtimeHistory = [];
@@ -424,7 +459,7 @@
     });
     if (completed) {
       notify(resetPreferences ? "Local Factory Reset completed. VPN recovery data is preserved; servers are unchanged." : "Host removed locally. VPN recovery data is preserved; server instances keep running.");
-      if (hosts.length) await selectServer(hosts[0].id, "Danger Zone");
+
     }
   }
   async function archiveDangerInstance() {
@@ -609,7 +644,7 @@
     if (busy) return;
     const created = await task("Saving server connection", () => call<DockerHost>("create_host", { input: { ...hostForm, passphrase: hostForm.passphrase || null } }));
     hostForm.passphrase = "";
-    if (created) { notify("Server connection saved. Verify its SSH identity before connecting.", "info"); hosts = [...hosts, created]; await selectServer(created.id); }
+    if (created) { notify("Server connection saved. Verify its SSH identity before connecting.", "info"); hosts = [...hosts, created]; await selectServer(created.id, "Hosts", false); }
   }
   async function previewMigration(id: string) {
     const result = await task("Previewing local legacy migration", () => call<MigrationPreview>("preview_legacy_migration", { instanceId: id, destinationHostId: migrationDestination || selectedHostId }));
@@ -646,27 +681,27 @@
     <div class="topbar"><div class="breadcrumbs"><span>Workspace</span><span aria-hidden="true">/</span><strong>{page === "add-server" ? "Add Server" : page === "create-instance" ? "Create Instance" : page === "migration" ? "Migration" : serverTab}</strong></div><button class="secondary" onclick={openActivity}>Activity</button><div class="topbar-state"><span class="connection-dot" data-state={connection}></span>{host ? `${host.display_name} · ${connectionLabel}` : "No server selected"}</div></div>
   <main class="app-main">
     {#if busy}<div class="progress" role="status">{busy}…</div>{/if}
-    {#if error}<div class="alert" role="alert"><div><strong>{error.message}</strong>{#if error.remediation}<p>{error.remediation}</p>{/if}{#if error.code === "revision_conflict"}<p>Your local draft is retained. Reload after reviewing the server’s changes.</p>{/if}</div><button aria-label="Dismiss error" onclick={() => error = null}>×</button></div>{/if}
+    {#if error}<div class="alert" role="alert"><div><strong>{error.message}</strong>{#if error.remediation}<p>{error.remediation}</p>{/if}{#if error.code === "revision_conflict"}<p>Your local draft is retained. Reload after reviewing the server’s changes.</p>{/if}{#if error.technical_detail}<details class="error-details"><summary>Technical details</summary><pre>{error.technical_detail}</pre></details>{/if}</div><button aria-label="Dismiss error" onclick={() => error = null}>×</button></div>{/if}
     {#if page === "server" && serverTab === "Danger Zone"}
       <header class="page-head"><div><p class="eyebrow">Workspace / Destructive actions</p><h1>Danger Zone</h1><p class="subtitle">Remove local connections, reset the client, or archive a server instance. Every action requires confirmation.</p></div></header>
       <div class="danger-zone">
         <section class="card danger-preservation"><h2>Recovery data stays protected</h2><p>Local removal and reset preserve VPN configurations, generated client keys, and recovery bindings. SSH key files and exported VPN configurations are never deleted. Factory Reset is not secure erasure.</p></section>
         {#if pendingCleanup}<div class="alert" role="status">A local cleanup needs reconciliation. Retry the same action to check its original operation; its host selection will not change.</div>{/if}
-        {#if hosts.length}<section class="card"><label>Danger Zone host<select value={selectedHostId} disabled={Boolean(busy) || Boolean(pendingCleanup)} onchange={(event) => selectServer(event.currentTarget.value, "Danger Zone")}>{#each hosts as server}<option value={server.id}>{server.display_name} · {server.ssh.username}@{server.ssh.hostname}:{server.ssh.port}</option>{/each}</select></label><p>Remote actions affect this host only. Factory Reset applies to all saved hosts.</p></section>{/if}
+        {#if hosts.length}<section class="card"><label>Danger Zone host<select value={selectedHostId} disabled={Boolean(busy) || Boolean(pendingCleanup)} onchange={(event) => selectServer(event.currentTarget.value, "Danger Zone")}><option value="" disabled>Choose a host</option>{#each hosts as server}<option value={server.id}>{server.display_name} · {server.ssh.username}@{server.ssh.hostname}:{server.ssh.port}</option>{/each}</select></label><p>Remote actions affect this host only. Factory Reset applies to all saved hosts.</p></section>{/if}
         <section class="card danger-row"><div><h2>Local drop</h2><p>Remove {host?.display_name ?? "the selected host"} from this machine, including its connection, cache, and drafts. Server instances keep running. Reconnect to the verified appliance to access them again.</p></div><button class="danger-action" disabled={!initialized || !host || Boolean(busy) || (Boolean(pendingCleanup) && pendingCleanup?.resetPreferences !== false)} onclick={() => cleanupLocal(false)}>{pendingCleanup && !pendingCleanup.resetPreferences ? "Retry local drop" : "Remove host locally"}</button></section>
         <section class="card danger-row"><div><h2>Full drop</h2><p>Would permanently remove all current VPNCTL-managed instances from this server, then remove the local connection.</p><p id="full-drop-unavailable">Unavailable: safe server ownership checks and recovery archives are not ready. No full-server deletion will run.</p></div><button class="danger-action" disabled aria-describedby="full-drop-unavailable">Full drop unavailable</button></section>
         <section class="card danger-row"><div><h2>Factory Reset · local data only</h2><p>Remove all saved host profiles, connection state, caches, and drafts, and reset application preferences. You will confirm the full profile count before continuing. Servers remain unchanged; VPN recovery data survives.</p></div><button class="danger-action" disabled={!initialized || Boolean(busy) || (Boolean(pendingCleanup) && pendingCleanup?.resetPreferences !== true)} onclick={() => cleanupLocal(true)}>{pendingCleanup?.resetPreferences ? "Retry local Factory Reset" : "Factory Reset local data"}</button></section>
         <section class="card danger-row"><div><h2>Factory Reset · remove remote data</h2><p>Would clean each distinct verified saved appliance before resetting the client.</p><p id="remote-reset-unavailable">Unavailable for the same server ownership and archive requirements as full drop.</p></div><button class="danger-action" disabled aria-describedby="remote-reset-unavailable">Remote Factory Reset unavailable</button></section>
         <section class="card"><h2>Instance and device actions</h2>
-          {#if !host}<p>Add a host to manage its instances.</p>{:else}
+          {#if !host}<p>{hosts.length ? "Select a host above to manage its instances." : "Add a host to manage its instances."}</p>{:else}
             <p>{host.display_name} · {online ? "Live connection" : "Remote actions require a live connection."}</p>
             <button class="secondary" disabled={Boolean(busy) || Boolean(pendingCleanup)} onclick={refreshServer}>Refresh / Reconnect</button>
             {#if inventory?.discovery.instances.length}<label>Managed instance<select value={dangerInstance?.configuration.instance.id ?? ""} disabled={Boolean(busy) || Boolean(pendingCleanup) || Boolean(pendingDrop)} onchange={(event) => { dangerInstanceId = event.currentTarget.value; dangerPeerId = ""; }}>{#each inventory.discovery.instances as item}<option value={item.configuration.instance.id}>{item.configuration.instance.display_name}</option>{/each}</select></label>{:else}<p>{online ? "No managed instances available." : "Connect to load the server inventory."}</p>{/if}
-            {#if online && !supportsInstanceArchives}<div class="alert" role="status">Server helper update required. Archiving is unavailable until the VPNCTL helper on this server is updated. Then Refresh / Reconnect. The instance remains active unless archival succeeds.</div>{/if}
+            {#if online && !supportsInstanceArchives}<div class="alert" role="status">Automatic helper repair is required. Use Refresh / Reconnect to install the matching bundled helper and check server capabilities. Any repair failure appears above with a retry explanation. The instance remains active unless archival succeeds.</div>{/if}
             <div class="danger-row"><div><h3>Archive instance on server</h3><p>Stop the selected VPN instance and disconnect its users. Saved history and server recovery data are retained. This does not permanently erase the instance.</p></div><button class="danger-action" disabled={!online || !supportsInstanceArchives || !dangerInstance || Boolean(busy) || Boolean(pendingCleanup) || (Boolean(pendingInstanceArchive) && (pendingInstanceArchive?.hostId !== selectedHostId || pendingInstanceArchive?.instanceId !== dangerInstance?.configuration.instance.id))} onclick={archiveDangerInstance}>Archive instance on server</button></div>
             <div class="danger-row"><div><h3>Drop Device</h3><p>Remove a device identity and its managed DNS records from the saved server configuration. Certificate devices are revoked first. Deploy separately to apply access changes.</p>
             {#if dropPeers.length}<label>Device<select value={dropPeer?.id ?? ""} disabled={Boolean(busy) || Boolean(pendingDrop)} onchange={(event) => dangerPeerId = event.currentTarget.value}>{#each dropPeers as peer}<option value={peer.id}>{peer.display_name}{peer.enabled ? "" : " (disabled / revoked)"}</option>{/each}</select></label>{:else}<p>No devices in this instance.</p>{/if}
-            {#if !supportsDropPeer}<p>Update the server helper to support device removal.</p>{/if}{#if !online}<p>Reconnect before removing a device.</p>{/if}{#if pendingDrop}<p>A removal outcome is pending for {hosts.find(item => item.id === pendingDrop?.hostId)?.display_name ?? "another host"}. Return to that host and retry the same operation before selecting another device. A certificate may already have been revoked.</p><button class="secondary" disabled={Boolean(busy) || !online || pendingDrop.hostId !== selectedHostId} onclick={checkDropOutcome}>Check removal outcome</button>{/if}
+            {#if !supportsDropPeer}<p>Use Refresh / Reconnect to repair this server’s helper automatically before removing a device.</p>{/if}{#if !online}<p>Reconnect before removing a device.</p>{/if}{#if pendingDrop}<p>A removal outcome is pending for {hosts.find(item => item.id === pendingDrop?.hostId)?.display_name ?? "another host"}. Return to that host and retry the same operation before selecting another device. A certificate may already have been revoked.</p><button class="secondary" disabled={Boolean(busy) || !online || pendingDrop.hostId !== selectedHostId} onclick={checkDropOutcome}>Check removal outcome</button>{/if}
             {#if dangerInstance && inventory?.discovery.deployments?.[dangerInstance.configuration.instance.id]?.pending_operation}<p>Resolve the interrupted operation, or retry this pending device removal, before another mutation.</p>{/if}</div>
             <button class="danger-action" disabled={!online || !supportsDropPeer || !dropPeer || Boolean(busy) || Boolean(pendingCleanup) || (!pendingDrop && Boolean(inventory?.discovery.deployments?.[dangerInstance?.configuration.instance.id ?? ""]?.pending_operation)) || Boolean(pendingDrop && (pendingDrop.hostId !== selectedHostId || pendingDrop.operation.instance_id !== dangerInstance?.configuration.instance.id || pendingDrop.operation.peer_id !== dropPeer.id))} onclick={dropDangerPeer}>{pendingDrop ? "Retry device removal" : "Drop Device"}</button></div>
             {#if dangerPeers.length}<div class="danger-row"><div><h3>Revoke device certificate</h3><p>Revocation cannot be reversed. Deploy the instance afterward to apply it. Local client keys are preserved.</p></div><button class="danger-action" disabled={!online || !dangerPeer || Boolean(busy) || Boolean(pendingCleanup)} onclick={revokeDangerPeer}>Revoke device certificate</button></div>{/if}
@@ -697,7 +732,7 @@
         {#if BackendForm}<BackendForm bind:form={instanceForm} />{/if}<button class="primary" disabled={!online || Boolean(busy)}>Save to Server</button>
       </form>
     {:else if !host}
-      <header class="page-head"><div><p class="eyebrow">Workspace setup</p><h1>Servers</h1><p class="subtitle">Manage remote VPN appliances from verified SSH connections.</p></div></header><section class="card empty-workspace"><div class="empty-symbol" aria-hidden="true">▣</div><h2>Connect your first VPN server</h2><p>Add a Linux server using a verified SSH connection.</p><button class="primary" onclick={() => page = "add-server"}>Add Server</button></section>
+      <header class="page-head"><div><p class="eyebrow">Workspace setup</p><h1>Servers</h1><p class="subtitle">Manage remote VPN appliances from verified SSH connections.</p></div></header><section class="card empty-workspace"><div class="empty-symbol" aria-hidden="true">▣</div>{#if hosts.length}<h2>Choose a host to connect</h2><p>Hosts connect only when selected. Connections stay open while VPNCTL is open and close when the app closes.</p><p>Connecting also repairs compatible outdated server helpers using the bundled version. VPN configuration changes still require deployment.</p>{#each hosts as savedHost}<button class="secondary" disabled={Boolean(busy)} onclick={() => selectServer(savedHost.id)}>{savedHost.display_name}<small>{savedHost.ssh.username}@{savedHost.ssh.hostname}:{savedHost.ssh.port} · {hostSessions[savedHost.id]?.connection === "connected" ? "Connected" : "Not connected"}</small></button>{/each}{:else}<h2>Connect your first VPN server</h2><p>Add a Linux server using a verified SSH connection.</p>{/if}<button class="primary" onclick={() => page = "add-server"}>Add Server</button></section>
     {:else}
       <header class="page-head"><div><p class="eyebrow">Control plane / {serverTab}</p><h1>{selected && serverTab === "Instances" ? "Instances" : serverTab}</h1><p class="subtitle">{serverTab === "Overview" ? `One workspace for ${host.display_name}, VPN instances, connected devices, and private DNS.` : serverTab === "Hosts" ? "Manage verified SSH connections and inspect remote hosts." : serverTab === "Instances" ? `Provision and manage VPN appliances on ${host.display_name}.` : `Manage ${serverTab.toLowerCase()} for ${host.display_name}.`}</p></div>{#if serverTab === "Overview" || serverTab === "Instances"}<button class="primary" disabled={!online || Boolean(busy)} onclick={() => { instanceForm = newInstanceForm(selectedHostId, host!.ssh.hostname); page = "create-instance"; }}>Create Instance</button>{:else if serverTab === "Hosts"}<button class="primary" onclick={() => page = "add-server"}>+ Add host</button>{/if}</header>
       {#if connection !== "connected" && connection !== "loading"}<div class="alert" role="status">{connectionLabel}. Remote saving and deployment require a verified live connection. <button class="secondary" disabled={Boolean(busy)} onclick={refreshServer}>Reconnect</button></div>{/if}
@@ -707,7 +742,7 @@
       {#if ["Devices", "DNS", "Backups", "Logs"].includes(serverTab) && inventory?.discovery.instances.length}<section class="card section-selector"><label for="section-instance">Instance</label><select disabled={Boolean(busy)} id="section-instance" value={selected?.configuration.instance.id ?? ""} onchange={async (event) => { const selector = event.currentTarget; await selectSectionInstance(selector.value); selector.value = selected?.configuration.instance.id ?? ""; }}>{#each inventory.discovery.instances as item}<option value={item.configuration.instance.id}>{item.configuration.instance.display_name}</option>{/each}</select><span>{host.display_name} · {inventory.cached ? "cached" : connection}</span></section>{/if}
       {#if serverTab === "Backups"}
         <section class="card archived-backups"><header><div><h2>Archived instances</h2><p>Restore saved configuration and retained runtime identities. Restored instances stay stopped until you start or deploy them.</p></div><button class="secondary" disabled={Boolean(busy)} onclick={refreshServer}>Refresh archives</button></header>
-          {#if archivedInstances.length}<div class="table-wrap"><table><thead><tr><th>Instance</th><th>Archived</th><th>Saved state</th><th>Action</th></tr></thead><tbody>{#each archivedInstances as archived}<tr><td>{archived.configuration.instance.display_name}<small>{nameOf(archived.configuration.instance.backend)}</small></td><td>{new Date(archived.saved_at).toLocaleString()}</td><td>Archived revision {archived.revision}</td><td><button class="secondary" disabled={!online || !supportsInstanceArchives || dirty || Boolean(busy) || Boolean(pendingCleanup) || (Boolean(pendingArchiveRestore) && pendingArchiveRestore?.instanceId !== archived.configuration.instance.id)} onclick={() => restoreArchivedInstance(archived)}>{pendingArchiveRestore?.instanceId === archived.configuration.instance.id ? "Retry archived instance restore" : "Restore archived instance"}</button></td></tr>{/each}</tbody></table></div>{:else}<div class="inventory-empty"><h3>{online && !supportsInstanceArchives ? "Server helper update required" : inventory ? "No archived instances" : "Archive inventory unavailable"}</h3><p>{online && !supportsInstanceArchives ? "Update the VPNCTL helper on this server, then Refresh / Reconnect to list and restore archived instances." : inventory ? "Instances archived on this server will appear here." : "Connect to the server to read its archived instances."}</p></div>{/if}
+          {#if archivedInstances.length}<div class="table-wrap"><table><thead><tr><th>Instance</th><th>Archived</th><th>Saved state</th><th>Action</th></tr></thead><tbody>{#each archivedInstances as archived}<tr><td>{archived.configuration.instance.display_name}<small>{nameOf(archived.configuration.instance.backend)}</small></td><td>{new Date(archived.saved_at).toLocaleString()}</td><td>Archived revision {archived.revision}</td><td><button class="secondary" disabled={!online || !supportsInstanceArchives || dirty || Boolean(busy) || Boolean(pendingCleanup) || (Boolean(pendingArchiveRestore) && pendingArchiveRestore?.instanceId !== archived.configuration.instance.id)} onclick={() => restoreArchivedInstance(archived)}>{pendingArchiveRestore?.instanceId === archived.configuration.instance.id ? "Retry archived instance restore" : "Restore archived instance"}</button></td></tr>{/each}</tbody></table></div>{:else}<div class="inventory-empty"><h3>{online && !supportsInstanceArchives ? "Server helper update required" : inventory ? "No archived instances" : "Archive inventory unavailable"}</h3><p>{online && !supportsInstanceArchives ? "Use Refresh / Reconnect to repair the helper automatically, then list and restore archived instances." : inventory ? "Instances archived on this server will appear here." : "Connect to the server to read its archived instances."}</p></div>{/if}
         </section>
       {/if}
       {#if selected && draft}
@@ -769,7 +804,7 @@
       {:else if serverTab === "Backups"}
         <section class="card inventory-empty"><h2>Runtime snapshots</h2><p>Choose an active instance or restore an archived instance above to access its runtime snapshots.</p></section>
       {:else}
-        {#if serverTab === "Hosts"}<div class="prototype-split"><section class="card host-list-panel"><header><h2>Managed hosts</h2><span>{hosts.length} configured</span></header>{#each hosts as server}<button disabled={Boolean(busy)} class:selected={server.id === selectedHostId} onclick={async () => { await selectServer(server.id); serverTab = "Hosts"; }}><span class="instance-symbol" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="8" rx="2"/><rect x="3" y="13" width="18" height="8" rx="2"/><path d="M11 7h6M11 17h6"/></svg></span><span><strong>{server.display_name}</strong><small>{server.ssh.username}@{server.ssh.hostname}:{server.ssh.port}</small></span><span class="instance-chevron" aria-hidden="true">›</span></button>{/each}</section><section class="card host-detail-panel"><div class="detail-hero"><div><p class="eyebrow">Host details</p><h2>{host.display_name}</h2><p>{host.ssh.username}@{host.ssh.hostname}:{host.ssh.port}</p></div><span class="instance-state" data-state={online ? "healthy" : "needs_deployment"}>{connectionLabel}</span></div><p>SSH connectivity is separate from VPN service health.</p><div class="host-actions"><button class="secondary" disabled={Boolean(busy)} onclick={refreshServer}>Reconnect</button><details class="host-tools"><summary>Host Tools</summary><div><button class="secondary" disabled={Boolean(busy)} onclick={probeServer}>Verify SSH host identity</button><Tooltip text="Check the server’s SSH host key to help ensure you are connecting to the expected machine." /><button class="secondary" disabled={Boolean(busy)} onclick={inspectServer}>Check Server Requirements</button><Tooltip text="Check whether the remote server meets the requirements for managing and deploying VPN instances." /></div></details></div><div class="fact-grid"><div><span>Appliance identity</span><strong>{inventory?.identity.appliance_id ?? "Not synchronized"}</strong></div><div><span>Managed instances</span><strong>{inventory?.discovery.instances.length ?? "Unknown"}</strong></div><div><span>Last synchronized</span><strong>{inventory ? new Date(inventory.synchronized_at).toLocaleString() : "Never"}</strong></div><div><span>Connection</span><strong>{connectionLabel}</strong></div></div>{#if probe}<div class="host-verification"><h3>{probe.state === "changed" ? "Changed SSH host key" : "SSH host key"}</h3><p>{probe.key.sha256_fingerprint}</p><p>Verify this fingerprint through an independent trusted channel.</p><p>Approval requires the exact independently verified fingerprint. A changed identity also requires explicit replacement confirmation.</p><label>Exact verified fingerprint<input bind:value={fingerprint} /></label>{#if probe.state === "changed"}<label><input type="checkbox" bind:checked={replaceChanged} /> Explicitly replace the previously approved key</label>{/if}<button class="primary" disabled={Boolean(busy) || fingerprint !== probe.key.sha256_fingerprint || (probe.state === "changed" && !replaceChanged)} onclick={approveIdentity}>Approve SSH identity</button></div>{/if}{#if inspection}<div class="inspection-panel"><p>{inspection.inspection.operating_system} · {inspection.inspection.architecture}</p><p>Docker: {inspection.inspection.docker_version ?? "Unavailable"} · Compose: {inspection.inspection.compose_version ?? "Unavailable"}</p><HostReadinessMatrix view={inspection} /></div>{/if}</section></div>
+        {#if serverTab === "Hosts"}<div class="prototype-split"><section class="card host-list-panel"><header><h2>Managed hosts</h2><span>{hosts.length} configured</span></header>{#each hosts as server}<button disabled={Boolean(busy)} class:selected={server.id === selectedHostId} onclick={async () => { await selectServer(server.id); serverTab = "Hosts"; }}><span class="instance-symbol" aria-hidden="true"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="8" rx="2"/><rect x="3" y="13" width="18" height="8" rx="2"/><path d="M11 7h6M11 17h6"/></svg></span><span><strong>{server.display_name}</strong><small>{server.ssh.username}@{server.ssh.hostname}:{server.ssh.port} · {hostSessions[server.id]?.connection === "connected" ? "Connected" : "Not connected"}</small></span><span class="instance-chevron" aria-hidden="true">›</span></button>{/each}</section><section class="card host-detail-panel"><div class="detail-hero"><div><p class="eyebrow">Host details</p><h2>{host.display_name}</h2><p>{host.ssh.username}@{host.ssh.hostname}:{host.ssh.port}</p></div><span class="instance-state" data-state={online ? "healthy" : "needs_deployment"}>{connectionLabel}</span></div><p>SSH connectivity is separate from VPN service health.</p><div class="host-actions"><button class="secondary" disabled={Boolean(busy)} onclick={refreshServer}>Reconnect</button><details class="host-tools"><summary>Host Tools</summary><div><button class="secondary" disabled={Boolean(busy)} onclick={probeServer}>Verify SSH host identity</button><Tooltip text="Check the server’s SSH host key to help ensure you are connecting to the expected machine." /><button class="secondary" disabled={Boolean(busy)} onclick={inspectServer}>Check Server Requirements</button><Tooltip text="Check whether the remote server meets the requirements for managing and deploying VPN instances." /></div></details></div><div class="fact-grid"><div><span>Appliance identity</span><strong>{inventory?.identity.appliance_id ?? "Not synchronized"}</strong></div><div><span>Managed instances</span><strong>{inventory?.discovery.instances.length ?? "Unknown"}</strong></div><div><span>Last synchronized</span><strong>{inventory ? new Date(inventory.synchronized_at).toLocaleString() : "Never"}</strong></div><div><span>Connection</span><strong>{connectionLabel}</strong></div></div>{#if probe}<div class="host-verification"><h3>{probe.state === "changed" ? "Changed SSH host key" : "SSH host key"}</h3><p>{probe.key.sha256_fingerprint}</p><p>Verify this fingerprint through an independent trusted channel.</p><p>Approval requires the exact independently verified fingerprint. A changed identity also requires explicit replacement confirmation.</p><label>Exact verified fingerprint<input bind:value={fingerprint} /></label>{#if probe.state === "changed"}<label><input type="checkbox" bind:checked={replaceChanged} /> Explicitly replace the previously approved key</label>{/if}<button class="primary" disabled={Boolean(busy) || fingerprint !== probe.key.sha256_fingerprint || (probe.state === "changed" && !replaceChanged)} onclick={approveIdentity}>Approve SSH identity</button></div>{/if}{#if inspection}<div class="inspection-panel"><p>{inspection.inspection.operating_system} · {inspection.inspection.architecture}</p><p>Docker: {inspection.inspection.docker_version ?? "Unavailable"} · Compose: {inspection.inspection.compose_version ?? "Unavailable"}</p><HostReadinessMatrix view={inspection} /></div>{/if}</section></div>
         {:else}
           {#if serverTab === "Overview"}
             <section class="server-hero"><div><p class="eyebrow">Network status</p><h2>{online ? `${inventory?.discovery.instances.length ?? 0} VPN ${(inventory?.discovery.instances.length ?? 0) === 1 ? "instance" : "instances"} configured` : connection === "offline" ? "Showing saved server data" : connection === "loading" ? "Connecting to server" : "Server needs attention"}</h2><p>{online ? `${inventory?.discovery.instances.length ?? 0} ${(inventory?.discovery.instances.length ?? 0) === 1 ? "instance" : "instances"} on ${host.display_name}. Deployment status and health are shown per instance.` : "Reconnect to read current remote state before saving or deploying changes."}</p></div><button class="hero-action" onclick={() => navigateSection("Instances")}>Manage instances <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14m-6-6 6 6-6 6"/></svg></button></section>
@@ -798,6 +833,9 @@
 </div>
 
 <style>
+  .error-details { margin-top: 0.75rem; }
+  .error-details summary { cursor: pointer; }
+  .error-details pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 20rem; overflow: auto; }
   aside h2 { font-size: .8rem; color: #9fb3c8; padding: 0 13px; }
   .card { margin-top: 20px; padding: 24px; }
   .remote-form { display: grid; gap: 16px; max-width: 700px; }

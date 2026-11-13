@@ -43,7 +43,51 @@ env:
     `xattr -dr com.apple.quarantine "/path/to/VPNCTL.app"`
 
 jobs:
+  helpers:
+    name: Build matching Linux helpers
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Prepare helper build runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          for tool in git curl docker tar xz sha256sum; do
+            command -v "$tool" >/dev/null || { echo "Missing helper build tool: $tool" >&2; exit 1; }
+          done
+          docker info >/dev/null
+          if ! command -v node >/dev/null || [ "$(node --version)" != v24.18.0 ]; then
+            case "$(uname -m)" in
+              x86_64) node_arch=x64 ;;
+              aarch64) node_arch=arm64 ;;
+              *) echo 'Unsupported helper build host architecture' >&2; exit 1 ;;
+            esac
+            work="$(mktemp -d)"
+            trap 'rm -rf "$work"' EXIT
+            archive="node-v24.18.0-linux-${node_arch}.tar.xz"
+            base=https://nodejs.org/dist/v24.18.0
+            curl --proto '=https' --tlsv1.2 -fsSLo "$work/$archive" "$base/$archive"
+            curl --proto '=https' --tlsv1.2 -fsSLo "$work/SHASUMS256.txt" "$base/SHASUMS256.txt"
+            (cd "$work" && awk -v name="$archive" '$2 == name {print}' SHASUMS256.txt > selected.sha256 && test -s selected.sha256 && sha256sum -c selected.sha256)
+            prefix="${HOME}/.local/node-v24.18.0"
+            mkdir -p "$prefix"
+            tar -xJf "$work/$archive" --strip-components=1 -C "$prefix"
+            echo "$prefix/bin" >> "${GITHUB_PATH}"
+          fi
+      - uses: https://code.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Enable Linux ARM builds
+        uses: https://github.com/docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - name: Build static helper payloads from release source
+        run: bash build-helpers/server/bundle.sh
+      # Forgejo requires its patched v4 artifact actions.
+      - uses: https://code.forgejo.org/forgejo/upload-artifact@16871d9e8cfcf27ff31822cac382bbb5450f1e1e # v4
+        with:
+          name: linux-helper-bundles
+          path: target/vam-server-dist/
+          if-no-files-found: error
   package:
+    needs: helpers
     name: Package ${{ matrix.package.name }}
     if: ${{ startsWith(forgejo.ref, 'refs/tags/v') || startsWith(github.ref, 'refs/tags/v') }}
     runs-on: ${{ matrix.package.runs_on }}
@@ -349,9 +393,10 @@ jobs:
               rm -f dist/releases/vpnctl-windows-x86_64-installer.exe
               install -m 0755 "$windows_release_bin" dist/windows/x86_64/vpnctl.exe
               install -m 0644 "$windows_webview2_loader" dist/windows/x86_64/WebView2Loader.dll
-              zip -j dist/releases/vpnctl-windows-x86_64-portable.zip \
-                dist/windows/x86_64/vpnctl.exe \
-                dist/windows/x86_64/WebView2Loader.dll
+              mkdir -p dist/windows/x86_64/licenses
+              cp apps/desktop/src-tauri/licenses/* dist/windows/x86_64/licenses/
+              cp LICENSE dist/windows/x86_64/licenses/VPNCTL-MIT.txt
+              (cd dist/windows/x86_64 && zip -r ../../../dist/releases/vpnctl-windows-x86_64-portable.zip vpnctl.exe WebView2Loader.dll licenses)
               install -m 0755 "$windows_installer" dist/releases/vpnctl-windows-x86_64-installer.exe
             artifact_paths: dist/releases/vpnctl-windows-x86_64-portable.zip dist/releases/vpnctl-windows-x86_64-installer.exe
             release_asset_paths: dist/releases/vpnctl-windows-x86_64-portable.zip dist/releases/vpnctl-windows-x86_64-portable.zip.asc dist/releases/vpnctl-windows-x86_64-installer.exe dist/releases/vpnctl-windows-x86_64-installer.exe.asc
@@ -640,6 +685,12 @@ jobs:
         if: ${{ matrix.package.setup_command != '' }}
         shell: ${{ matrix.package.build_shell }}
         run: ${{ matrix.package.setup_command }}
+
+      - name: Retrieve matching trusted helper builds
+        uses: https://code.forgejo.org/forgejo/download-artifact@d8d0a99033603453ad2255e58720b460a0555e1e # v4
+        with:
+          name: linux-helper-bundles
+          path: target/vam-server-dist
 
       - name: Validate packaging inputs
         shell: bash
