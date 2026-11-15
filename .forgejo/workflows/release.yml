@@ -44,13 +44,27 @@ env:
 
 jobs:
   helpers:
-    name: Build matching Linux helpers
-    runs-on: ubuntu-22.04
+    name: Build Linux helper (${{ matrix.helper.architecture }})
+    runs-on: ${{ matrix.helper.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        helper:
+          - architecture: x86_64
+            runner: ubuntu-22.04
+            docker_architecture: amd64
+          - architecture: aarch64
+            runner: arm-ubuntu-22.04
+            docker_architecture: arm64
     steps:
       - name: Prepare helper build runtime
         shell: bash
         run: |
           set -euo pipefail
+          if [ "$(uname -m)" != "${{ matrix.helper.architecture }}" ]; then
+            echo 'Helper runner must provide native Linux ${{ matrix.helper.architecture }}. Check its runner label image and container architecture mapping.' >&2
+            exit 1
+          fi
           missing_tools=""
           packages=(ca-certificates)
           for tool in git curl docker tar xz sha256sum; do
@@ -81,6 +95,11 @@ jobs:
             echo 'Helper builds require a reachable Docker endpoint supplied by the runner. Check DOCKER_HOST or the configured Docker socket; installing the CLI does not provide daemon access.' >&2
             exit 1
           fi
+          docker_platform=$(docker info --format '{{.OSType}}/{{.Architecture}}')
+          case "$docker_platform" in
+            linux/${{ matrix.helper.architecture }}|linux/${{ matrix.helper.docker_architecture }}) ;;
+            *) echo "Helper runner requires a native Linux ${{ matrix.helper.architecture }} Docker engine; found $docker_platform. Configure the runner's Linux VM/engine architecture." >&2; exit 1 ;;
+          esac
           if ! command -v node >/dev/null || [ "$(node --version)" != v24.18.0 ]; then
             case "$(uname -m)" in
               x86_64) node_arch=x64 ;;
@@ -102,8 +121,6 @@ jobs:
       - uses: https://code.forgejo.org/actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
-      - name: Enable Linux ARM builds
-        uses: https://github.com/docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
       - name: Set up multi-platform image builder
         uses: https://github.com/docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
         with:
@@ -111,11 +128,12 @@ jobs:
       - name: Build static helper payloads from release source
         env:
           VAM_RELEASE_TAG: ${{ forgejo.ref || github.ref }}
+          VAM_HELPER_ARCHITECTURES: ${{ matrix.helper.architecture }}
         run: bash build-helpers/server/bundle.sh
       # Forgejo requires its patched v4 artifact actions.
       - uses: https://code.forgejo.org/forgejo/upload-artifact@16871d9e8cfcf27ff31822cac382bbb5450f1e1e # v4
         with:
-          name: linux-helper-bundles
+          name: linux-helper-${{ matrix.helper.architecture }}
           path: target/vam-server-dist/
           if-no-files-found: error
   package:
@@ -727,10 +745,15 @@ jobs:
           node build-helpers/release/version.mjs "$VAM_RELEASE_TAG"
           cargo update --workspace
 
-      - name: Retrieve matching trusted helper builds
+      - name: Retrieve matching trusted x86 helper
         uses: https://code.forgejo.org/forgejo/download-artifact@d8d0a99033603453ad2255e58720b460a0555e1e # v4
         with:
-          name: linux-helper-bundles
+          name: linux-helper-x86_64
+          path: target/vam-server-dist
+      - name: Retrieve matching trusted ARM helper
+        uses: https://code.forgejo.org/forgejo/download-artifact@d8d0a99033603453ad2255e58720b460a0555e1e # v4
+        with:
+          name: linux-helper-aarch64
           path: target/vam-server-dist
 
       - name: Validate packaging inputs

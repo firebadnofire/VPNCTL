@@ -79,14 +79,22 @@ Cargo and compilation caches live in named Docker volumes, retained across runs.
 Images are built with explicit Buildx `--load` and their OS/architecture is checked
 before execution. The legacy Docker builder is unsupported: it can build a native
 image despite a different requested platform, causing a misleading registry-pull
-failure when the build container is created. CI sets up QEMU and Buildx explicitly.
+failure when the build container is created. CI sets up Buildx explicitly.
 Set `VAM_HELPER_BUILD_NAMESPACE` to isolate image/cache names (default
 `vpnctl-helper`).
 Build containers default to 4 CPUs/6 GiB (`VAM_HELPER_BUILD_CPUS` and
 `VAM_HELPER_BUILD_MEMORY` override these). `VAM_HELPER_ARCHITECTURES=x86_64` can
 limit a development validation build; production packaging requires both.
-Tagged release CI builds these artifacts once, then embeds the same artifacts in
-each desktop package. Debug builds allow absent payloads and report automatic
+Tagged release CI builds each architecture once in parallel: x86_64 uses
+`ubuntu-22.04`; aarch64 uses the Mac mini's `arm-ubuntu-22.04` label. That label
+must supply an ARM Linux job container and native ARM Linux Docker engine (for
+example, an ARM Linux VM on Apple Silicon), not a macOS shell or x86 container.
+The job checks both architectures before building; it does not install QEMU.
+Each job uploads its own artifact, and every desktop package downloads both.
+The existing `macos-latest` packaging job remains separate and can use the same
+Mac mini after helper builds finish. Local dual-architecture builds still need
+emulation or appropriately configured native Buildx nodes.
+Debug builds allow absent payloads and report automatic
 repair as unavailable rather than downloading replacement code. Release builds
 fail clearly when either payload is absent or has the wrong ELF architecture.
 
