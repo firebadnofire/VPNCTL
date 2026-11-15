@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, statSync, copyFileSync, symlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stampReleaseVersion, versionFromTag } from "../../build-helpers/release/version.mjs";
@@ -56,5 +57,18 @@ test("a malformed package leaves the workspace version untouched", () => {
     writeFileSync(join(root, "apps/desktop/package.json"), "broken JSON");
     assert.throws(() => stampReleaseVersion(root, "v0.3.10"));
     assert.match(readFileSync(join(root, "Cargo.toml"), "utf8"), /version = "0.1.0"/);
+  } finally { rmSync(root, { recursive: true }); }
+});
+
+test("CLI stamps a checkout reached through a directory symlink", () => {
+  const root = fixture();
+  try {
+    mkdirSync(join(root, "build-helpers/release"), { recursive: true });
+    copyFileSync(new URL("../../build-helpers/release/version.mjs", import.meta.url), join(root, "build-helpers/release/version.mjs"));
+    symlinkSync(root, join(root, "linked-checkout"), "dir");
+    const output = execFileSync(process.execPath, [join(root, "linked-checkout/build-helpers/release/version.mjs"), "refs/tags/v0.3.10"], { encoding: "utf8" });
+    assert.match(output, /Release version: 0.3.10/);
+    assert.equal(JSON.parse(readFileSync(join(root, "apps/desktop/src-tauri/tauri.conf.json"), "utf8")).version, "0.3.10");
+    assert.match(readFileSync(join(root, "Cargo.toml"), "utf8"), /version = "0.3.10"/);
   } finally { rmSync(root, { recursive: true }); }
 });

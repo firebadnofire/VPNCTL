@@ -62,3 +62,24 @@ for architecture in $VAM_HELPER_ARCHITECTURES; do
   test -z "$(docker ps -aq --filter "ancestor=${namespace}-builder:${architecture}-rust1.97.1")"
 done
 printf 'PASS: failed build is surfaced, stopped containers removed, previous artifacts preserved.\n'
+# Simulate the legacy builder's wrong-architecture image metadata. Refuse it
+# before creating a build container or attempting an implicit registry pull.
+(
+  docker() {
+    if [[ "$1" == image && "$2" == inspect && "${3:-}" == --format ]]; then
+      printf 'linux/invalid\n'
+    else
+      command docker "$@"
+    fi
+  }
+  export -f docker
+  if bash "$work/build-helpers/server/bundle.sh" > "$work/mismatch.log" 2>&1; then
+    echo 'Expected image architecture mismatch was ignored.' >&2; exit 1
+  fi
+)
+grep -q 'Helper image architecture mismatch' "$work/mismatch.log"
+for architecture in $VAM_HELPER_ARCHITECTURES; do
+  test "$(cat "$work/target/vam-server-dist/${architecture}-unknown-linux-musl/vam-server")" = 'fixture output'
+  test -z "$(docker ps -aq --filter "ancestor=${namespace}-builder:${architecture}-rust1.97.1")"
+done
+printf 'PASS: wrong-architecture images are rejected before container creation.\n'

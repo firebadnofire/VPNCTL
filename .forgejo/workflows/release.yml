@@ -104,6 +104,10 @@ jobs:
           persist-credentials: false
       - name: Enable Linux ARM builds
         uses: https://github.com/docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+      - name: Set up multi-platform image builder
+        uses: https://github.com/docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        with:
+          cache-binary: false
       - name: Build static helper payloads from release source
         env:
           VAM_RELEASE_TAG: ${{ forgejo.ref || github.ref }}

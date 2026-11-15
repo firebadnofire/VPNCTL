@@ -63,7 +63,7 @@ The Linux builder image is retained as a cache. Set
 
 Release desktop builds require matching Linux x86_64 and aarch64 helper payloads
 in `target/vam-server-dist/<architecture>-unknown-linux-musl/vam-server`.
-Run `bash build-helpers/server/bundle.sh` with Docker and amd64/arm64 emulation
+Run `bash build-helpers/server/bundle.sh` with Docker Buildx and amd64/arm64 emulation
 before packaging, or set `VAM_HELPER_BUNDLE_DIR` to that directory from a trusted
 build of the same source. Never use an unverified downloaded executable here:
 the desktop package's signature covers these embedded bytes.
@@ -76,6 +76,10 @@ same path on the Docker daemon host. Stage new source files before bundling.
 Ignored/untracked files and Git metadata are not transferred. The builder image
 uses an empty build context, and build containers retain normal SELinux confinement.
 Cargo and compilation caches live in named Docker volumes, retained across runs.
+Images are built with explicit Buildx `--load` and their OS/architecture is checked
+before execution. The legacy Docker builder is unsupported: it can build a native
+image despite a different requested platform, causing a misleading registry-pull
+failure when the build container is created. CI sets up QEMU and Buildx explicitly.
 Set `VAM_HELPER_BUILD_NAMESPACE` to isolate image/cache names (default
 `vpnctl-helper`).
 Build containers default to 4 CPUs/6 GiB (`VAM_HELPER_BUILD_CPUS` and
@@ -106,3 +110,12 @@ grant socket access. Prefer an isolated builder as described in the
 Run `bash tests/build-helpers/helper-bundle.sh` on a Docker host with amd64/arm64
 emulation to check source/artifact transfer and failure cleanup without compiling
 Rust. The test uses isolated image/cache names and removes its containers/caches.
+
+Release CI derives the application version from the triggering `vMAJOR.MINOR.PATCH`
+tag, including valid semantic-version suffixes. It stamps the Cargo workspace,
+desktop package and Tauri configuration in the build checkout, then regenerates
+workspace lock entries with Cargo before locked builds. The helper receives the
+same tag. Native application metadata supplies the displayed `Version` label;
+development manifests remain at their development version. Invalid release tags
+fail before stamping rather than falling back to a hardcoded release version.
+Run `node --test tests/build-helpers/release-version.test.mjs` to validate stamping.

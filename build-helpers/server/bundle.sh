@@ -21,11 +21,17 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 docker info >/dev/null
+docker buildx version >/dev/null || { echo 'Docker Buildx is required for architecture-correct helper images. Install the Buildx plugin and configure a multi-platform builder.' >&2; exit 1; }
 for architecture in ${VAM_HELPER_ARCHITECTURES:-x86_64 aarch64}; do
   case "$architecture" in x86_64) platform=amd64;; aarch64) platform=arm64;; *) echo "Unsupported helper architecture: $architecture" >&2; exit 1;; esac
   target="${architecture}-unknown-linux-musl"
   image="${namespace}-builder:${architecture}-rust1.97.1"
-  docker build --platform "linux/${platform}" -t "$image" - < "$root/build-helpers/server/Dockerfile"
+  docker buildx build --load --platform "linux/${platform}" -t "$image" - < "$root/build-helpers/server/Dockerfile"
+  built_platform=$(docker image inspect --format '{{.Os}}/{{.Architecture}}' "$image")
+  if [[ "$built_platform" != "linux/${platform}" ]]; then
+    echo "Helper image architecture mismatch: expected linux/${platform}, got $built_platform. Check the Buildx builder and emulation setup." >&2
+    exit 1
+  fi
   # Stream source and copy artifacts through the Docker API. A job container's
   # checkout path need not exist on the daemon host. Named volumes retain caches
   # without granting the builder a writable bind mount of the checkout.
