@@ -1,6 +1,7 @@
 <script lang="ts">
   import { formFeedback } from "./lib/form-feedback";
   import { configurationStatus } from "./lib/configuration-presentation";
+  import ErrorFeedback from "./lib/components/ErrorFeedback.svelte";
   import BlockingContent from "./lib/components/BlockingContent.svelte";
   import ConfigurationReview from "./lib/components/ConfigurationReview.svelte";
   import { createNotifications } from "./lib/notifications";
@@ -682,7 +683,7 @@
     <div class="topbar"><div class="breadcrumbs"><span>Workspace</span><span aria-hidden="true">/</span><strong>{page === "add-server" ? "Add Server" : page === "create-instance" ? "Create Instance" : page === "migration" ? "Migration" : serverTab}</strong></div><button class="secondary" onclick={openActivity}>Activity</button><div class="topbar-state"><span class="connection-dot" data-state={connection}></span>{host ? `${host.display_name} · ${connectionLabel}` : "No server selected"}</div></div>
   <main class="app-main">
     {#if busy}<div class="progress" role="status">{busy}…</div>{/if}
-    {#if error}<div class="alert" role="alert"><div><strong>{error.message}</strong>{#if error.remediation}<p>{error.remediation}</p>{/if}{#if error.code === "revision_conflict"}<p>Your local draft is retained. Reload after reviewing the server’s changes.</p>{/if}{#if error.technical_detail}<details class="error-details"><summary>Technical details</summary><pre>{error.technical_detail}</pre></details>{/if}</div><button aria-label="Dismiss error" onclick={() => error = null}>×</button></div>{/if}
+    {#if error}<ErrorFeedback {error} operation={errorOperation} context={[host?.display_name, selected?.configuration.instance.display_name].filter(Boolean).join(" / ")} ondismiss={() => { error = null; errorOperation = ""; }} ondeployment={selected ? () => { serverTab = "Instances"; tab = "Deployment"; } : undefined} />{/if}
     {#if page === "server" && serverTab === "Danger Zone"}
       <header class="page-head"><div><p class="eyebrow">Workspace / Destructive actions</p><h1>Danger Zone</h1><p class="subtitle">Remove local connections, reset the client, or archive a server instance. Every action requires confirmation.</p></div></header>
       <div class="danger-zone">
@@ -790,6 +791,7 @@
               {#if restorePreview}<section class="alert"><div><h3>Restore deployed revision {restorePreview.deployed_revision ?? "unknown"}</h3><p>{restorePreview.identity_impact}</p><p>Saved desired revision {restorePreview.desired_revision} will remain unchanged.</p><button class="primary" disabled={!online || dirty || Boolean(busy)} onclick={restoreDeployment}>Restore Deployment</button></div></section>{/if}
             {:else}
             <div class="header-actions"><button class="primary" disabled={!online || dirty || staleDraft || Boolean(busy) || Boolean(observation?.pending_operation)} onclick={previewDeployment}>Preview / Deploy</button><Tooltip label="About deployment" text="Preview and apply the saved server configuration to the VPN service. Saving alone does not deploy." /><button class="secondary" disabled={!online || Boolean(busy)} onclick={checkHealth}>Check health</button><button class="secondary" disabled={!online || Boolean(busy)} onclick={async () => { await task("Creating runtime backup", () => call("backup_remote_deployment", { hostId: selectedHostId, instanceId: selected!.configuration.instance.id, expectedRevision: baseRevision })); if (!lastTaskFailed) notify("Runtime backup created on server."); }}>Create runtime backup</button><button class="secondary" disabled={!online || Boolean(busy)} onclick={loadHistory}>View configuration history</button><button class="secondary" disabled={!online || Boolean(busy)} onclick={loadRuntimeHistory}>View deployment history</button><button class="secondary" disabled={!online || Boolean(busy)} onclick={loadBackups}>View runtime backups</button></div>
+            {#if observation?.deployed_revision == null}<p>Runtime backups require a successful deployment. Preview and deploy the saved configuration first; saving alone does not create a runtime to back up.</p>{/if}
             {#if dirty}<p>Save local edits to the server before previewing deployment.</p>{/if}
             {#if plan}<h3>Deployment preview for saved revision {selected.revision}</h3>{#each plan.warnings as warning}<p class="danger">{warning}</p>{/each}<ul>{#each plan.operations as operation}<li>{operation.operation.replaceAll("_", " ")} {operation.path ?? operation.service ?? ""}</li>{/each}</ul><button class="primary" disabled={!online || dirty || Boolean(busy)} onclick={deploy}>Apply saved revision {selected.revision}</button>{/if}
             {#if health}<h3>Deployment health</h3><dl><dt>Gateway</dt><dd>{health.gateway_running ? "Running" : "Stopped / unavailable"}</dd><dt>Backend</dt><dd>{health.backend_ready ? "Ready" : "Needs attention"}</dd><dt>Listeners</dt><dd>{health.listeners_ready ? "Ready" : "Needs attention"}</dd><dt>Deployed peer state</dt><dd>{health.client_state_matches ? "Matches" : "Needs attention"}</dd>{#if health.dns_required}<dt>Private DNS</dt><dd>{health.private_dns_resolves ? "Resolving" : "Needs attention"}</dd><dt>Public DNS</dt><dd>{health.public_dns_resolves ? "Resolving securely" : "Needs attention"}</dd>{/if}</dl>{#if health.details.length}<details><summary>Health details</summary><ul>{#each health.details as detail}<li>{detail}</li>{/each}</ul></details>{/if}{/if}
@@ -834,9 +836,6 @@
 </div>
 
 <style>
-  .error-details { margin-top: 0.75rem; }
-  .error-details summary { cursor: pointer; }
-  .error-details pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 20rem; overflow: auto; }
   aside h2 { font-size: .8rem; color: #9fb3c8; padding: 0 13px; }
   .card { margin-top: 20px; padding: 24px; }
   .remote-form { display: grid; gap: 16px; max-width: 700px; }
@@ -873,7 +872,7 @@
 {#if exportDevice}
   <ModalShell returnFocus={dialogTrigger} title="Get Configuration" eyebrow={`${exportDevice.display_name} · ${nameOf(selected!.configuration.instance.backend)}`} onclose={closeExport}>
     <p>This configuration contains private VPN credentials. Keep it private and share it only with the intended device.</p>
-    {#if error && ["Preparing private configuration QR code", "Copying private configuration", "Downloading private configuration"].includes(errorOperation)}<div class="alert" role="alert">{error.message}</div>{/if}
+    {#if error && ["Preparing private configuration QR code", "Copying private configuration", "Downloading private configuration"].includes(errorOperation)}<ErrorFeedback {error} operation={errorOperation} />{/if}
     {#if exportReason}<p>{exportReason}</p>{/if}
     {#if observation?.deployed_revision !== selected!.revision}<p>Saved changes have not yet been deployed. This configuration may require deployment before it can connect.</p>{/if}
     {#if qrImage}<img class="configuration-qr" src={qrImage} alt="Private VPN client configuration QR code" width="384" height="384" />{/if}

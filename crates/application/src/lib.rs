@@ -3637,9 +3637,14 @@ fi
             .await
             .map_err(storage_error)?
             .ok_or_else(|| {
-                validation_error(
-                    "Deploy the instance successfully before creating a restorable manual backup.",
-                )
+                let mut error = AppError::new(
+                    "backup_requires_deployment",
+                    "A runtime backup requires a successful deployment.",
+                );
+                error.remediation = Some(
+                    "Open Deployment, preview the saved configuration, and deploy it successfully. Then create the runtime backup.".into(),
+                );
+                error
             })?;
         let (host, trusted, passphrase) = self.trusted_host(instance.host_id).await?;
         let name = format!(
@@ -8335,7 +8340,7 @@ fn validation_error(message: &str) -> AppError {
         scope: None,
         remote_state_changed: false,
         rollback_succeeded: None,
-        remediation: Some("Correct the highlighted values and try again.".into()),
+        remediation: None,
         technical_detail: None,
     }
 }
@@ -8490,7 +8495,7 @@ fn command_error(scope: &str, result: &CommandResult, changed: bool) -> AppError
     );
     AppError {
         code: "remote_command".into(),
-        message: "A fixed remote operation failed.".into(),
+        message: "A command on the server failed.".into(),
         scope: Some(scope.into()),
         remote_state_changed: changed,
         rollback_succeeded: None,
@@ -8514,6 +8519,15 @@ fn io_error(error: std::io::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validation_errors_do_not_claim_fields_are_highlighted() {
+        let error = validation_error("Deployment is required before backup.");
+        assert_eq!(error.message, "Deployment is required before backup.");
+        assert!(error.remediation.is_none());
+        assert!(!error.remote_state_changed);
+    }
+
     use std::collections::VecDeque;
     use std::sync::RwLock;
     use vam_secrets::MemorySecretStore;
@@ -10535,6 +10549,56 @@ mod tests {
             service.inspect_host(host.id).await.unwrap_err().code,
             "host_key_changed"
         );
+    }
+
+    #[tokio::test]
+    async fn undeployed_backup_reports_a_prerequisite_without_ssh() {
+        let storage = Storage::in_memory().await.unwrap();
+        let fake = fake_transport();
+        let service = ApplicationService::with_transport(
+            storage,
+            Arc::new(MemorySecretStore::default()),
+            fake.clone(),
+        );
+        let host = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "lab".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("/tmp/key"),
+                passphrase: None,
+            })
+            .await
+            .unwrap();
+        let instance = service
+            .create_instance(CreateInstanceInput {
+                host_id: host.id,
+                display_name: "local only".into(),
+                endpoint_host: "vpn.example.test".into(),
+                backend: VpnBackendKind::OpenVpn,
+                backend_settings: None,
+                endpoint_port: Some(1_194),
+                ipv4_subnet: "10.66.0.0/24".into(),
+                dns_zone: DEFAULT_DNS_ZONE.into(),
+                routing_mode: None,
+                xray_tls_import: None,
+            })
+            .await
+            .unwrap();
+
+        let error = service.create_backup(instance.id).await.unwrap_err();
+        assert_eq!(error.code, "backup_requires_deployment");
+        assert!(
+            error
+                .remediation
+                .as_deref()
+                .unwrap()
+                .contains("Open Deployment")
+        );
+        assert!(!error.remote_state_changed);
+        assert!(error.technical_detail.is_none());
+        assert!(fake.commands.lock().expect("test command lock").is_empty());
     }
 
     #[tokio::test]

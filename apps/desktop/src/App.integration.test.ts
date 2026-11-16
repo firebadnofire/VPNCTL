@@ -138,7 +138,7 @@ describe("remote-authoritative desktop workflows", () => {
     // jsdom does not implement native details activation; the native disclosure
     // keeps content in the DOM and browsers provide keyboard/touch behavior.
     expect(details.querySelector("pre")?.textContent).toContain("DNS readiness probe failed");
-    expect(screen.getByText("A fixed remote operation failed.")).toBeTruthy();
+    expect(screen.getByText("A command on the server failed.")).toBeTruthy();
   });
   it("discovers the selected server and distinguishes an empty inventory", async () => {
     await renderConnected();
@@ -914,6 +914,27 @@ describe("remote-authoritative desktop workflows", () => {
     expect(screen.queryByText("Server changed while editing")).toBeNull();
     expect(screen.getByText(/The server configuration has changed since/)).toBeTruthy();
     expect((screen.getByRole("button", { name: "Save to Server" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("explains backup prerequisites without inventing invalid fields and opens deployment", async () => {
+    current = inventory([manifest()]); const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "backup_remote_deployment" ? Promise.reject({
+      code: "validation", message: "Deploy the instance successfully before creating a restorable manual backup.",
+      remediation: "Correct the highlighted values and try again.", remote_state_changed: false,
+    }) : base(command, args));
+    await renderConnected(); await screen.findByText("Remote WG");
+    await fireEvent.click(screen.getByRole("button", { name: /Remote WG.*WireGuard/ }));
+    await fireEvent.click(screen.getByRole("tab", { name: "Deployment" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Create runtime backup" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).not.toContain("highlighted");
+    expect(alert.textContent).toContain("Creating runtime backup · Mainsrv / Remote WG");
+    expect(alert.querySelector("details")?.open).toBe(false);
+    expect(alert.textContent).toContain("validation");
+    await fireEvent.click(screen.getByRole("tab", { name: "Overview" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Open Deployment" }));
+    expect(screen.getByRole("tab", { name: "Deployment" }).getAttribute("aria-selected")).toBe("true");
+    expect(invoke.mock.calls.some(([command]) => command === "apply_remote_deployment")).toBe(false);
   });
 
   it("drops the selected device only after confirmation and reuses a lost-response request", async () => {
