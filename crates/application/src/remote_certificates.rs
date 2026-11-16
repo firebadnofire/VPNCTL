@@ -147,6 +147,7 @@ impl ApplicationService {
         manifest: &Manifest,
         peer_id: Uuid,
         binding: DeviceBackendData,
+        password: Option<&str>,
     ) -> Result<vam_protocol::ClientArtifact, AppError> {
         let peer = manifest
             .configuration
@@ -225,7 +226,15 @@ impl ApplicationService {
             .client_secret_references(&device)
             .map_err(backend_error)?
         {
-            secrets.insert(reference.clone(), self.secret_text(&reference).await?);
+            let value = match (&device.backend_data, password) {
+                (DeviceBackendData::Ikev2(data), Some(password))
+                    if reference == data.bundle_password_ref =>
+                {
+                    Zeroizing::new(password.to_owned())
+                }
+                _ => self.secret_text(&reference).await?,
+            };
+            secrets.insert(reference, value);
         }
         let artifact = backend
             .render_client(&state, &device, &secrets)

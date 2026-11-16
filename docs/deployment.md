@@ -1,5 +1,38 @@
 # Deployment and recovery
 
+## IKEv2 host prerequisites
+
+The Docker host must provide the IPsec policy firewall match (`xt_policy`,
+kernel option `CONFIG_NETFILTER_XT_MATCH_POLICY`). A module installed on disk
+may still need to be loaded before the IKEv2 validation container can start.
+An error containing `Extension policy revision 0 not supported` followed by an
+iptables FORWARD rule failure indicates this prerequisite is unavailable.
+
+The host administrator can load it with `sudo modprobe xt_policy`. On systems
+using systemd-modules-load, an administrator-managed file under
+`/etc/modules-load.d/` containing `xt_policy` makes loading persistent. Inspect
+existing configuration before creating or changing that file. If loading fails,
+install the modules matching the running kernel with the required option enabled.
+Review a fresh deployment preview after correcting the host. VPNCTL does not
+automatically change the host's kernel module configuration. Keep the IPsec policy
+firewall rules and the container's existing capability restrictions intact.
+
+For an IPv4 appliance behind a NAT router, forward UDP 500 and UDP 4500 to the
+Docker host, preserving both destination ports. These are distinct from allowing
+traffic to the router itself. Verify connectivity with a client outside the LAN;
+a successful deployment health check does not prove Internet reachability.
+
+IKEv2 file exports use a binary `.p12` bundle. In Get Configuration, choose and
+confirm a password of 20–128 printable ASCII characters without spaces before
+downloading. Keep that password for the importing VPN client. The chosen password
+protects only that download: it is not saved locally, sent to the appliance, or
+used to change the device's certificate or private key. Closing the dialog or a
+successful download clears the fields; this does not guarantee immediate erasure
+of webview memory. Existing service callers that do not supply an export password
+retain the generated-password export behavior.
+
+## Deployment state and recovery
+
 Saving public configuration commits a new desired generation on the appliance. It does not change containers or deployed revision. A deployment preview reports redacted operations and warnings bound to the desired revision and observed runtime state. The helper takes its filesystem lock again before mutation and refuses a stale preview.
 
 The helper reuses backend rendering, staging, validation, Compose activation, health checks and compensation. It resolves protected WG/AWG PSKs and persistent server identities inside the appliance. Redacted runtime operation history, backup-to-revision mapping and pending markers are stored remotely so a fresh client can inspect them. If a process is interrupted with a pending marker, conflicting mutations are refused until the operation is reconciled. A request-ID check reports **committed** when a successful receipt exists, **uncommitted** when no pending operation or successful receipt exists, and **unresolved** when a pending operation has no durable receipt or recovery is required. A completed receipt can finalize pending bookkeeping; an unresolved marker stays in place for operator recovery. Do not repeat a mutation with a new ID until its status is known.

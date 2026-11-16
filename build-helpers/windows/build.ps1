@@ -54,15 +54,35 @@ function Set-SessionPath {
     $env:Path = ($pathParts -join ";")
 }
 
+function Get-NodeArchitecture {
+    param(
+        [string]$ProcessArchitecture = $env:PROCESSOR_ARCHITECTURE,
+        [string]$NativeArchitecture = $env:PROCESSOR_ARCHITEW6432
+    )
+    # Windows PowerShell 5.1 can run on .NET versions without OSArchitecture.
+    # WOW64 exposes the native OS architecture separately from the shell's.
+    $architecture = if ([string]::IsNullOrWhiteSpace($NativeArchitecture)) {
+        $ProcessArchitecture
+    } else {
+        $NativeArchitecture
+    }
+    switch ($architecture) {
+        'AMD64' { return 'x64' }
+        'ARM64' { return 'arm64' }
+        default { throw "Unsupported Windows architecture '$architecture'. The build helper requires x64 or ARM64 Windows." }
+    }
+}
+
 function Update-SessionPath {
     $cargoBin = Join-Path $env:USERPROFILE ".cargo\bin"
     $nodeBin = Join-Path $env:ProgramFiles "nodejs"
+    $portableNodeBin = Join-Path $env:LOCALAPPDATA "dnswg\build-tools\node\$NodeVersionRequired\node-v$NodeVersionRequired-win-$(Get-NodeArchitecture)"
     $nasmBin = Join-Path $env:ProgramFiles "NASM"
     $nasmPortableBin = Join-Path $env:LOCALAPPDATA "dnswg\build-tools\nasm\$NasmVersionRequired\nasm-$NasmVersionRequired"
     $corepackBin = Join-Path $env:LOCALAPPDATA "dnswg\build-tools\corepack-bin"
     $nsisBin = Join-Path ${env:ProgramFiles(x86)} "NSIS"
 
-    Set-SessionPath -PrependPaths @($cargoBin, $nodeBin, $nasmPortableBin, $nasmBin, $corepackBin, $nsisBin)
+    Set-SessionPath -PrependPaths @($cargoBin, $portableNodeBin, $nodeBin, $nasmPortableBin, $nasmBin, $corepackBin, $nsisBin)
 }
 
 function Assert-WingetAvailable {
@@ -304,6 +324,70 @@ function Ensure-WebView2Runtime {
     }
 }
 
+function Assert-NodeArchiveHash {
+    param([string]$Path, [string]$Expected)
+    $actual = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    if ($actual -ne $Expected) {
+        throw "Node archive checksum mismatch. Expected $Expected; got $actual. The archive was not extracted."
+    }
+}
+
+function Install-PortableNode {
+    $architecture = Get-NodeArchitecture
+    # Official v24.18.0 SHASUMS256.txt, pinned with the toolchain version.
+    $checksums = @{
+        x64 = "0ae68406b42d7725661da979b1403ec9926da205c6770827f33aac9d8f26e821"
+        arm64 = "f274669adb93b1fd0fbf8f21fd078609e9dcc84333d4f2718d2dde3f9a161a01"
+    }
+    if ($NodeVersionRequired -ne "24.18.0" -or -not $checksums.ContainsKey($architecture)) {
+        throw "No verified portable Node $NodeVersionRequired archive is configured for $architecture. Update the version and official checksums together."
+    }
+    $archiveName = "node-v$NodeVersionRequired-win-$architecture"
+    $parent = Join-Path $env:LOCALAPPDATA "dnswg\build-tools\node"
+    $destination = Join-Path $parent $NodeVersionRequired
+    $nodePath = Join-Path $destination "$archiveName\node.exe"
+    if (Test-Path -LiteralPath $nodePath -PathType Leaf) {
+        $version = (& $nodePath --version).Trim()
+        if ($LASTEXITCODE -ne 0 -or $version -ne $NodeVersionRequiredWithPrefix) {
+            throw "Cached Node is invalid at $nodePath. Repair that build-tools cache and retry."
+        }
+        Set-SessionPath -PrependPaths @((Split-Path $nodePath))
+        return
+    }
+    if ($SkipToolInstall) {
+        throw "Node $NodeVersionRequiredWithPrefix is required. Rerun without -SkipToolInstall to install a verified portable copy without changing system Node."
+    }
+    if (Test-Path -LiteralPath $destination) {
+        throw "Incomplete Node cache at $destination. Repair that build-tools cache and retry."
+    }
+    $url = "https://nodejs.org/dist/v$NodeVersionRequired/$archiveName.zip"
+    Confirm-ToolInstall -Name "portable Node.js $NodeVersionRequired" -InstallDescription "download $url, verify its pinned SHA-256, and extract to $destination (system Node unchanged)"
+    New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    $staging = Join-Path $parent (".node-stage-" + [Guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $staging | Out-Null
+    try {
+        $archive = Join-Path $staging "node.zip"
+        Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $archive
+        Assert-NodeArchiveHash -Path $archive -Expected $checksums[$architecture]
+        Expand-Archive -LiteralPath $archive -DestinationPath $staging
+        Remove-Item -LiteralPath $archive
+        $stagedNode = Join-Path $staging "$archiveName\node.exe"
+        $version = (& $stagedNode --version).Trim()
+        if ($LASTEXITCODE -ne 0 -or $version -ne $NodeVersionRequiredWithPrefix) {
+            throw "Downloaded Node reports '$version'; expected $NodeVersionRequiredWithPrefix."
+        }
+        Move-Item -LiteralPath $staging -Destination $destination
+    } finally {
+        $resolvedStaging = [IO.Path]::GetFullPath($staging)
+        $allowedPrefix = [IO.Path]::GetFullPath($parent).TrimEnd('\') + '\.node-stage-'
+        if (-not $resolvedStaging.StartsWith($allowedPrefix, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing unsafe Node staging cleanup: $resolvedStaging"
+        }
+        if (Test-Path -LiteralPath $resolvedStaging) { Remove-Item -LiteralPath $resolvedStaging -Recurse -Force }
+    }
+    Set-SessionPath -PrependPaths @((Split-Path $nodePath))
+}
+
 function Ensure-NodeVersion {
     $currentNode = $null
     if (Get-Command node -ErrorAction SilentlyContinue) {
@@ -315,19 +399,12 @@ function Ensure-NodeVersion {
         return
     }
 
-    if ($SkipToolInstall) {
-        if ($null -eq $currentNode) {
-            throw "Required command not found: node. Rerun without -SkipToolInstall to install Node $NodeVersionRequiredWithPrefix."
-        }
-
-        throw "Node $NodeVersionRequiredWithPrefix is required; found $currentNode. Rerun without -SkipToolInstall to install the required version."
-    }
-
-    Invoke-WingetInstall -Id "OpenJS.NodeJS.LTS" -Name "Node.js $NodeVersionRequired" -Version $NodeVersionRequired
+    Write-Host "Selecting pinned Node $NodeVersionRequiredWithPrefix (current: $currentNode) for this build session."
+    Install-PortableNode
 
     $currentNode = (& node --version).Trim()
     if ($currentNode -ne $NodeVersionRequiredWithPrefix) {
-        throw "Node $NodeVersionRequiredWithPrefix is required; found $currentNode after installation. Remove the conflicting Node installation or adjust PATH, then rerun this helper."
+        throw "Node $NodeVersionRequiredWithPrefix is required; found $currentNode after selecting the portable runtime. Check PATH command overrides."
     }
 }
 
@@ -343,6 +420,71 @@ function Ensure-RustToolchain {
             throw "Rust command not found after toolchain install: $command"
         }
     }
+}
+
+function Test-HelperPayloads {
+    param([string]$BundleRoot)
+    $complete = $true
+    foreach ($entry in @(@('x86_64', 62), @('aarch64', 183))) {
+        $path = Join-Path $BundleRoot "$($entry[0])-unknown-linux-musl\vam-server"
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            $complete = $false
+            continue
+        }
+        $file = Get-Item -LiteralPath $path
+        if ($file.Length -lt 64 -or $file.Length -gt 150MB) { throw "Invalid helper size: $path" }
+        $stream = [IO.File]::OpenRead($path)
+        try {
+            $header = New-Object byte[] 20
+            if ($stream.Read($header, 0, 20) -ne 20) { throw "Cannot read helper header: $path" }
+        } finally { $stream.Dispose() }
+        if ($header[0] -ne 127 -or $header[1] -ne 69 -or $header[2] -ne 76 -or
+            $header[3] -ne 70 -or $header[4] -ne 2 -or $header[5] -ne 1 -or
+            $header[18] -ne $entry[1] -or $header[19] -ne 0) {
+            throw "Invalid $($entry[0]) Linux ELF helper: $path. Rebuild the helper bundles from this source."
+        }
+    }
+    return $complete
+}
+
+function Ensure-HelperBundles {
+    param([string]$RepoRoot)
+    $bundleRoot = Join-Path $RepoRoot 'target\vam-server-dist'
+    if (-not [string]::IsNullOrWhiteSpace($env:VAM_HELPER_BUNDLE_DIR)) {
+        $bundleRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($env:VAM_HELPER_BUNDLE_DIR)
+        if (-not (Test-HelperPayloads $bundleRoot)) {
+            throw "VAM_HELPER_BUNDLE_DIR is incomplete: $bundleRoot. Supply both Linux architectures from a trusted build of this source."
+        }
+        $env:VAM_HELPER_BUNDLE_DIR = $bundleRoot
+        Write-Host "Using supplied Linux helper bundles: $bundleRoot"
+        return
+    }
+    if (Test-HelperPayloads $bundleRoot) {
+        Write-Host "Both Linux helper bundles are available: $bundleRoot"
+        return
+    }
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        throw 'Linux helpers are missing. Start Docker Desktop with Linux containers and Docker Buildx, then rerun; or set VAM_HELPER_BUNDLE_DIR to trusted matching-source bundles for both architectures.'
+    }
+    Invoke-Checked docker info
+    Invoke-Checked docker buildx version
+    $git = Get-Command git -CommandType Application -ErrorAction Stop
+    $gitRoot = Split-Path (Split-Path $git.Source)
+    $bash = Join-Path $gitRoot 'bin\bash.exe'
+    if (-not (Test-Path -LiteralPath $bash -PathType Leaf)) {
+        throw "Git Bash is required to build Linux helpers. Expected $bash. Install Git for Windows or provide VAM_HELPER_BUNDLE_DIR."
+    }
+    $previousArchitectures = $env:VAM_HELPER_ARCHITECTURES
+    Push-Location $RepoRoot
+    try {
+        $env:VAM_HELPER_ARCHITECTURES = 'x86_64 aarch64'
+        Write-Host 'Building both Linux helper architectures with Docker (requires amd64/arm64 emulation or native builder nodes)...'
+        Invoke-Checked $bash build-helpers/server/bundle.sh
+    } finally {
+        $env:VAM_HELPER_ARCHITECTURES = $previousArchitectures
+        Pop-Location
+    }
+    if (-not (Test-HelperPayloads $bundleRoot)) { throw "Helper build did not produce both payloads in $bundleRoot." }
 }
 
 function Ensure-Pnpm {
@@ -382,6 +524,8 @@ if ($env:OS -ne "Windows_NT") {
 }
 
 Update-SessionPath
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+Ensure-HelperBundles -RepoRoot $repoRoot
 Ensure-VisualCppTools
 Ensure-NodeVersion
 Ensure-WebView2Runtime

@@ -1272,16 +1272,32 @@ impl ApplicationService {
         Ok(host)
     }
 
-    pub async fn update_host(&self, host: DockerHost) -> Result<DockerHost, AppError> {
+    pub async fn update_host(&self, mut host: DockerHost) -> Result<DockerHost, AppError> {
         let _guard = self.cleanup_guard.read().await;
         let previous = self
             .storage
             .get_host(host.id)
             .await
             .map_err(storage_error)?;
-        if host.display_name.trim().is_empty() || host.ssh.hostname.trim().is_empty() {
-            return Err(validation_error("Host name and address are required."));
+        if host.display_name.trim().is_empty()
+            || host.ssh.hostname.trim().is_empty()
+            || host.ssh.username.trim().is_empty()
+            || host.ssh.private_key_path.as_os_str().is_empty()
+        {
+            return Err(validation_error(
+                "Host name, address, SSH user, and private key path are required.",
+            ));
         }
+        if host.ssh.port == 0 {
+            return Err(validation_error("SSH port must be between 1 and 65535."));
+        }
+        host.display_name = host.display_name.trim().into();
+        host.ssh.hostname = host.ssh.hostname.trim().into();
+        host.ssh.username = host.ssh.username.trim().into();
+        // Editing public connection fields must not replace native credentials.
+        host.ssh.passphrase_ref = previous.ssh.passphrase_ref.clone();
+        host.created_at = previous.created_at;
+        host.updated_at = Utc::now();
         if previous.ssh != host.ssh {
             self.transport
                 .disconnect_host(&previous.ssh)
@@ -8429,6 +8445,9 @@ fn secret_error(error: SecretStoreError) -> AppError {
 }
 
 fn ssh_error(error: SshError) -> AppError {
+    if let Some(failure) = ssh_credential_error(&error) {
+        return failure;
+    }
     let code = match error {
         SshError::Cancelled => "cancelled",
         SshError::Timeout => "ssh_timeout",
@@ -8446,6 +8465,31 @@ fn ssh_error(error: SshError) -> AppError {
         remediation: Some("Verify the host, approved key, SSH key file, and network.".into()),
         technical_detail: None,
     }
+}
+
+fn ssh_credential_error(error: &SshError) -> Option<AppError> {
+    let (code, message, remediation) = match error {
+        SshError::KeyFile(_) => (
+            "ssh_key_file",
+            "The SSH private key could not be loaded on this computer. Authentication was not attempted.",
+            "Check the host's private key file path and file permissions. Select a valid private key file and, if encrypted, provide its passphrase, then reconnect.",
+        ),
+        SshError::Authentication => (
+            "ssh_authentication",
+            "The server refused authentication with the selected SSH key.",
+            "Check the SSH username and selected private key. Ensure the matching public key is authorized for that account on the server, then reconnect.",
+        ),
+        _ => return None,
+    };
+    Some(AppError {
+        code: code.into(),
+        message: message.into(),
+        scope: None,
+        remote_state_changed: false,
+        rollback_succeeded: None,
+        remediation: Some(remediation.into()),
+        technical_detail: Some(error.to_string()),
+    })
 }
 
 fn deployment_error(error: vam_deployment::DeploymentError) -> AppError {
@@ -8489,17 +8533,33 @@ fn serialization_error(error: serde_json::Error) -> AppError {
 fn command_error(scope: &str, result: &CommandResult, changed: bool) -> AppError {
     let stdout = String::from_utf8_lossy(&result.stdout);
     let stderr = String::from_utf8_lossy(&result.stderr);
+    let ipsec_policy_unavailable =
+        stderr.contains("iptables") && stderr.contains("Extension policy revision 0 not supported");
     let detail = format!(
         "exit_status={}\nstdout:\n{}\nstderr:\n{}",
         result.exit_status, stdout, stderr
     );
     AppError {
-        code: "remote_command".into(),
-        message: "A command on the server failed.".into(),
+        code: if ipsec_policy_unavailable {
+            "ipsec_policy_unavailable"
+        } else {
+            "remote_command"
+        }
+        .into(),
+        message: if ipsec_policy_unavailable {
+            "The server cannot use the IPsec policy firewall match required by IKEv2."
+        } else {
+            "A command on the server failed."
+        }
+        .into(),
         scope: Some(scope.into()),
         remote_state_changed: changed,
         rollback_succeeded: None,
-        remediation: Some("Expand the technical details and inspect the remote host.".into()),
+        remediation: Some(if ipsec_policy_unavailable {
+            "Ask the server administrator to load xt_policy on the Docker host (sudo modprobe xt_policy) and enable it at boot. If unavailable, install matching kernel modules with CONFIG_NETFILTER_XT_MATCH_POLICY support. Then review and retry deployment. Do not remove the IPsec policy firewall checks or grant the container privileged access."
+        } else {
+            "Expand the technical details and inspect the remote host."
+        }.into()),
         technical_detail: Some(redact(&detail, &[])),
     }
 }
@@ -8519,6 +8579,48 @@ fn io_error(error: std::io::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_error_explains_unavailable_ipsec_policy_without_losing_recovery_state() {
+        let result = CommandResult {
+            exit_status: 1,
+            stdout: Vec::new(),
+            stderr: b"Warning: Extension policy revision 0 not supported, missing kernel module?\niptables v1.8.11 (nf_tables): RULE_APPEND failed (No such file or directory): rule in chain FORWARD".to_vec(),
+        };
+        let error = command_error("validate", &result, true);
+        assert_eq!(error.code, "ipsec_policy_unavailable");
+        assert!(error.message.contains("IPsec policy firewall match"));
+        assert!(error.remediation.as_ref().unwrap().contains("Docker host"));
+        assert!(
+            error
+                .remediation
+                .as_ref()
+                .unwrap()
+                .contains("modprobe xt_policy")
+        );
+        assert_eq!(error.scope.as_deref(), Some("validate"));
+        assert!(error.remote_state_changed);
+        assert_eq!(error.rollback_succeeded, None);
+        assert!(
+            error
+                .technical_detail
+                .unwrap()
+                .contains("RULE_APPEND failed")
+        );
+    }
+
+    #[test]
+    fn command_error_keeps_unrelated_firewall_failures_generic() {
+        let result = CommandResult {
+            exit_status: 1,
+            stdout: Vec::new(),
+            stderr: b"iptables v1.8.11: Permission denied (you must be root)".to_vec(),
+        };
+        let error = command_error("validate", &result, false);
+        assert_eq!(error.code, "remote_command");
+        assert!(!error.remote_state_changed);
+        assert!(!error.remediation.unwrap().contains("xt_policy"));
+    }
 
     #[test]
     fn validation_errors_do_not_claim_fields_are_highlighted() {
@@ -9479,6 +9581,70 @@ mod tests {
         assert!(validation.contains("docker rm -f \"$ikev2_probe\""));
         assert!(validation.contains("trap cleanup_ikev2_probe EXIT INT TERM HUP"));
         assert!(!validation.contains("swanctl --version"));
+    }
+
+    #[tokio::test]
+    async fn invalid_pkcs12_password_is_rejected_before_remote_access_or_file_creation() {
+        let service = ApplicationService::with_transport(
+            Storage::in_memory().await.unwrap(),
+            Arc::new(MemorySecretStore::default()),
+            Arc::new(RusshTransport::default()),
+        );
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("client.p12");
+        let password = "invalid password with spaces";
+        let error = service
+            .export_remote_peer_with_password(
+                Uuid::nil(),
+                Uuid::nil(),
+                Uuid::nil(),
+                &destination,
+                Some(Zeroizing::new(password.into())),
+            )
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("bundle_password"));
+        assert!(!format!("{error:?}").contains(password));
+        assert!(!error.remote_state_changed);
+        assert!(!destination.exists());
+    }
+
+    #[tokio::test]
+    async fn host_edits_validate_fields_and_preserve_credential_identity() {
+        let service = ApplicationService::with_transport(
+            Storage::in_memory().await.unwrap(),
+            Arc::new(MemorySecretStore::default()),
+            Arc::new(RusshTransport::default()),
+        );
+        let original = service
+            .create_host(CreateHostInput {
+                display_name: "lab".into(),
+                hostname: "192.0.2.1".into(),
+                port: 22,
+                username: "tester".into(),
+                private_key_path: PathBuf::from("key"),
+                passphrase: Some("test-only-passphrase".into()),
+            })
+            .await
+            .unwrap();
+        let mut edited = original.clone();
+        edited.ssh.username = " ".into();
+        assert!(service.update_host(edited).await.is_err());
+        let mut edited = original.clone();
+        edited.ssh.port = 0;
+        assert!(service.update_host(edited).await.is_err());
+        assert_eq!(service.list_hosts().await.unwrap(), vec![original.clone()]);
+        let mut edited = original.clone();
+        edited.display_name = " new name ".into();
+        edited.ssh.hostname = " new.example.test ".into();
+        edited.ssh.passphrase_ref = None;
+        let saved = service.update_host(edited).await.unwrap();
+        assert_eq!(saved.display_name, "new name");
+        assert_eq!(saved.ssh.hostname, "new.example.test");
+        assert_eq!(saved.ssh.passphrase_ref, original.ssh.passphrase_ref);
+        assert_eq!(saved.id, original.id);
+        assert_eq!(saved.created_at, original.created_at);
+        assert_eq!(service.list_hosts().await.unwrap(), vec![saved]);
     }
 
     #[tokio::test]

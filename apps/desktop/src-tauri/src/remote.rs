@@ -141,10 +141,17 @@ pub async fn export_remote_peer(
     instance_id: Uuid,
     peer_id: Uuid,
     destination: PathBuf,
+    password: Option<String>,
 ) -> Result<(), AppError> {
     state
         .0
-        .export_remote_peer(host_id, instance_id, peer_id, &destination)
+        .export_remote_peer_with_password(
+            host_id,
+            instance_id,
+            peer_id,
+            &destination,
+            password.map(zeroize::Zeroizing::new),
+        )
         .await
 }
 #[tauri::command]

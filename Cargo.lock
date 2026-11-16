@@ -7288,6 +7288,7 @@ dependencies = [
  "vam-protocol",
  "vam-secrets",
  "vam-storage",
+ "zeroize",
 ]
 
 [[package]]

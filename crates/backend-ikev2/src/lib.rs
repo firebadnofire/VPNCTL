@@ -532,7 +532,7 @@ fn validate_device_material(data: &Ikev2DeviceData) -> Result<(), BackendError> 
     Ok(())
 }
 
-fn validate_bundle_password(password: &str) -> Result<(), BackendError> {
+pub fn validate_bundle_password(password: &str) -> Result<(), BackendError> {
     if !(20..=128).contains(&password.len())
         || !password
             .bytes()
@@ -1144,6 +1144,47 @@ mod tests {
             .unwrap();
         assert!(config.contents.contains("local_ts = 0.0.0.0/0"));
         assert!(!config.contents.contains("local_ts = 10.89.0.0/24"));
+    }
+
+    #[test]
+    fn chosen_pkcs12_password_protects_only_the_export_and_rejects_the_old_password() {
+        let (state, device, mut secrets, old_password) = fixture();
+        let DeviceBackendData::Ikev2(data) = &device.backend_data else {
+            panic!("IKEv2 fixture required")
+        };
+        let chosen = "user-chosen-password-123!";
+        secrets.insert(
+            data.bundle_password_ref.clone(),
+            Zeroizing::new(chosen.into()),
+        );
+        let artifact = Ikev2Backend
+            .render_client(&state, &device, &secrets)
+            .unwrap();
+        assert!(
+            KeyStore::from_pkcs12(
+                artifact.contents.as_bytes(),
+                chosen,
+                Pkcs12ImportPolicy::Strict
+            )
+            .is_ok()
+        );
+        assert!(
+            KeyStore::from_pkcs12(
+                artifact.contents.as_bytes(),
+                &old_password,
+                Pkcs12ImportPolicy::Strict
+            )
+            .is_err()
+        );
+        assert!(!format!("{state:?}").contains(chosen));
+        for invalid in [
+            "",
+            "short",
+            "password with spaces 12345",
+            "non-ascii-password-é12345",
+        ] {
+            assert!(validate_bundle_password(invalid).is_err());
+        }
     }
 
     #[test]

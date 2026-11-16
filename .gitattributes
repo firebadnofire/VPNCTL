@@ -1,0 +1,2 @@
+# SQLx hashes migration bytes; keep checksums identical across build platforms.
+crates/storage/migrations/** text eol=lf

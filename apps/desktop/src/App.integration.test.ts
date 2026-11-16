@@ -6,8 +6,9 @@ import type { LegacyCandidate, Manifest, RemoteDraft, RemoteInventory } from "./
 
 const invoke = vi.hoisted(() => vi.fn());
 const confirm = vi.hoisted(() => vi.fn());
+const save = vi.hoisted(() => vi.fn());
 vi.mock("@tauri-apps/api/core", () => ({ invoke }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), save: vi.fn(), confirm }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: vi.fn(), save, confirm }));
 const host = { id: "host-1", display_name: "Mainsrv", ssh: { hostname: "192.0.2.1", username: "tester", port: 22, private_key_path: "key" }, created_at: "2026-11-10T12:00:00Z", updated_at: "2026-11-10T12:00:00Z" };
 function manifest(): Manifest {
   return { schema_version: 1, appliance_id: "appliance-1", revision: 4, request_id: "request-1", request_digest: "digest", saved_at: "2026-11-10T12:00:00Z", removed: false,
@@ -21,7 +22,7 @@ describe("remote-authoritative desktop workflows", () => {
   let current: RemoteInventory;
   let candidates: LegacyCandidate[];
   beforeEach(() => {
-    invoke.mockReset(); confirm.mockReset(); confirm.mockResolvedValue(true);
+    invoke.mockReset(); confirm.mockReset(); confirm.mockResolvedValue(true); save.mockReset();
     current = inventory(); candidates = [];
     invoke.mockImplementation(async (command: string) => {
       switch (command) {
@@ -140,6 +141,21 @@ describe("remote-authoritative desktop workflows", () => {
     expect(details.querySelector("pre")?.textContent).toContain("DNS readiness probe failed");
     expect(screen.getByText("A command on the server failed.")).toBeTruthy();
   });
+  it.each([
+    ["ssh_key_file", "The SSH private key could not be loaded on this computer. Authentication was not attempted.", "SSH key could not be loaded"],
+    ["ssh_authentication", "The server refused authentication with the selected SSH key.", "SSH key refused"],
+  ])("explains %s without suggesting an uncertain remote mutation", async (code, message, label) => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "discover_remote" ? Promise.reject({
+      code, message, remote_state_changed: false,
+      remediation: "Check the SSH username and private key, then reconnect.",
+    }) : base(command, args));
+    await renderConnected();
+    await screen.findByText(message);
+    expect(screen.getAllByText(label, { exact: false }).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/The server may have changed/)).toBeNull();
+    expect(screen.queryByText(/reconcile the mutation request/)).toBeNull();
+  });
   it("discovers the selected server and distinguishes an empty inventory", async () => {
     await renderConnected();
     await screen.findByText("No VPN instances configured on this server.");
@@ -147,6 +163,27 @@ describe("remote-authoritative desktop workflows", () => {
     expect(screen.getByRole("button", { name: "Create Instance" })).toBeTruthy();
     expect(screen.queryByText(/Migrate Instances/)).toBeNull();
     expect(invoke.mock.calls.some(([command]) => ["list_instances", "list_instance_summaries", "create_instance"].includes(command))).toBe(false);
+  });
+  it("edits a saved host locally and requires explicit reconnect after SSH changes", async () => {
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => command === "update_host" ? (args as {host: typeof host}).host : base(command, args));
+    await renderConnected();
+    await fireEvent.click(screen.getByRole("button", {name: /^Hosts/}));
+    await fireEvent.click(screen.getByRole("button", {name: "Edit host"}));
+    expect((screen.getByLabelText("SSH hostname") as HTMLInputElement).value).toBe(host.ssh.hostname);
+    await fireEvent.input(screen.getByLabelText("SSH hostname"), {target: {value: "corrected.example.test"}});
+    await fireEvent.input(screen.getByLabelText("Private key path"), {target: {value: "C:\\Users\\tester\\.ssh\\id_ed25519"}});
+    await fireEvent.click(screen.getByRole("button", {name: "Save host"}));
+    await waitFor(() => expect(screen.queryByRole("dialog", {name: "Edit host"})).toBeNull());
+    expect(invoke).toHaveBeenCalledWith("update_host", {host: {...host, ssh: {...host.ssh, hostname: "corrected.example.test", private_key_path: "C:\\Users\\tester\\.ssh\\id_ed25519"}}});
+    expect(invoke.mock.calls.filter(([command]) => command === "discover_remote")).toHaveLength(1);
+    expect(screen.getAllByText("Not connected", {exact: false}).length).toBeGreaterThan(0);
+    await fireEvent.click(screen.getByRole("button", {name: "Edit host"}));
+    await fireEvent.input(screen.getByLabelText("SSH hostname"), {target: {value: "discard.example.test"}});
+    await fireEvent.click(screen.getByRole("button", {name: "Cancel"}));
+    await fireEvent.click(screen.getByRole("button", {name: "Edit host"}));
+    expect((screen.getByLabelText("SSH hostname") as HTMLInputElement).value).toBe("corrected.example.test");
+    expect(invoke.mock.calls.filter(([command]) => command === "update_host")).toHaveLength(1);
   });
   it("routes prototype navigation through the selected server", async () => {
     current = inventory([manifest()]);
@@ -446,6 +483,49 @@ describe("remote-authoritative desktop workflows", () => {
     await fireEvent.click(screen.getByRole("button", { name: /Hosts/ }));
     expect(screen.queryByAltText("Private VPN client configuration QR code")).toBeNull();
   });
+  it("requires a chosen matching password for IKEv2 exports and clears it after use or close", async () => {
+    const remote = manifest();
+    remote.configuration.instance.backend = "ikev2";
+    remote.configuration.peers = [{ id: "peer-1", user_id: null, display_name: "Phone", ipv4_address: null, ipv6_address: null, dns_name: null, enabled: true, created_at: remote.saved_at, identity: { backend: "ikev2", identity: "phone", certificate_serial: "01" } }];
+    current = inventory([remote]);
+    current.discovery.deployments[remote.configuration.instance.id] = { deployed_revision: remote.revision, pending_operation: null };
+    const base = invoke.getMockImplementation()!;
+    invoke.mockImplementation((command: string, args: unknown) => {
+      if (command === "remote_peer_availability") return [{ peer_id: "peer-1", complete_export_available: true }];
+      if (command === "export_remote_peer") return null;
+      return base(command, args);
+    });
+    save.mockResolvedValue("chosen.p12");
+    await renderConnected(); await screen.findByText("Remote WG");
+    await fireEvent.click(screen.getByRole("button", { name: /Devices/ }));
+    await waitFor(() => expect((screen.getByRole("button", { name: "Get Configuration" }) as HTMLButtonElement).disabled).toBe(false));
+    await fireEvent.click(screen.getByRole("button", { name: "Get Configuration" }));
+    const download = screen.getByRole("button", { name: "Download configuration file" }) as HTMLButtonElement;
+    expect(download.disabled).toBe(true);
+    expect(screen.queryByRole("button", { name: "Show QR code" })).toBeNull();
+    const password = screen.getByLabelText("PKCS#12 password") as HTMLInputElement;
+    const confirmation = screen.getByLabelText("Confirm PKCS#12 password") as HTMLInputElement;
+    expect(password.type).toBe("password");
+    await fireEvent.input(password, { target: { value: "short" } });
+    await fireEvent.input(confirmation, { target: { value: "short" } });
+    expect(download.disabled).toBe(true);
+    const chosen = "user-chosen-password-123!";
+    await fireEvent.input(password, { target: { value: chosen } });
+    expect(download.disabled).toBe(true);
+    await fireEvent.input(confirmation, { target: { value: chosen } });
+    expect(download.disabled).toBe(false);
+    await fireEvent.click(download);
+    await waitFor(() => expect(invoke).toHaveBeenCalledWith("export_remote_peer", { hostId: host.id, instanceId: remote.configuration.instance.id, peerId: "peer-1", destination: "chosen.p12", password: chosen }));
+    await waitFor(() => expect(password.value).toBe(""));
+    expect(confirmation.value).toBe("");
+    await fireEvent.input(password, { target: { value: chosen } });
+    await fireEvent.click(screen.getByRole("button", { name: "Close Get Configuration" }));
+    await fireEvent.click(screen.getByRole("button", { name: "Get Configuration" }));
+    expect((screen.getByLabelText("PKCS#12 password") as HTMLInputElement).value).toBe("");
+    expect((screen.getByLabelText("Confirm PKCS#12 password") as HTMLInputElement).value).toBe("");
+    expect(invoke.mock.calls.some(([command]) => command === "save_remote_instance" || command === "apply_remote_deployment")).toBe(false);
+    expect(invoke.mock.calls.filter(([command]) => command !== "export_remote_peer").some(([, args]) => JSON.stringify(args)?.includes(chosen))).toBe(false);
+  });
   it("clears health from the previous instance when switching instances", async () => {
     const first = manifest();
     const second = structuredClone(first);
@@ -464,6 +544,7 @@ describe("remote-authoritative desktop workflows", () => {
     await fireEvent.click(screen.getByRole("tab", { name: "Deployment" }));
     await fireEvent.click(screen.getByRole("button", { name: "Check health" }));
     await screen.findByText("Deployment health");
+    await screen.findByText(/Running · health verified\s*· checked/);
     await fireEvent.click(screen.getByRole("button", { name: "Instances" }));
     await fireEvent.click(screen.getByRole("button", { name: /Second WG.*WireGuard/ }));
     await waitFor(() => expect(screen.queryByText(/Checking local export material/)).toBeNull());

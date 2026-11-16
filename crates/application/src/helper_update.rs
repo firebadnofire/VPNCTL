@@ -86,7 +86,13 @@ impl ApplicationService {
         };
         let payload = payloads.iter().find(|p| p.architecture == architecture)
             .filter(|p| payload_valid(p))
-            .ok_or_else(|| update_error("This desktop build has no valid bundled Linux helper for the server. Install a complete VPNCTL release or rebuild with helper bundles."))?;
+            .ok_or_else(|| {
+                let mut error = update_error("VPNCTL is missing a required server component. This is an application packaging error.");
+                error.code = "desktop_package_incomplete".into();
+                error.remediation = Some("Reinstall VPNCTL from a verified installer. Reconnecting cannot repair missing application components. If this persists, report the installer version and server architecture to the distributor.".into());
+                error.technical_detail = Some(format!("Missing or invalid bundled Linux helper for {architecture}. No helper installation was attempted."));
+                error
+            })?;
         let installed = self.transport.execute(
             &host.ssh, &trusted.public_key_base64, passphrase.as_ref(),
             "/usr/bin/sudo -n -- /bin/sh -c 'PATH=/usr/bin:/bin; export PATH; sha256sum /usr/local/libexec/vam-server'",
@@ -487,15 +493,19 @@ mod tests {
     async fn missing_bundle_produces_actionable_error() {
         let (service, server, host) = service().await;
         let service = service.with_helper_payloads(vec![]);
+        let error = service.ensure_remote_helper(host).await.unwrap_err();
+        assert_eq!(error.code, "desktop_package_incomplete");
+        assert!(error.message.contains("packaging error"));
+        assert!(!error.message.contains("complete VPNCTL release"));
         assert!(
-            service
-                .ensure_remote_helper(host)
-                .await
-                .unwrap_err()
-                .message
-                .contains("bundled")
+            error
+                .remediation
+                .unwrap()
+                .contains("Reconnecting cannot repair")
         );
+        assert!(!error.remote_state_changed);
         assert_eq!(server.installs.load(Ordering::SeqCst), 0);
+        assert_eq!(server.uploads.load(Ordering::SeqCst), 0);
     }
     #[tokio::test]
     async fn cleanup_failure_is_reported_alongside_the_original_install_failure() {

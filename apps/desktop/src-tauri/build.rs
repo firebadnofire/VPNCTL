@@ -23,14 +23,10 @@ fn main() {
             );
             let path = path.canonicalize().expect("resolve helper path");
             source.push_str(&format!("vam_application::HelperPayload {{ architecture: {architecture:?}, contents: include_bytes!({:?}) }},\n", path.to_str().expect("UTF-8 helper path")));
-        } else if env::var("PROFILE").as_deref() == Ok("release") {
+        } else {
             panic!(
                 "Missing trusted Linux helper: {}. Run bash build-helpers/server/bundle.sh or set VAM_HELPER_BUNDLE_DIR to the matching source build's helper bundle directory before packaging.",
                 path.display()
-            );
-        } else {
-            println!(
-                "cargo:warning=No {architecture} helper bundle; automatic repair will report unavailable in this development build."
             );
         }
     }

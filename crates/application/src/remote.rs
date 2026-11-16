@@ -563,8 +563,26 @@ impl ApplicationService {
         peer_id: Uuid,
         destination: &std::path::Path,
     ) -> Result<(), AppError> {
+        self.export_remote_peer_with_password(host_id, instance_id, peer_id, destination, None)
+            .await
+    }
+
+    /// The optional password protects this export only; it is never persisted or sent remotely.
+    pub async fn export_remote_peer_with_password(
+        &self,
+        host_id: Uuid,
+        instance_id: Uuid,
+        peer_id: Uuid,
+        destination: &std::path::Path,
+        password: Option<zeroize::Zeroizing<String>>,
+    ) -> Result<(), AppError> {
         let artifact = self
-            .remote_peer_export_artifact(host_id, instance_id, peer_id)
+            .remote_peer_export_artifact_with_password(
+                host_id,
+                instance_id,
+                peer_id,
+                password.as_ref().map(|value| value.as_str()),
+            )
             .await?;
         super::write_private_file(destination, artifact.contents.as_bytes()).await
     }
@@ -576,15 +594,34 @@ impl ApplicationService {
         instance_id: Uuid,
         peer_id: Uuid,
     ) -> Result<vam_protocol::ClientArtifact, AppError> {
+        self.remote_peer_export_artifact_with_password(host_id, instance_id, peer_id, None)
+            .await
+    }
+
+    async fn remote_peer_export_artifact_with_password(
+        &self,
+        host_id: Uuid,
+        instance_id: Uuid,
+        peer_id: Uuid,
+        password: Option<&str>,
+    ) -> Result<vam_protocol::ClientArtifact, AppError> {
         use vam_core::DeviceBackendData;
+        if let Some(password) = password {
+            vam_backend_ikev2::validate_bundle_password(password).map_err(super::backend_error)?;
+        }
         let manifest = self.read_remote(host_id, instance_id).await?;
+        if password.is_some() && manifest.configuration.instance.backend != VpnBackendKind::Ikev2 {
+            return Err(validation_error(
+                "An export password is supported only for IKEv2 PKCS#12 files.",
+            ));
+        }
         let binding = self.storage.get_setting::<DeviceBackendData>(&peer_binding_key(manifest.appliance_id, instance_id, peer_id)).await.map_err(storage_error)?
             .ok_or_else(|| AppError::new("missing_local_private_key", "This client does not possess the device private key and cannot export a complete configuration."))?;
         if matches!(
             binding,
             DeviceBackendData::OpenVpn(_) | DeviceBackendData::Ikev2(_)
         ) {
-            self.remote_certificate_artifact(host_id, &manifest, peer_id, binding)
+            self.remote_certificate_artifact(host_id, &manifest, peer_id, binding, password)
                 .await
         } else {
             self.remote_peer_configuration(host_id, &manifest, peer_id, binding)
@@ -1387,6 +1424,11 @@ fn archive_operation_error(error: AppError) -> AppError {
 }
 
 fn remote_transport_error(error: &vam_authority_client::AuthorityClientError) -> AppError {
+    if let vam_authority_client::AuthorityClientError::Ssh(error) = error
+        && let Some(failure) = crate::ssh_credential_error(error)
+    {
+        return failure;
+    }
     AppError { code: "remote_exchange_failed".into(), message: error.to_string(), scope: None,
         remote_state_changed: true, rollback_succeeded: None,
         remediation: Some("Reconnect and reconcile the mutation request UUID before retrying a write. The existing local draft and remote cache remain available.".into()), technical_detail: None }
@@ -1395,6 +1437,33 @@ fn remote_transport_error(error: &vam_authority_client::AuthorityClientError) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn credential_failures_keep_specific_guidance_and_no_mutation_warning() {
+        for (source, code, message) in [
+            (
+                vam_ssh::SshError::KeyFile("invalid path (os error 123)".into()),
+                "ssh_key_file",
+                "Authentication was not attempted",
+            ),
+            (
+                vam_ssh::SshError::Authentication,
+                "ssh_authentication",
+                "server refused authentication",
+            ),
+        ] {
+            let failure =
+                remote_transport_error(&vam_authority_client::AuthorityClientError::Ssh(source));
+            assert_eq!(failure.code, code);
+            assert!(failure.message.contains(message));
+            assert!(!failure.remote_state_changed);
+            assert!(!failure.remediation.unwrap().contains("reconcile"));
+            assert!(failure.technical_detail.is_some());
+        }
+        let uncertain = remote_transport_error(&vam_authority_client::AuthorityClientError::Ssh(
+            vam_ssh::SshError::Timeout,
+        ));
+        assert!(uncertain.remote_state_changed);
+    }
     use async_trait::async_trait;
     use std::sync::{
         Arc,

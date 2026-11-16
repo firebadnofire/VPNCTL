@@ -19,11 +19,18 @@ adds the `x86_64-apple-darwin` and `aarch64-apple-darwin` Rust targets through
 `rustup`, requires Apple's `lipo` and `hdiutil` tools, and builds a universal
 `.app` plus `.dmg` under `target/universal-apple-darwin/release/bundle`.
 The Windows helper also bootstraps
-missing native build tools with `winget`: Visual Studio 2022 C++ Build Tools, Node.js 24.18.0,
+missing native build tools with `winget`: Visual Studio 2022 C++ Build Tools,
 Rustup/Rust 1.97.1 with `clippy` and `rustfmt`, Microsoft Edge WebView2
 Runtime, NASM, NSIS, and pnpm 11.9.0 through Corepack. When a tool is missing,
 the Windows helper lists the exact install action it will run and asks before
-continuing. NASM is installed from the official portable ZIP under
+continuing. When system Node differs from the pin, the helper selects an official
+portable Node 24.18.0 ZIP, verified against a pinned SHA-256, under
+`%LOCALAPPDATA%\dnswg\build-tools\node`. It neither downgrades nor uninstalls
+system Node; selection changes only the build session's PATH. Cached copies are
+reused, including with `-SkipToolInstall`. Run
+`powershell -NoProfile -File tests/build-helpers/windows-node.ps1` to validate
+checksum rejection and real portable-runtime selection/reuse.
+NASM is installed from the official portable ZIP under
 `%LOCALAPPDATA%\dnswg\build-tools` because the Winget installer may register
 successfully without making `nasm.exe` discoverable. Corepack pnpm shims are
 also written under `%LOCALAPPDATA%\dnswg\build-tools` so the helper does not
@@ -34,6 +41,13 @@ lifecycle scripts. Set `VAM_SKIP_CHECKS=1` for a packaging-only iteration, pass
 them, or pass `-AssumeYes` only when tool installation has already been approved
 for the current machine. PATH updates are kept session-local and deduplicated so
 reruns do not grow the environment.
+
+SQLx migration files under `crates/storage/migrations/` must retain LF line
+endings, as enforced by `.gitattributes`. SQLx checksums include line-ending
+bytes. A Windows checkout with CRLF migrations can compile successfully and then
+refuse an existing database with "migration was previously applied but has been
+modified". Normalize the checkout to LF and rebuild; do not edit recorded database
+checksums or disable migration verification.
 
 The Linux helper always builds inside Docker. Its builder uses an immutable,
 multi-platform Node 24.18.0 Bookworm image digest and pins Rust 1.97.1 and pnpm
@@ -61,8 +75,16 @@ The Linux builder image is retained as a cache. Set
 
 ## Embedded server helpers
 
-Release desktop builds require matching Linux x86_64 and aarch64 helper payloads
+All desktop builds require matching Linux x86_64 and aarch64 helper payloads
 in `target/vam-server-dist/<architecture>-unknown-linux-musl/vam-server`.
+The Windows build helper checks these before tool installation or verification.
+If missing, it invokes the existing helper builder through Git for Windows Bash.
+Docker Desktop must already be running with Linux containers, Buildx, and support
+for both architectures; the script does not install or reconfigure Docker.
+An explicit `VAM_HELPER_BUNDLE_DIR` must contain both valid ELF architectures;
+an incomplete or invalid supplied directory fails immediately.
+Run `powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/build-helpers/windows-helpers.ps1`
+to check this preflight without Docker or compilation.
 Run `bash build-helpers/server/bundle.sh` with Docker Buildx and amd64/arm64 emulation
 before packaging, or set `VAM_HELPER_BUNDLE_DIR` to that directory from a trusted
 build of the same source. Never use an unverified downloaded executable here:
@@ -94,9 +116,9 @@ Each job uploads its own artifact, and every desktop package downloads both.
 The existing `macos-latest` packaging job remains separate and can use the same
 Mac mini after helper builds finish. Local dual-architecture builds still need
 emulation or appropriately configured native Buildx nodes.
-Debug builds allow absent payloads and report automatic
-repair as unavailable rather than downloading replacement code. Release builds
-fail clearly when either payload is absent or has the wrong ELF architecture.
+Debug and release builds both fail when either payload is absent or has the
+wrong ELF architecture. There is no reduced-functionality desktop build or
+installer: build the helpers before building the desktop, including for GUI tests.
 
 `tests/helper-update/installer.sh` exercises install, idempotence, checksum/ABI
 failure, post-install rollback, symlink refusal, and control-data preservation.
